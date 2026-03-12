@@ -4,6 +4,30 @@
 #include <stdlib.h>
 #include <assert.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+
+// Widen 16 int8 ternary values (-1/0/+1) to float, FMA with 16 floats from x,
+// accumulate into 4 float32x4 accumulators.
+static inline void neon_acc_i8x16_f32(int8x16_t t, const float *x,
+    float32x4_t *a0, float32x4_t *a1, float32x4_t *a2, float32x4_t *a3) {
+    int16x8_t lo16 = vmovl_s8(vget_low_s8(t));
+    int16x8_t hi16 = vmovl_s8(vget_high_s8(t));
+    *a0 = vmlaq_f32(*a0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16))),  vld1q_f32(x + 0));
+    *a1 = vmlaq_f32(*a1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16))), vld1q_f32(x + 4));
+    *a2 = vmlaq_f32(*a2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16))),  vld1q_f32(x + 8));
+    *a3 = vmlaq_f32(*a3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16))), vld1q_f32(x + 12));
+}
+
+// Reduce 4 float32x4 accumulators to a single scalar sum (ARMv7-compatible).
+static inline float neon_reduce4(float32x4_t a, float32x4_t b,
+                                  float32x4_t c, float32x4_t d) {
+    float32x4_t s = vaddq_f32(vaddq_f32(a, b), vaddq_f32(c, d));
+    float32x2_t r = vadd_f32(vget_low_f32(s), vget_high_f32(s));
+    return vget_lane_f32(vpadd_f32(r, r), 0);
+}
+#endif // __ARM_NEON
+
 // --- FP16 <-> FP32 conversion ---
 
 float fp16_to_fp32(uint16_t h) {
@@ -157,7 +181,6 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
         // avoiding malloc/free and intermediate buffer per row.
         int row_bytes = W->cols / 4;
         const uint8_t *base = (const uint8_t *)W->data;
-        const int8_t imap[4] = {-1, 0, 1, 0};  // 2-bit -> ternary {-1, 0, +1}
         float scale = W->scale;
         int cols = W->cols;
 
@@ -165,9 +188,42 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
         #pragma omp parallel for
         #endif
         for (int row = 0; row < W->rows; row++) {
-            float sum = 0.0f;
             const uint8_t *rd = base + (size_t)row * row_bytes;
             int done = 0;
+#ifdef __ARM_NEON
+            float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+            float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+            const uint8x16_t neon_zero = vdupq_n_u8(0);
+            const uint8x16_t neon_two  = vdupq_n_u8(2);
+            while (done < cols) {
+                for (int h = 0; h < 2; h++) {
+                    uint8x16_t raw = vld1q_u8(rd + h * 16);
+                    const float *xp = x + done + h * 16;
+                    // Extract 2-bit sub-rows and map: 0->-1, 2->+1, else->0
+                    uint8x16_t v0 = vshrq_n_u8(raw, 6);
+                    uint8x16_t v1 = vandq_u8(vshrq_n_u8(raw, 4), vdupq_n_u8(3));
+                    uint8x16_t v2 = vandq_u8(vshrq_n_u8(raw, 2), vdupq_n_u8(3));
+                    uint8x16_t v3 = vandq_u8(raw, vdupq_n_u8(3));
+                    int8x16_t t0 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v0, neon_zero)),
+                                             vreinterpretq_s8_u8(vceqq_u8(v0, neon_two)));
+                    int8x16_t t1 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v1, neon_zero)),
+                                             vreinterpretq_s8_u8(vceqq_u8(v1, neon_two)));
+                    int8x16_t t2 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v2, neon_zero)),
+                                             vreinterpretq_s8_u8(vceqq_u8(v2, neon_two)));
+                    int8x16_t t3 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v3, neon_zero)),
+                                             vreinterpretq_s8_u8(vceqq_u8(v3, neon_two)));
+                    neon_acc_i8x16_f32(t0, xp + 0*32, &acc0, &acc1, &acc2, &acc3);
+                    neon_acc_i8x16_f32(t1, xp + 1*32, &acc0, &acc1, &acc2, &acc3);
+                    neon_acc_i8x16_f32(t2, xp + 2*32, &acc0, &acc1, &acc2, &acc3);
+                    neon_acc_i8x16_f32(t3, xp + 3*32, &acc0, &acc1, &acc2, &acc3);
+                }
+                rd += 32;
+                done += 128;
+            }
+            out[row] = neon_reduce4(acc0, acc1, acc2, acc3) * scale;
+#else
+            const int8_t imap[4] = {-1, 0, 1, 0};
+            float sum = 0.0f;
             while (done < cols) {
                 for (int gp = 0; gp < 32; gp++) {
                     uint8_t b = rd[gp];
@@ -180,40 +236,159 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
                 done += 128;
             }
             out[row] = sum * scale;
+#endif
         }
         return;
     }
 
-    // TQ1_0 / TQ2_0: block-based format
-    int n_blocks_per_row = W->cols / QK_K;
+    if (W->type == 35) {  // TQ2_0: fused dequant + dot product
+        const BlockTQ2 *blocks = (const BlockTQ2 *)W->data;
+        int n_blocks_per_row = W->cols / QK_K;
+        float tensor_scale = W->scale;
 
-    #ifdef _OPENMP
-    #pragma omp parallel for
-    #endif
-    for (int row = 0; row < W->rows; row++) {
-        float block_out[QK_K];
-        float sum = 0.0f;
-
-        for (int b = 0; b < n_blocks_per_row; b++) {
-            int block_idx = row * n_blocks_per_row + b;
-            int col_offset = b * QK_K;
-
-            if (W->type == 35) {  // TQ2_0
-                const BlockTQ2 *blocks = (const BlockTQ2 *)W->data;
-                dequant_tq2_block(&blocks[block_idx], block_out);
-            } else {  // TQ1_0
-                const BlockTQ1 *blocks = (const BlockTQ1 *)W->data;
-                dequant_tq1_block(&blocks[block_idx], block_out);
+        #ifdef _OPENMP
+        #pragma omp parallel for
+        #endif
+        for (int row = 0; row < W->rows; row++) {
+            float row_sum = 0.0f;
+            for (int b = 0; b < n_blocks_per_row; b++) {
+                const BlockTQ2 *blk = &blocks[row * n_blocks_per_row + b];
+                float d = fp16_to_fp32(blk->d);
+                const float *xb = x + b * QK_K;
+#ifdef __ARM_NEON
+                float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+                float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+                const uint8x16_t mask3 = vdupq_n_u8(3);
+                const int8x16_t one_s8 = vdupq_n_s8(1);
+                for (int half = 0; half < 2; half++) {
+                    const uint8_t *qs = blk->qs + half * 32;
+                    const float *xh = xb + half * 128;
+                    for (int i = 0; i < 2; i++) {
+                        uint8x16_t raw = vld1q_u8(qs + i * 16);
+                        const float *xp = xh + i * 16;
+                        int8x16_t t0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask3)), one_s8);
+                        int8x16_t t1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(raw, 2), mask3)), one_s8);
+                        int8x16_t t2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(raw, 4), mask3)), one_s8);
+                        int8x16_t t3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(raw, 6), mask3)), one_s8);
+                        neon_acc_i8x16_f32(t0, xp + 0*32, &acc0, &acc1, &acc2, &acc3);
+                        neon_acc_i8x16_f32(t1, xp + 1*32, &acc0, &acc1, &acc2, &acc3);
+                        neon_acc_i8x16_f32(t2, xp + 2*32, &acc0, &acc1, &acc2, &acc3);
+                        neon_acc_i8x16_f32(t3, xp + 3*32, &acc0, &acc1, &acc2, &acc3);
+                    }
+                }
+                row_sum += neon_reduce4(acc0, acc1, acc2, acc3) * d;
+#else
+                float block_sum = 0.0f;
+                for (int half = 0; half < 2; half++) {
+                    const uint8_t *qs = blk->qs + half * 32;
+                    const float *xh = xb + half * 128;
+                    for (int m = 0; m < 32; m++) {
+                        uint8_t byte = qs[m];
+                        int8_t q0 = (int8_t)((byte >> 0) & 3) - 1;
+                        int8_t q1 = (int8_t)((byte >> 2) & 3) - 1;
+                        int8_t q2 = (int8_t)((byte >> 4) & 3) - 1;
+                        int8_t q3 = (int8_t)((byte >> 6) & 3) - 1;
+                        block_sum += q0 * xh[0*32 + m];
+                        block_sum += q1 * xh[1*32 + m];
+                        block_sum += q2 * xh[2*32 + m];
+                        block_sum += q3 * xh[3*32 + m];
+                    }
+                }
+                row_sum += block_sum * d;
+#endif
             }
-
-            #ifdef _OPENMP
-            #pragma omp simd reduction(+:sum)
-            #endif
-            for (int k = 0; k < QK_K; k++) {
-                sum += block_out[k] * x[col_offset + k];
-            }
+            out[row] = row_sum * tensor_scale;
         }
+        return;
+    }
 
-        out[row] = sum * W->scale;
+    // TQ1_0 (type == 34): fused dequant + dot product
+    {
+        const BlockTQ1 *blocks = (const BlockTQ1 *)W->data;
+        int n_blocks_per_row = W->cols / QK_K;
+        float tensor_scale = W->scale;
+        static const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+
+        #ifdef _OPENMP
+        #pragma omp parallel for
+        #endif
+        for (int row = 0; row < W->rows; row++) {
+            float row_sum = 0.0f;
+            for (int b = 0; b < n_blocks_per_row; b++) {
+                const BlockTQ1 *blk = &blocks[row * n_blocks_per_row + b];
+                float d = fp16_to_fp32(blk->d);
+                float block_sum = 0.0f;
+                const float *xb = x + b * QK_K;
+#ifdef __ARM_NEON
+                float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+                float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+                const int8x16_t one_s8 = vdupq_n_s8(1);
+                const uint8x8_t three_u8 = vdup_n_u8(3);
+
+                // Section 1: qs[0..31], 5 trits/byte -> 160 values
+                for (int n = 0; n < 5; n++) {
+                    uint8x16_t pow3_vec = vdupq_n_u8(pow3[n]);
+                    for (int i = 0; i < 2; i++) {
+                        uint8x16_t raw = vld1q_u8(blk->qs + i * 16);
+                        uint8x16_t q = vmulq_u8(raw, pow3_vec);
+                        uint8x8_t xi_lo = vshrn_n_u16(vmull_u8(vget_low_u8(q), three_u8), 8);
+                        uint8x8_t xi_hi = vshrn_n_u16(vmull_u8(vget_high_u8(q), three_u8), 8);
+                        int8x16_t ternary = vsubq_s8(vreinterpretq_s8_u8(vcombine_u8(xi_lo, xi_hi)), one_s8);
+                        neon_acc_i8x16_f32(ternary, xb + n*32 + i*16, &acc0, &acc1, &acc2, &acc3);
+                    }
+                }
+
+                // Section 2: qs[32..47], 5 trits/byte -> 80 values
+                for (int n = 0; n < 5; n++) {
+                    uint8x16_t raw = vld1q_u8(blk->qs + 32);
+                    uint8x16_t q = vmulq_u8(raw, vdupq_n_u8(pow3[n]));
+                    uint8x8_t xi_lo = vshrn_n_u16(vmull_u8(vget_low_u8(q), three_u8), 8);
+                    uint8x8_t xi_hi = vshrn_n_u16(vmull_u8(vget_high_u8(q), three_u8), 8);
+                    int8x16_t ternary = vsubq_s8(vreinterpretq_s8_u8(vcombine_u8(xi_lo, xi_hi)), one_s8);
+                    neon_acc_i8x16_f32(ternary, xb + 160 + n*16, &acc0, &acc1, &acc2, &acc3);
+                }
+
+                block_sum = neon_reduce4(acc0, acc1, acc2, acc3);
+
+                // Section 3: qh[0..3], 4 trits/byte -> 16 values (scalar)
+                for (int n = 0; n < 4; n++) {
+                    for (int m = 0; m < 4; m++) {
+                        uint8_t q = blk->qh[m] * pow3[n];
+                        int16_t xi = ((uint16_t)q * 3) >> 8;
+                        block_sum += (xi - 1) * xb[240 + n*4 + m];
+                    }
+                }
+#else
+                // Section 1: qs[0..31], 5 trits/byte -> 160 values
+                for (int n = 0; n < 5; n++) {
+                    for (int m = 0; m < 32; m++) {
+                        uint8_t q = blk->qs[m] * pow3[n];
+                        int16_t xi = ((uint16_t)q * 3) >> 8;
+                        block_sum += (xi - 1) * xb[n*32 + m];
+                    }
+                }
+
+                // Section 2: qs[32..47], 5 trits/byte -> 80 values
+                for (int n = 0; n < 5; n++) {
+                    for (int m = 0; m < 16; m++) {
+                        uint8_t q = blk->qs[32 + m] * pow3[n];
+                        int16_t xi = ((uint16_t)q * 3) >> 8;
+                        block_sum += (xi - 1) * xb[160 + n*16 + m];
+                    }
+                }
+
+                // Section 3: qh[0..3], 4 trits/byte -> 16 values
+                for (int n = 0; n < 4; n++) {
+                    for (int m = 0; m < 4; m++) {
+                        uint8_t q = blk->qh[m] * pow3[n];
+                        int16_t xi = ((uint16_t)q * 3) >> 8;
+                        block_sum += (xi - 1) * xb[240 + n*4 + m];
+                    }
+                }
+#endif
+                row_sum += block_sum * d;
+            }
+            out[row] = row_sum * tensor_scale;
+        }
     }
 }
