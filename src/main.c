@@ -9,6 +9,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <pthread/qos.h>
+#endif
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 typedef struct {
     const char *model_path;
     const char *prompt;
@@ -71,6 +79,19 @@ static CLIArgs parse_args(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     CLIArgs args = parse_args(argc, argv);
+
+    // Pin to performance cores on Apple Silicon
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#ifdef _OPENMP
+    {
+        int ncores = 0;
+        size_t len = sizeof(ncores);
+        if (sysctlbyname("hw.perflevel0.logicalcpu", &ncores, &len, NULL, 0) == 0 && ncores > 0)
+            omp_set_num_threads(ncores);
+    }
+#endif
+#endif
 
     // Load model file
     fprintf(stderr, "Loading %s...\n", args.model_path);

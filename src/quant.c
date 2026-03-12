@@ -191,16 +191,18 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
             const uint8_t *rd = base + (size_t)row * row_bytes;
             int done = 0;
 #ifdef __ARM_NEON
-            float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
-            float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+            float32x4_t accA0 = vdupq_n_f32(0), accA1 = vdupq_n_f32(0);
+            float32x4_t accA2 = vdupq_n_f32(0), accA3 = vdupq_n_f32(0);
+            float32x4_t accB0 = vdupq_n_f32(0), accB1 = vdupq_n_f32(0);
+            float32x4_t accB2 = vdupq_n_f32(0), accB3 = vdupq_n_f32(0);
             const uint8x16_t neon_zero = vdupq_n_u8(0);
             const uint8x16_t neon_two  = vdupq_n_u8(2);
             while (done < cols) {
-                __builtin_prefetch(rd + 64, 0, 0);
+                __builtin_prefetch(rd + 128, 0, 0);
+                __builtin_prefetch(rd + 192, 0, 0);
                 for (int h = 0; h < 2; h++) {
                     uint8x16_t raw = vld1q_u8(rd + h * 16);
                     const float *xp = x + done + h * 16;
-                    // Extract 2-bit sub-rows and map: 0->-1, 2->+1, else->0
                     uint8x16_t v0 = vshrq_n_u8(raw, 6);
                     uint8x16_t v1 = vandq_u8(vshrq_n_u8(raw, 4), vdupq_n_u8(3));
                     uint8x16_t v2 = vandq_u8(vshrq_n_u8(raw, 2), vdupq_n_u8(3));
@@ -213,15 +215,16 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
                                              vreinterpretq_s8_u8(vceqq_u8(v2, neon_two)));
                     int8x16_t t3 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v3, neon_zero)),
                                              vreinterpretq_s8_u8(vceqq_u8(v3, neon_two)));
-                    neon_acc_i8x16_f32(t0, xp + 0*32, &acc0, &acc1, &acc2, &acc3);
-                    neon_acc_i8x16_f32(t1, xp + 1*32, &acc0, &acc1, &acc2, &acc3);
-                    neon_acc_i8x16_f32(t2, xp + 2*32, &acc0, &acc1, &acc2, &acc3);
-                    neon_acc_i8x16_f32(t3, xp + 3*32, &acc0, &acc1, &acc2, &acc3);
+                    neon_acc_i8x16_f32(t0, xp + 0*32, &accA0, &accA1, &accA2, &accA3);
+                    neon_acc_i8x16_f32(t1, xp + 1*32, &accB0, &accB1, &accB2, &accB3);
+                    neon_acc_i8x16_f32(t2, xp + 2*32, &accA0, &accA1, &accA2, &accA3);
+                    neon_acc_i8x16_f32(t3, xp + 3*32, &accB0, &accB1, &accB2, &accB3);
                 }
                 rd += 32;
                 done += 128;
             }
-            out[row] = neon_reduce4(acc0, acc1, acc2, acc3) * scale;
+            out[row] = (neon_reduce4(accA0, accA1, accA2, accA3) +
+                        neon_reduce4(accB0, accB1, accB2, accB3)) * scale;
 #else
             const int8_t imap[4] = {-1, 0, 1, 0};
             float sum = 0.0f;
@@ -254,12 +257,14 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
             float row_sum = 0.0f;
             for (int b = 0; b < n_blocks_per_row; b++) {
                 const BlockTQ2 *blk = &blocks[row * n_blocks_per_row + b];
-                __builtin_prefetch(blk + 1, 0, 0);
+                __builtin_prefetch(blk + 2, 0, 0);
                 float d = fp16_to_fp32(blk->d);
                 const float *xb = x + b * QK_K;
 #ifdef __ARM_NEON
-                float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
-                float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+                float32x4_t accA0 = vdupq_n_f32(0), accA1 = vdupq_n_f32(0);
+                float32x4_t accA2 = vdupq_n_f32(0), accA3 = vdupq_n_f32(0);
+                float32x4_t accB0 = vdupq_n_f32(0), accB1 = vdupq_n_f32(0);
+                float32x4_t accB2 = vdupq_n_f32(0), accB3 = vdupq_n_f32(0);
                 const uint8x16_t mask3 = vdupq_n_u8(3);
                 const int8x16_t one_s8 = vdupq_n_s8(1);
                 for (int half = 0; half < 2; half++) {
@@ -272,13 +277,14 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
                         int8x16_t t1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(raw, 2), mask3)), one_s8);
                         int8x16_t t2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(raw, 4), mask3)), one_s8);
                         int8x16_t t3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(raw, 6), mask3)), one_s8);
-                        neon_acc_i8x16_f32(t0, xp + 0*32, &acc0, &acc1, &acc2, &acc3);
-                        neon_acc_i8x16_f32(t1, xp + 1*32, &acc0, &acc1, &acc2, &acc3);
-                        neon_acc_i8x16_f32(t2, xp + 2*32, &acc0, &acc1, &acc2, &acc3);
-                        neon_acc_i8x16_f32(t3, xp + 3*32, &acc0, &acc1, &acc2, &acc3);
+                        neon_acc_i8x16_f32(t0, xp + 0*32, &accA0, &accA1, &accA2, &accA3);
+                        neon_acc_i8x16_f32(t1, xp + 1*32, &accB0, &accB1, &accB2, &accB3);
+                        neon_acc_i8x16_f32(t2, xp + 2*32, &accA0, &accA1, &accA2, &accA3);
+                        neon_acc_i8x16_f32(t3, xp + 3*32, &accB0, &accB1, &accB2, &accB3);
                     }
                 }
-                row_sum += neon_reduce4(acc0, acc1, acc2, acc3) * d;
+                row_sum += (neon_reduce4(accA0, accA1, accA2, accA3) +
+                            neon_reduce4(accB0, accB1, accB2, accB3)) * d;
 #else
                 float block_sum = 0.0f;
                 for (int half = 0; half < 2; half++) {
@@ -318,15 +324,18 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
             float row_sum = 0.0f;
             for (int b = 0; b < n_blocks_per_row; b++) {
                 const BlockTQ1 *blk = &blocks[row * n_blocks_per_row + b];
-                __builtin_prefetch(blk + 1, 0, 0);
+                __builtin_prefetch(blk + 2, 0, 0);
                 float d = fp16_to_fp32(blk->d);
                 float block_sum = 0.0f;
                 const float *xb = x + b * QK_K;
 #ifdef __ARM_NEON
-                float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
-                float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+                float32x4_t accA0 = vdupq_n_f32(0), accA1 = vdupq_n_f32(0);
+                float32x4_t accA2 = vdupq_n_f32(0), accA3 = vdupq_n_f32(0);
+                float32x4_t accB0 = vdupq_n_f32(0), accB1 = vdupq_n_f32(0);
+                float32x4_t accB2 = vdupq_n_f32(0), accB3 = vdupq_n_f32(0);
                 const int8x16_t one_s8 = vdupq_n_s8(1);
                 const uint8x8_t three_u8 = vdup_n_u8(3);
+                int acc_flip = 0;
 
                 // Section 1: qs[0..31], 5 trits/byte -> 160 values
                 for (int n = 0; n < 5; n++) {
@@ -337,7 +346,10 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
                         uint8x8_t xi_lo = vshrn_n_u16(vmull_u8(vget_low_u8(q), three_u8), 8);
                         uint8x8_t xi_hi = vshrn_n_u16(vmull_u8(vget_high_u8(q), three_u8), 8);
                         int8x16_t ternary = vsubq_s8(vreinterpretq_s8_u8(vcombine_u8(xi_lo, xi_hi)), one_s8);
-                        neon_acc_i8x16_f32(ternary, xb + n*32 + i*16, &acc0, &acc1, &acc2, &acc3);
+                        if (acc_flip++ & 1)
+                            neon_acc_i8x16_f32(ternary, xb + n*32 + i*16, &accB0, &accB1, &accB2, &accB3);
+                        else
+                            neon_acc_i8x16_f32(ternary, xb + n*32 + i*16, &accA0, &accA1, &accA2, &accA3);
                     }
                 }
 
@@ -348,10 +360,14 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
                     uint8x8_t xi_lo = vshrn_n_u16(vmull_u8(vget_low_u8(q), three_u8), 8);
                     uint8x8_t xi_hi = vshrn_n_u16(vmull_u8(vget_high_u8(q), three_u8), 8);
                     int8x16_t ternary = vsubq_s8(vreinterpretq_s8_u8(vcombine_u8(xi_lo, xi_hi)), one_s8);
-                    neon_acc_i8x16_f32(ternary, xb + 160 + n*16, &acc0, &acc1, &acc2, &acc3);
+                    if (acc_flip++ & 1)
+                        neon_acc_i8x16_f32(ternary, xb + 160 + n*16, &accB0, &accB1, &accB2, &accB3);
+                    else
+                        neon_acc_i8x16_f32(ternary, xb + 160 + n*16, &accA0, &accA1, &accA2, &accA3);
                 }
 
-                block_sum = neon_reduce4(acc0, acc1, acc2, acc3);
+                block_sum = neon_reduce4(accA0, accA1, accA2, accA3) +
+                            neon_reduce4(accB0, accB1, accB2, accB3);
 
                 // Section 3: qh[0..3], 4 trits/byte -> 16 values (scalar)
                 for (int n = 0; n < 4; n++) {
