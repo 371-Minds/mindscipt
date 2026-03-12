@@ -3,9 +3,36 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+
+static inline float neon_hsum_f32(float32x4_t v) {
+    float32x2_t r = vadd_f32(vget_low_f32(v), vget_high_f32(v));
+    return vget_lane_f32(vpadd_f32(r, r), 0);
+}
+#endif
+
 // --- Helper functions ---
 
 static void rmsnorm(float *out, const float *x, const float *w, int size, float eps) {
+#ifdef __ARM_NEON
+    float32x4_t sum_sq = vdupq_n_f32(0);
+    int i = 0;
+    for (; i + 3 < size; i += 4) {
+        float32x4_t xv = vld1q_f32(x + i);
+        sum_sq = vmlaq_f32(sum_sq, xv, xv);
+    }
+    float ss = neon_hsum_f32(sum_sq);
+    for (; i < size; i++) ss += x[i] * x[i];
+    ss = 1.0f / sqrtf(ss / size + eps);
+    float32x4_t ss_v = vdupq_n_f32(ss);
+    for (i = 0; i + 3 < size; i += 4) {
+        float32x4_t xv = vld1q_f32(x + i);
+        float32x4_t wv = vld1q_f32(w + i);
+        vst1q_f32(out + i, vmulq_f32(vmulq_f32(xv, ss_v), wv));
+    }
+    for (; i < size; i++) out[i] = x[i] * ss * w[i];
+#else
     float ss = 0.0f;
     #ifdef _OPENMP
     #pragma omp simd reduction(+:ss)
@@ -16,6 +43,7 @@ static void rmsnorm(float *out, const float *x, const float *w, int size, float 
     #pragma omp simd
     #endif
     for (int i = 0; i < size; i++) out[i] = x[i] * ss * w[i];
+#endif
 }
 
 static void softmax(float *x, int size) {
@@ -113,6 +141,13 @@ float *transformer_forward(Model *m, int token, int pos) {
             // Attention scores: q · k for all positions up to pos
             for (int t = 0; t <= pos; t++) {
                 float *k_t = s->key_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+#ifdef __ARM_NEON
+                float32x4_t acc = vdupq_n_f32(0);
+                for (int d = 0; d < head_size; d += 4) {
+                    acc = vmlaq_f32(acc, vld1q_f32(q_h + d), vld1q_f32(k_t + d));
+                }
+                att[t] = neon_hsum_f32(acc) / sqrtf((float)head_size);
+#else
                 float score = 0.0f;
                 #ifdef _OPENMP
                 #pragma omp simd reduction(+:score)
@@ -121,6 +156,7 @@ float *transformer_forward(Model *m, int token, int pos) {
                     score += q_h[d] * k_t[d];
                 }
                 att[t] = score / sqrtf((float)head_size);
+#endif
             }
 
             // Softmax over attention scores
@@ -132,12 +168,19 @@ float *transformer_forward(Model *m, int token, int pos) {
             for (int t = 0; t <= pos; t++) {
                 float *v_t = s->value_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
                 float a = att[t];
+#ifdef __ARM_NEON
+                float32x4_t a_v = vdupq_n_f32(a);
+                for (int d = 0; d < head_size; d += 4) {
+                    vst1q_f32(xb_h + d, vmlaq_f32(vld1q_f32(xb_h + d), a_v, vld1q_f32(v_t + d)));
+                }
+#else
                 #ifdef _OPENMP
                 #pragma omp simd
                 #endif
                 for (int d = 0; d < head_size; d++) {
                     xb_h[d] += a * v_t[d];
                 }
+#endif
             }
         }
 
@@ -150,10 +193,15 @@ float *transformer_forward(Model *m, int token, int pos) {
         ternary_matvec(s->xb2, &lw->wo, s->xb);
 
         // Residual connection
+#ifdef __ARM_NEON
+        for (int i = 0; i < dim; i += 4)
+            vst1q_f32(s->x + i, vaddq_f32(vld1q_f32(s->x + i), vld1q_f32(s->xb2 + i)));
+#else
         #ifdef _OPENMP
         #pragma omp simd
         #endif
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
+#endif
 
         // ---- FFN block ----
 
@@ -167,6 +215,15 @@ float *transformer_forward(Model *m, int token, int pos) {
 
             if (c->act_type == 1) {
                 // BitNet b1.58 with ReLU²: relu²(gate) * up
+#ifdef __ARM_NEON
+                {
+                    float32x4_t zero = vdupq_n_f32(0);
+                    for (int i = 0; i < hidden_dim; i += 4) {
+                        float32x4_t g = vmaxq_f32(vld1q_f32(s->hb + i), zero);
+                        vst1q_f32(s->hb + i, vmulq_f32(vmulq_f32(g, g), vld1q_f32(s->hb2 + i)));
+                    }
+                }
+#else
                 #ifdef _OPENMP
                 #pragma omp simd
                 #endif
@@ -174,6 +231,7 @@ float *transformer_forward(Model *m, int token, int pos) {
                     float g = s->hb[i] > 0 ? s->hb[i] : 0;  // ReLU
                     s->hb[i] = g * g * s->hb2[i];            // ReLU² * up
                 }
+#endif
             } else {
                 // SiLU (SwiGLU): silu(gate) * up
                 #ifdef _OPENMP
@@ -215,10 +273,15 @@ float *transformer_forward(Model *m, int token, int pos) {
         ternary_matvec(s->xb, &lw->ffn_down, s->hb);
 
         // Residual connection
+#ifdef __ARM_NEON
+        for (int i = 0; i < dim; i += 4)
+            vst1q_f32(s->x + i, vaddq_f32(vld1q_f32(s->x + i), vld1q_f32(s->xb + i)));
+#else
         #ifdef _OPENMP
         #pragma omp simd
         #endif
         for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
+#endif
 
         #ifdef DEBUG
         if (l == 0 && pos == 0) {
@@ -241,9 +304,19 @@ float *transformer_forward(Model *m, int token, int pos) {
         for (int v = 0; v < c->vocab_size; v++) {
             const uint16_t *row = emb + (size_t)v * dim;
             float sum = 0.0f;
+#ifdef __ARM_NEON
+            float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+            for (int d = 0; d < dim; d += 8) {
+                float16x8_t f16 = vreinterpretq_f16_u16(vld1q_u16(row + d));
+                acc0 = vmlaq_f32(acc0, vcvt_f32_f16(vget_low_f16(f16)),  vld1q_f32(s->x + d));
+                acc1 = vmlaq_f32(acc1, vcvt_f32_f16(vget_high_f16(f16)), vld1q_f32(s->x + d + 4));
+            }
+            sum = neon_hsum_f32(vaddq_f32(acc0, acc1));
+#else
             for (int d = 0; d < dim; d++) {
                 sum += fp16_to_fp32(row[d]) * s->x[d];
             }
+#endif
             s->logits[v] = sum;
         }
     } else {
