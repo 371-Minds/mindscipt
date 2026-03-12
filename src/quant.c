@@ -196,6 +196,7 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
             const uint8x16_t neon_zero = vdupq_n_u8(0);
             const uint8x16_t neon_two  = vdupq_n_u8(2);
             while (done < cols) {
+                __builtin_prefetch(rd + 64, 0, 0);
                 for (int h = 0; h < 2; h++) {
                     uint8x16_t raw = vld1q_u8(rd + h * 16);
                     const float *xp = x + done + h * 16;
@@ -253,6 +254,7 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
             float row_sum = 0.0f;
             for (int b = 0; b < n_blocks_per_row; b++) {
                 const BlockTQ2 *blk = &blocks[row * n_blocks_per_row + b];
+                __builtin_prefetch(blk + 1, 0, 0);
                 float d = fp16_to_fp32(blk->d);
                 const float *xb = x + b * QK_K;
 #ifdef __ARM_NEON
@@ -316,6 +318,7 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
             float row_sum = 0.0f;
             for (int b = 0; b < n_blocks_per_row; b++) {
                 const BlockTQ1 *blk = &blocks[row * n_blocks_per_row + b];
+                __builtin_prefetch(blk + 1, 0, 0);
                 float d = fp16_to_fp32(blk->d);
                 float block_sum = 0.0f;
                 const float *xb = x + b * QK_K;
