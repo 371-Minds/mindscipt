@@ -6,6 +6,8 @@ test_quant
 test_tokenizer
 test_transformer
 test_e2e
+test_safety
+dump_model
 
 # WASM build output
 wasm/bitnet.js
@@ -24,4 +26,5 @@ Thumbs.db
 
 # Model files (large)
 *.gguf
+model/
 models/

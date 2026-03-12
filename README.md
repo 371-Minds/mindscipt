@@ -48,15 +48,29 @@ Usage: ./bitnet <model.gguf> [options]
 
 ## Getting a Model
 
-Download a BitNet GGUF model. For example, `bitnet-b1.58-2B-4T`:
+Download the official Microsoft BitNet b1.58-2B-4T GGUF model into the `model/` directory:
 
 ```bash
-# Using huggingface-cli
-huggingface-cli download microsoft/BitNet-b1.58-2B-4T-gguf --local-dir models/
+mkdir -p model
 
-# Or download directly
-wget https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf/resolve/main/bitnet-b1.58-2B-4T-TQ1_0.gguf
+# Using huggingface-cli (recommended)
+pip install huggingface-hub
+huggingface-cli download microsoft/bitnet-b1.58-2B-4T-gguf \
+  --include "bitnet-b1.58-2B-4T-TQ2_0.gguf" \
+  --local-dir model/
+
+# Or download directly with curl (~780 MB)
+curl -L -o model/bitnet-b1.58-2B-4T-TQ2_0.gguf \
+  https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf/resolve/main/bitnet-b1.58-2B-4T-TQ2_0.gguf
 ```
+
+Then run:
+
+```bash
+./bitnet model/bitnet-b1.58-2B-4T-TQ2_0.gguf -p "The capital of France is"
+```
+
+The `model/` directory is git-ignored — model files won't be committed.
 
 ## Project Structure
 
