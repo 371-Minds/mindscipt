@@ -171,26 +171,160 @@ void dequant_i2s_row(const uint8_t *data, float *out, int n, float scale) {
     }
 }
 
+// --- SDOT int8 accumulation for I2_S (Apple Silicon / ARMv8.2+ dotprod) ---
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+
+// Quantize float vector x[n] to int8, returning scale = amax/127.
+// x_q[n] = round(x[i] / scale), clamped to [-127, 127].
+static float quantize_x_to_i8(const float *x, int8_t *x_q, int n) {
+    // Find absolute max via NEON
+    float32x4_t vmax = vdupq_n_f32(0);
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(x + i)));
+        vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(x + i + 4)));
+        vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(x + i + 8)));
+        vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(x + i + 12)));
+    }
+    for (; i + 3 < n; i += 4)
+        vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(x + i)));
+    float amax = vmaxvq_f32(vmax);
+    for (; i < n; i++) {
+        float a = fabsf(x[i]);
+        if (a > amax) amax = a;
+    }
+
+    if (amax == 0.0f) {
+        memset(x_q, 0, n);
+        return 0.0f;
+    }
+
+    float scale = amax / 127.0f;
+    float inv_scale = 127.0f / amax;
+    float32x4_t vinv = vdupq_n_f32(inv_scale);
+
+    i = 0;
+    for (; i + 15 < n; i += 16) {
+        // Convert 16 floats to 16 int8s
+        int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i),      vinv));
+        int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 4),  vinv));
+        int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 8),  vinv));
+        int32x4_t i3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 12), vinv));
+        int16x4_t s0 = vqmovn_s32(i0);
+        int16x4_t s1 = vqmovn_s32(i1);
+        int16x4_t s2 = vqmovn_s32(i2);
+        int16x4_t s3 = vqmovn_s32(i3);
+        int8x8_t  b0 = vqmovn_s16(vcombine_s16(s0, s1));
+        int8x8_t  b1 = vqmovn_s16(vcombine_s16(s2, s3));
+        vst1_s8(x_q + i,     b0);
+        vst1_s8(x_q + i + 8, b1);
+    }
+    for (; i < n; i++) {
+        int v = (int)roundf(x[i] * inv_scale);
+        x_q[i] = (int8_t)(v < -127 ? -127 : (v > 127 ? 127 : v));
+    }
+    return scale;
+}
+
+// SDOT I2_S matvec inner loop — called from within an OMP parallel region.
+// Accumulates int32, converts at the end. Uses omp for nowait.
+static void i2s_matvec_sdot(float *out, const QWeight *W,
+                             const int8_t *x_q, float x_scale) {
+    int row_bytes = W->cols / 4;
+    const uint8_t *base = (const uint8_t *)W->data;
+    float combined_scale = W->scale * x_scale;
+    int cols = W->cols;
+
+    #ifdef _OPENMP
+    #pragma omp for nowait
+    #endif
+    for (int row = 0; row < W->rows; row++) {
+        const uint8_t *rd = base + (size_t)row * row_bytes;
+        int done = 0;
+
+        int32x4_t iaccA = vdupq_n_s32(0), iaccB = vdupq_n_s32(0);
+        int32x4_t iaccC = vdupq_n_s32(0), iaccD = vdupq_n_s32(0);
+        const uint8x16_t neon_zero = vdupq_n_u8(0);
+        const uint8x16_t neon_two  = vdupq_n_u8(2);
+
+        while (done < cols) {
+            __builtin_prefetch(rd + 128, 0, 0);
+            for (int h = 0; h < 2; h++) {
+                uint8x16_t raw = vld1q_u8(rd + h * 16);
+                const int8_t *xp = x_q + done + h * 16;
+
+                uint8x16_t v0 = vshrq_n_u8(raw, 6);
+                uint8x16_t v1 = vandq_u8(vshrq_n_u8(raw, 4), vdupq_n_u8(3));
+                uint8x16_t v2 = vandq_u8(vshrq_n_u8(raw, 2), vdupq_n_u8(3));
+                uint8x16_t v3 = vandq_u8(raw, vdupq_n_u8(3));
+
+                // Decode ternary: 0→-1, 1→0, 2→+1
+                int8x16_t t0 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v0, neon_zero)),
+                                         vreinterpretq_s8_u8(vceqq_u8(v0, neon_two)));
+                int8x16_t t1 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v1, neon_zero)),
+                                         vreinterpretq_s8_u8(vceqq_u8(v1, neon_two)));
+                int8x16_t t2 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v2, neon_zero)),
+                                         vreinterpretq_s8_u8(vceqq_u8(v2, neon_two)));
+                int8x16_t t3 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v3, neon_zero)),
+                                         vreinterpretq_s8_u8(vceqq_u8(v3, neon_two)));
+
+                // SDOT: 16 int8×int8 multiply-adds per instruction
+                int8x16_t xv0 = vld1q_s8(xp + 0*32);
+                int8x16_t xv1 = vld1q_s8(xp + 1*32);
+                int8x16_t xv2 = vld1q_s8(xp + 2*32);
+                int8x16_t xv3 = vld1q_s8(xp + 3*32);
+
+                iaccA = vdotq_s32(iaccA, t0, xv0);
+                iaccB = vdotq_s32(iaccB, t1, xv1);
+                iaccC = vdotq_s32(iaccC, t2, xv2);
+                iaccD = vdotq_s32(iaccD, t3, xv3);
+            }
+            rd += 32;
+            done += 128;
+        }
+
+        // Reduce int32 accumulators to scalar
+        int32x4_t sum4 = vaddq_s32(vaddq_s32(iaccA, iaccB), vaddq_s32(iaccC, iaccD));
+        int32_t total = vaddvq_s32(sum4);
+        out[row] = (float)total * combined_scale;
+    }
+}
+
+#endif // __ARM_NEON && __ARM_FEATURE_DOTPROD
+
 // --- Ternary matrix-vector multiply ---
 // out[rows] = W[rows × cols] @ x[cols]
 
 void ternary_matvec(float *out, const QWeight *W, const float *x) {
 
     if (W->type == 36) {  // I2_S
-        // Fused dequant + dot product: decode each byte and accumulate directly,
-        // avoiding malloc/free and intermediate buffer per row.
-        int row_bytes = W->cols / 4;
-        const uint8_t *base = (const uint8_t *)W->data;
-        float scale = W->scale;
         int cols = W->cols;
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+        // SDOT path: quantize x once, then use integer dot products
+        int8_t *x_q = (int8_t *)malloc(cols * sizeof(int8_t));
+        float x_scale = quantize_x_to_i8(x, x_q, cols);
+
+        #ifdef _OPENMP
+        #pragma omp parallel
+        #endif
+        {
+            i2s_matvec_sdot(out, W, x_q, x_scale);
+        }
+        free(x_q);
+#elif defined(__ARM_NEON)
+        // Float NEON path (no dotprod)
+        {
+        int row_bytes = cols / 4;
+        const uint8_t *base = (const uint8_t *)W->data;
+        float scale = W->scale;
         #ifdef _OPENMP
         #pragma omp parallel for
         #endif
         for (int row = 0; row < W->rows; row++) {
             const uint8_t *rd = base + (size_t)row * row_bytes;
             int done = 0;
-#ifdef __ARM_NEON
             float32x4_t accA0 = vdupq_n_f32(0), accA1 = vdupq_n_f32(0);
             float32x4_t accA2 = vdupq_n_f32(0), accA3 = vdupq_n_f32(0);
             float32x4_t accB0 = vdupq_n_f32(0), accB1 = vdupq_n_f32(0);
@@ -225,7 +359,20 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
             }
             out[row] = (neon_reduce4(accA0, accA1, accA2, accA3) +
                         neon_reduce4(accB0, accB1, accB2, accB3)) * scale;
+        }
+        }
 #else
+        // Scalar fallback
+        {
+        int row_bytes = cols / 4;
+        const uint8_t *base = (const uint8_t *)W->data;
+        float scale = W->scale;
+        #ifdef _OPENMP
+        #pragma omp parallel for
+        #endif
+        for (int row = 0; row < W->rows; row++) {
+            const uint8_t *rd = base + (size_t)row * row_bytes;
+            int done = 0;
             const int8_t imap[4] = {-1, 0, 1, 0};
             float sum = 0.0f;
             while (done < cols) {
@@ -240,8 +387,9 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
                 done += 128;
             }
             out[row] = sum * scale;
-#endif
         }
+        }
+#endif
         return;
     }
 
@@ -409,5 +557,45 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
             }
             out[row] = row_sum * tensor_scale;
         }
+    }
+}
+
+// --- Batch ternary matvec ---
+// Runs multiple independent matvecs with a single OMP parallel region.
+
+void ternary_matvec_batch(const MatvecTask *tasks, int n_tasks,
+                           const float *x, int8_t *x_q_buf) {
+    if (n_tasks <= 0) return;
+
+    // Check if all tasks are I2_S (for SDOT fast path)
+    int cols = tasks[0].W->cols;
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    int all_i2s = 1;
+    for (int t = 0; t < n_tasks; t++) {
+        if (tasks[t].W->type != 36) { all_i2s = 0; break; }
+    }
+
+    if (all_i2s) {
+        // Quantize x to int8 once, shared across all tasks
+        float x_scale = quantize_x_to_i8(x, x_q_buf, cols);
+
+        #ifdef _OPENMP
+        #pragma omp parallel
+        #endif
+        {
+            for (int t = 0; t < n_tasks; t++) {
+                i2s_matvec_sdot(tasks[t].out, tasks[t].W, x_q_buf, x_scale);
+            }
+        }
+        return;
+    }
+#else
+    (void)x_q_buf;  // unused on non-DOTPROD platforms
+#endif
+
+    // Fallback: use existing per-task matvec (each forks its own OMP region)
+    for (int t = 0; t < n_tasks; t++) {
+        ternary_matvec(tasks[t].out, tasks[t].W, x);
     }
 }

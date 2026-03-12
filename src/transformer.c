@@ -115,15 +115,17 @@ float *transformer_forward(Model *m, int token, int pos) {
         // RMSNorm before attention
         rmsnorm(s->xb, s->x, lw->attn_norm, dim, c->norm_eps);
 
-        // QKV projections (ternary matmul)
-        ternary_matvec(s->q, &lw->wq, s->xb);    // q = Wq @ xb
-        // KV go directly into cache
+        // QKV projections (ternary matmul) — batched to reduce OMP fork/join
         size_t loff = (size_t)l * c->seq_len * kv_dim;
         float *key_cache_row   = s->key_cache   + loff + (size_t)pos * kv_dim;
         float *value_cache_row = s->value_cache + loff + (size_t)pos * kv_dim;
 
-        ternary_matvec(key_cache_row,   &lw->wk, s->xb);  // k = Wk @ xb
-        ternary_matvec(value_cache_row, &lw->wv, s->xb);  // v = Wv @ xb
+        MatvecTask qkv[3] = {
+            { s->q,            &lw->wq },
+            { key_cache_row,   &lw->wk },
+            { value_cache_row, &lw->wv },
+        };
+        ternary_matvec_batch(qkv, 3, s->xb, s->x_q);
 
         // RoPE on q and k
         rope(s->q, dim, head_size, pos, c->rope_theta);
@@ -209,9 +211,12 @@ float *transformer_forward(Model *m, int token, int pos) {
         rmsnorm(s->xb, s->x, lw->ffn_norm, dim, c->norm_eps);
 
         if (c->has_ffn_gate) {
-            // SwiGLU / Gated: gate * activation(up)
-            ternary_matvec(s->hb,  &lw->ffn_gate, s->xb);  // gate
-            ternary_matvec(s->hb2, &lw->ffn_up,   s->xb);  // up
+            // SwiGLU / Gated: gate * activation(up) — batched
+            MatvecTask ffn[2] = {
+                { s->hb,  &lw->ffn_gate },
+                { s->hb2, &lw->ffn_up   },
+            };
+            ternary_matvec_batch(ffn, 2, s->xb, s->x_q);
 
             if (c->act_type == 1) {
                 // BitNet b1.58 with ReLU²: relu²(gate) * up

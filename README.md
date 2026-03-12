@@ -141,6 +141,21 @@ Requires [Emscripten](https://emscripten.org/):
 # Open wasm/index.html in a browser
 ```
 
+## Performance
+
+Benchmarked on Apple M4 (MacBook Pro), single-socket, `bitnet-b1.58-2B-4T` (I2_S format), 64 generated tokens:
+
+| Optimization | tok/s | Speedup |
+|-------------|-------|---------|
+| Baseline (scalar C) | ~3.0 | 1.0x |
+| + OpenMP parallel matvec | ~5.1 | 1.7x |
+| + ARM NEON SIMD (ternary matvec) | ~10.5 | 3.5x |
+| + NEON transformer (attention, residuals) | ~15.0 | 5.0x |
+| + 8-accumulator ILP + prefetch | ~15.5 | 5.2x |
+| + **SDOT int8 accumulation + batch matvec** | **~32.7** | **10.9x** |
+
+The SDOT path uses ARM's `vdotq_s32` instruction to perform 16 int8×int8 multiply-adds per cycle, replacing a ~24-instruction float widening pipeline. Batch matvec reduces OpenMP fork/join barriers by grouping independent QKV and FFN projections into single parallel regions.
+
 ## How It Works
 
 ### BitNet b1.58 Architecture

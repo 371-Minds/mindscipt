@@ -241,9 +241,13 @@ int model_load(Model *m, GGUFFile *f, int max_seq_len) {
     s->key_cache   = (float *)calloc(kv_cache_size, sizeof(float));
     s->value_cache = (float *)calloc(kv_cache_size, sizeof(float));
 
+    int x_q_size = c->dim > c->hidden_dim ? c->dim : c->hidden_dim;
+    s->x_q = (int8_t *)calloc(x_q_size, sizeof(int8_t));
+
     // #1: Check all allocations succeeded
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 ||
-        !s->q || !s->att || !s->logits || !s->key_cache || !s->value_cache) {
+        !s->q || !s->att || !s->logits || !s->key_cache || !s->value_cache ||
+        !s->x_q) {
         fprintf(stderr, "model: failed to allocate run state\n");
         goto fail_state;
     }
@@ -273,6 +277,7 @@ void model_free(Model *m) {
     free(s->logits);
     free(s->key_cache);
     free(s->value_cache);
+    free(s->x_q);
 }
 
 // #8: Bounds-check token before accessing embedding table

@@ -41,4 +41,13 @@ void     dequant_tq2_block(const BlockTQ2 *block, float *out);
 void     dequant_i2s_row(const uint8_t *data, float *out, int n, float scale);
 void     ternary_matvec(float *out, const QWeight *W, const float *x);
 
+// Batch matvec: run multiple independent matvecs with a single OMP fork/join
+typedef struct {
+    float *out;
+    const QWeight *W;
+} MatvecTask;
+
+void ternary_matvec_batch(const MatvecTask *tasks, int n_tasks,
+                           const float *x, int8_t *x_q_buf);
+
 #endif // QUANT_H

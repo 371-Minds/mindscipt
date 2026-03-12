@@ -146,12 +146,135 @@ static void test_ternary_matvec(void) {
     printf("PASSED\n");
 }
 
+// --- Test I2_S matvec: compare single vs batch (catches SDOT quantization error) ---
+
+static void test_i2s_matvec(void) {
+    printf("test_i2s_matvec... ");
+
+    // Create I2_S weight matrix: 4 rows × 256 cols
+    // Each row needs 256/4 = 64 packed bytes + 4 bytes for float scale at end
+    int rows = 4, cols = 256;
+    int row_bytes = cols / 4;  // 64
+    size_t data_size = (size_t)rows * row_bytes + sizeof(float);
+    uint8_t *data = (uint8_t *)calloc(data_size, 1);
+
+    // Fill with a known pattern: alternating -1, +1, 0, 0
+    // Encoding: 0=-1, 1=0, 2=+1. Pack 4 per byte: bits 7-6, 5-4, 3-2, 1-0
+    // subrow0=-1(0), subrow1=+1(2), subrow2=0(1), subrow3=0(1)
+    // byte = (0<<6) | (2<<4) | (1<<2) | (1<<0) = 0x25
+    for (int r = 0; r < rows; r++) {
+        for (int b = 0; b < row_bytes; b++) {
+            data[r * row_bytes + b] = 0x25;
+        }
+    }
+
+    // Set per-tensor scale at end of packed data
+    float tensor_scale = 0.5f;
+    memcpy(data + (size_t)rows * row_bytes, &tensor_scale, sizeof(float));
+
+    QWeight W = { data, 36, rows, cols, tensor_scale };
+
+    // Input: ramp 0.1, 0.2, ..., with some variation
+    float x[256];
+    for (int i = 0; i < cols; i++) x[i] = 0.1f * (i % 17) - 0.8f;
+
+    // Reference: single-call matvec
+    float ref[4];
+    ternary_matvec(ref, &W, x);
+
+    // Batch call
+    float out1[4], out2[4];
+    int8_t x_q[256];
+    memset(out1, 0, sizeof(out1));
+    memset(out2, 0, sizeof(out2));
+
+    // Split into 2 batch tasks (2 rows each) via separate QWeights
+    size_t half_data = (size_t)2 * row_bytes;
+    QWeight W1 = { data, 36, 2, cols, tensor_scale };
+    QWeight W2 = { data + half_data, 36, 2, cols, tensor_scale };
+
+    MatvecTask tasks[2] = {
+        { out1, &W1 },
+        { out2, &W2 },
+    };
+    ternary_matvec_batch(tasks, 2, x, x_q);
+
+    // Compare with 2% relative tolerance (int8 quantization error)
+    for (int i = 0; i < 2; i++) {
+        float err = fabsf(out1[i] - ref[i]);
+        float mag = fabsf(ref[i]) + 1e-6f;
+        assert(err / mag < 0.02f);
+    }
+    for (int i = 0; i < 2; i++) {
+        float err = fabsf(out2[i] - ref[2 + i]);
+        float mag = fabsf(ref[2 + i]) + 1e-6f;
+        assert(err / mag < 0.02f);
+    }
+
+    free(data);
+    printf("PASSED\n");
+}
+
+// --- Test batch TQ2_0 matvec: verify batch produces same results as individual calls ---
+
+static void test_matvec_batch(void) {
+    printf("test_matvec_batch... ");
+
+    // Create two TQ2_0 weight matrices: 2 rows × 256 cols each
+    int n_blocks = 2;
+    BlockTQ2 *blocks1 = (BlockTQ2 *)calloc(n_blocks, sizeof(BlockTQ2));
+    BlockTQ2 *blocks2 = (BlockTQ2 *)calloc(n_blocks, sizeof(BlockTQ2));
+
+    // Matrix 1: all +1
+    for (int r = 0; r < 2; r++) {
+        for (int i = 0; i < 64; i++) blocks1[r].qs[i] = 0xAA;
+        blocks1[r].d = 0x3C00;
+    }
+
+    // Matrix 2: all -1 (qs value 0 in every field)
+    for (int r = 0; r < 2; r++) {
+        for (int i = 0; i < 64; i++) blocks2[r].qs[i] = 0x00;
+        blocks2[r].d = 0x3C00;
+    }
+
+    QWeight W1 = { blocks1, 35, 2, 256, 1.0f };
+    QWeight W2 = { blocks2, 35, 2, 256, 1.0f };
+
+    float x[256];
+    for (int i = 0; i < 256; i++) x[i] = 1.0f;
+
+    // Reference: individual calls
+    float ref1[2], ref2[2];
+    ternary_matvec(ref1, &W1, x);
+    ternary_matvec(ref2, &W2, x);
+
+    // Batch call
+    float out1[2], out2[2];
+    int8_t x_q[256];
+    MatvecTask tasks[2] = {
+        { out1, &W1 },
+        { out2, &W2 },
+    };
+    ternary_matvec_batch(tasks, 2, x, x_q);
+
+    for (int i = 0; i < 2; i++) {
+        assert(fabsf(out1[i] - ref1[i]) < 1e-3f);
+        assert(fabsf(out2[i] - ref2[i]) < 1e-3f);
+    }
+
+    free(blocks1);
+    free(blocks2);
+    printf("PASSED\n");
+}
+
 int main(void) {
     printf("=== Quant Tests ===\n");
     test_fp16_conversion();
     test_tq2_dequant();
     test_tq1_dequant();
     test_ternary_matvec();
+    test_i2s_matvec();
+    test_matvec_batch();
     printf("All quant tests passed!\n");
     return 0;
 }

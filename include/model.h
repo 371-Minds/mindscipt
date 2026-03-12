@@ -35,6 +35,7 @@ typedef struct {
     float *logits;                // [vocab_size]
     float *key_cache;             // [n_layers * seq_len * kv_dim]
     float *value_cache;           // [n_layers * seq_len * kv_dim]
+    int8_t *x_q;                  // [max(dim, hidden_dim)] scratch for int8 quantized x
 } RunState;
 
 typedef struct {
