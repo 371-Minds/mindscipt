@@ -244,12 +244,14 @@ int main(int argc, char **argv) {
             if (len == 0) continue;
             if (strcmp(line, "/quit") == 0) break;
 
-            // Encode "User: {line}"
+            // Encode "User: {line}" + EOT + "Assistant: "
+            // (matches tokenizer_config.json chat_template from HuggingFace;
+            //  the GGUF chat_template uses a different format but is incorrect)
             char user_buf[4096 + 16];
             snprintf(user_buf, sizeof(user_buf), "User: %s", line);
             int n = bn_tokenizer_encode(&tokenizer, user_buf, 0, tokens, max_tokens);
 
-            // Append eot_id
+            // Append eot_id (HF eos_token = <|eot_id|>)
             if (n < max_tokens)
                 tokens[n++] = tokenizer.eot_id;
 
