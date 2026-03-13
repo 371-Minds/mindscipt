@@ -45,7 +45,7 @@ static void test_gguf_truncated(void) {
     wb_u32(&wb, 0x46554747);  // magic
     wb_u32(&wb, 3);           // version
 
-    GGUFFile *f = gguf_open(buf, wb.pos);
+    BnGGUFFile *f = bn_gguf_open(buf, wb.pos);
     assert(f == NULL);  // should fail: truncated
 
     printf("PASSED\n");
@@ -73,14 +73,14 @@ static void test_gguf_bad_ndims(void) {
     wb_u32(&wb, 0);           // type
     wb_u64(&wb, 0);           // offset
 
-    GGUFFile *f = gguf_open(buf, wb.pos);
+    BnGGUFFile *f = bn_gguf_open(buf, wb.pos);
     assert(f == NULL);  // should fail: n_dims > 4
 
     printf("PASSED\n");
 }
 
 // ===================================================================
-// Test: gguf_get_u32 with wrong type returns 0 (#21)
+// Test: bn_gguf_get_u32 with wrong type returns 0 (#21)
 // ===================================================================
 static void test_gguf_type_mismatch(void) {
     printf("test_gguf_type_mismatch... ");
@@ -99,24 +99,24 @@ static void test_gguf_type_mismatch(void) {
     wb_u32(&wb, 8);  // type = STRING
     wb_str(&wb, "hello");
 
-    GGUFFile *f = gguf_open(buf, wb.pos);
+    BnGGUFFile *f = bn_gguf_open(buf, wb.pos);
     assert(f != NULL);
 
     // Key exists but is STRING, not UINT32 → should return 0
-    uint32_t val = gguf_get_u32(f, "test.key");
+    uint32_t val = bn_gguf_get_u32(f, "test.key");
     assert(val == 0);
 
-    // gguf_get_str should work
-    const char *str = gguf_get_str(f, "test.key");
+    // bn_gguf_get_str should work
+    const char *str = bn_gguf_get_str(f, "test.key");
     assert(str != NULL);
     assert(strcmp(str, "hello") == 0);
 
-    gguf_free(f);
+    bn_gguf_free(f);
     printf("PASSED\n");
 }
 
 // ===================================================================
-// Test: gguf_tensor_data with bad offset returns NULL (#13)
+// Test: bn_gguf_tensor_data with bad offset returns NULL (#13)
 // ===================================================================
 static void test_gguf_tensor_data_oob(void) {
     printf("test_gguf_tensor_data_oob... ");
@@ -137,24 +137,24 @@ static void test_gguf_tensor_data_oob(void) {
     wb_u32(&wb, 0);           // type = F32
     wb_u64(&wb, 999999999);   // offset way beyond buffer
 
-    GGUFFile *f = gguf_open(buf, wb.pos);
+    BnGGUFFile *f = bn_gguf_open(buf, wb.pos);
     assert(f != NULL);
 
-    int ti = gguf_find_tensor(f, "test.tensor");
+    int ti = bn_gguf_find_tensor(f, "test.tensor");
     assert(ti >= 0);
 
-    void *data = gguf_tensor_data(f, ti);
+    void *data = bn_gguf_tensor_data(f, ti);
     assert(data == NULL);  // should be NULL: offset beyond buffer
 
     // Negative index should also return NULL
-    assert(gguf_tensor_data(f, -1) == NULL);
+    assert(bn_gguf_tensor_data(f, -1) == NULL);
 
-    gguf_free(f);
+    bn_gguf_free(f);
     printf("PASSED\n");
 }
 
 // ===================================================================
-// Test: gguf_get_arr_str with negative idx returns NULL (#34)
+// Test: bn_gguf_get_arr_str with negative idx returns NULL (#34)
 // ===================================================================
 static void test_gguf_arr_str_negative_idx(void) {
     printf("test_gguf_arr_str_negative_idx... ");
@@ -176,20 +176,20 @@ static void test_gguf_arr_str_negative_idx(void) {
     wb_str(&wb, "hello");
     wb_str(&wb, "world");
 
-    GGUFFile *f = gguf_open(buf, wb.pos);
+    BnGGUFFile *f = bn_gguf_open(buf, wb.pos);
     assert(f != NULL);
 
     // Valid indices
-    assert(gguf_get_arr_str(f, "test.arr", 0) != NULL);
-    assert(gguf_get_arr_str(f, "test.arr", 1) != NULL);
+    assert(bn_gguf_get_arr_str(f, "test.arr", 0) != NULL);
+    assert(bn_gguf_get_arr_str(f, "test.arr", 1) != NULL);
 
     // Negative index → NULL
-    assert(gguf_get_arr_str(f, "test.arr", -1) == NULL);
+    assert(bn_gguf_get_arr_str(f, "test.arr", -1) == NULL);
 
     // Out of range → NULL
-    assert(gguf_get_arr_str(f, "test.arr", 2) == NULL);
+    assert(bn_gguf_get_arr_str(f, "test.arr", 2) == NULL);
 
-    gguf_free(f);
+    bn_gguf_free(f);
     printf("PASSED\n");
 }
 
@@ -200,30 +200,30 @@ static void test_sampler_edge_cases(void) {
     printf("test_sampler_edge_cases... ");
 
     // Test sampler with temp=0 (argmax)
-    Sampler s;
-    sampler_init(&s, 4, 0.0f, 0.9f, 42);
+    BnSampler s;
+    bn_sampler_init(&s, 4, 0.0f, 0.9f, 42);
 
     float logits[] = {1.0f, 3.0f, 2.0f, 0.5f};
-    int tok = sampler_sample(&s, logits);
+    int tok = bn_sampler_sample(&s, logits);
     assert(tok == 1);  // argmax should pick index 1
 
     // Test with vocab_size=1
-    sampler_init(&s, 1, 0.5f, 0.9f, 42);
+    bn_sampler_init(&s, 1, 0.5f, 0.9f, 42);
     float logits1[] = {5.0f};
-    tok = sampler_sample(&s, logits1);
+    tok = bn_sampler_sample(&s, logits1);
     assert(tok == 0);
 
     printf("PASSED\n");
 }
 
 // ===================================================================
-// Test: model_embed_token with out-of-range token (#8)
+// Test: bn_model_embed_token with out-of-range token (#8)
 // ===================================================================
 static void test_embed_token_oob(void) {
     printf("test_embed_token_oob... ");
 
     // Create a minimal model with fake embedding
-    Model m;
+    BnModel m;
     memset(&m, 0, sizeof(m));
     m.config.dim = 4;
     m.config.vocab_size = 3;
@@ -235,58 +235,58 @@ static void test_embed_token_oob(void) {
     float out[4];
 
     // Valid token
-    model_embed_token(&m, out, 0);
+    bn_model_embed_token(&m, out, 0);
     assert(out[0] == 1.0f);
 
     // Negative token → should zero out
-    model_embed_token(&m, out, -1);
+    bn_model_embed_token(&m, out, -1);
     assert(out[0] == 0.0f && out[1] == 0.0f);
 
     // Token beyond vocab → should zero out
-    model_embed_token(&m, out, 999);
+    bn_model_embed_token(&m, out, 999);
     assert(out[0] == 0.0f && out[1] == 0.0f);
 
     printf("PASSED\n");
 }
 
 // ===================================================================
-// Test: transformer_forward with bad token/pos returns NULL (#9, #10)
+// Test: bn_transformer_forward with bad token/pos returns NULL (#9, #10)
 // ===================================================================
 static void test_transformer_bounds(void) {
     printf("test_transformer_bounds... ");
 
     // Create a minimal model (just enough for bounds checks)
-    Model m;
+    BnModel m;
     memset(&m, 0, sizeof(m));
     m.config.vocab_size = 100;
     m.config.seq_len = 512;
     m.config.dim = 64;
     m.config.n_layers = 0;  // skip layer processing
 
-    // transformer_forward should reject invalid token
-    float *logits = transformer_forward(&m, -1, 0);
+    // bn_transformer_forward should reject invalid token
+    float *logits = bn_transformer_forward(&m, -1, 0);
     assert(logits == NULL);
 
-    logits = transformer_forward(&m, 100, 0);  // == vocab_size
+    logits = bn_transformer_forward(&m, 100, 0);  // == vocab_size
     assert(logits == NULL);
 
-    // transformer_forward should reject invalid pos
-    logits = transformer_forward(&m, 0, -1);
+    // bn_transformer_forward should reject invalid pos
+    logits = bn_transformer_forward(&m, 0, -1);
     assert(logits == NULL);
 
-    logits = transformer_forward(&m, 0, 512);  // == seq_len
+    logits = bn_transformer_forward(&m, 0, 512);  // == seq_len
     assert(logits == NULL);
 
     printf("PASSED\n");
 }
 
 // ===================================================================
-// Test: dequant_tq1_block produces exactly QK_K values (#35)
+// Test: bn_quant_dequant_tq1 produces exactly BN_QK_K values (#35)
 // ===================================================================
 static void test_dequant_tq1_count(void) {
     printf("test_dequant_tq1_count... ");
 
-    BlockTQ1 block;
+    BnBlockTQ1 block;
     memset(&block, 0, sizeof(block));
     block.d = 0x3C00;  // scale = 1.0
 
@@ -294,14 +294,14 @@ static void test_dequant_tq1_count(void) {
     for (int i = 0; i < 48; i++) block.qs[i] = 0;
     for (int i = 0; i < 4; i++) block.qh[i] = 0;
 
-    float out[QK_K];
+    float out[BN_QK_K];
     memset(out, 0x7F, sizeof(out));  // fill with garbage
 
-    // Should produce exactly 256 values (assertion inside dequant_tq1_block)
-    dequant_tq1_block(&block, out);
+    // Should produce exactly 256 values (assertion inside bn_quant_dequant_tq1)
+    bn_quant_dequant_tq1(&block, out);
 
     // All values should be -1.0 (all-zero packed = trit value 0 = mapped to -1)
-    for (int i = 0; i < QK_K; i++) {
+    for (int i = 0; i < BN_QK_K; i++) {
         assert(fabsf(out[i] - (-1.0f)) < 1e-5f);
     }
 
@@ -322,7 +322,7 @@ static void test_i2s_dequant(void) {
     float out[128];
     memset(out, 0, sizeof(out));
 
-    dequant_i2s_row(data, out, 128, 1.0f);
+    bn_quant_dequant_i2s(data, out, 128, 1.0f);
 
     // All 128 values should be +1.0
     for (int i = 0; i < 128; i++) {
@@ -334,7 +334,7 @@ static void test_i2s_dequant(void) {
     memset(data2, 0x55, sizeof(data2));  // 0x55 = 01_01_01_01 → all 0
 
     float out2[256];
-    dequant_i2s_row(data2, out2, 256, 1.0f);
+    bn_quant_dequant_i2s(data2, out2, 256, 1.0f);
 
     for (int i = 0; i < 256; i++) {
         assert(fabsf(out2[i] - 0.0f) < 1e-5f);
@@ -344,20 +344,20 @@ static void test_i2s_dequant(void) {
 }
 
 // ===================================================================
-// Test: platform_load_buffer with is_mmap=2 (#19)
+// Test: bn_platform_load_buffer with is_mmap=2 (#19)
 // ===================================================================
 static void test_platform_load_buffer(void) {
     printf("test_platform_load_buffer... ");
 
     uint8_t stack_buf[32] = {1, 2, 3};
-    MappedFile mf = platform_load_buffer(stack_buf, sizeof(stack_buf));
+    BnMappedFile mf = bn_platform_load_buffer(stack_buf, sizeof(stack_buf));
 
     assert(mf.data == stack_buf);
     assert(mf.size == sizeof(stack_buf));
     assert(mf.is_mmap == 2);  // externally owned
 
     // Unloading should NOT free the stack buffer
-    platform_unload_file(&mf);
+    bn_platform_unload_file(&mf);
     assert(mf.data == NULL);
 
     // Original buffer should still be valid (stack_buf[0] == 1)

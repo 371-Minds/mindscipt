@@ -1,47 +1,47 @@
-#ifndef GGUF_H
-#define GGUF_H
+#ifndef BN_GGUF_H
+#define BN_GGUF_H
 
 #include <stdint.h>
 #include <stddef.h>
 
 // GGUF value types
 enum {
-    GGUF_TYPE_UINT8   = 0,
-    GGUF_TYPE_INT8    = 1,
-    GGUF_TYPE_UINT16  = 2,
-    GGUF_TYPE_INT16   = 3,
-    GGUF_TYPE_UINT32  = 4,
-    GGUF_TYPE_INT32   = 5,
-    GGUF_TYPE_FLOAT32 = 6,
-    GGUF_TYPE_BOOL    = 7,
-    GGUF_TYPE_STRING  = 8,
-    GGUF_TYPE_ARRAY   = 9,
-    GGUF_TYPE_UINT64  = 10,
-    GGUF_TYPE_INT64   = 11,
-    GGUF_TYPE_FLOAT64 = 12,
+    BN_GGUF_TYPE_UINT8   = 0,
+    BN_GGUF_TYPE_INT8    = 1,
+    BN_GGUF_TYPE_UINT16  = 2,
+    BN_GGUF_TYPE_INT16   = 3,
+    BN_GGUF_TYPE_UINT32  = 4,
+    BN_GGUF_TYPE_INT32   = 5,
+    BN_GGUF_TYPE_FLOAT32 = 6,
+    BN_GGUF_TYPE_BOOL    = 7,
+    BN_GGUF_TYPE_STRING  = 8,
+    BN_GGUF_TYPE_ARRAY   = 9,
+    BN_GGUF_TYPE_UINT64  = 10,
+    BN_GGUF_TYPE_INT64   = 11,
+    BN_GGUF_TYPE_FLOAT64 = 12,
 };
 
 // GGUF tensor types we care about
 enum {
-    GGUF_TENSOR_F32   = 0,
-    GGUF_TENSOR_F16   = 1,
-    GGUF_TENSOR_Q6_K  = 14,
-    GGUF_TENSOR_TQ1_0 = 34,
-    GGUF_TENSOR_TQ2_0 = 35,
-    GGUF_TENSOR_I2_S  = 36,
+    BN_GGUF_TENSOR_F32   = 0,
+    BN_GGUF_TENSOR_F16   = 1,
+    BN_GGUF_TENSOR_Q6_K  = 14,
+    BN_GGUF_TENSOR_TQ1_0 = 34,
+    BN_GGUF_TENSOR_TQ2_0 = 35,
+    BN_GGUF_TENSOR_I2_S  = 36,
 };
 
 typedef struct {
     uint64_t len;
     char    *str;
-} GGUFString;
+} BnGGUFString;
 
 typedef struct {
     uint32_t elem_type;
     uint64_t n;
     void    *data;       // raw array data (for non-string arrays)
-    GGUFString *strings; // for string arrays
-} GGUFArray;
+    BnGGUFString *strings; // for string arrays
+} BnGGUFArray;
 
 typedef struct {
     char    *key;
@@ -55,13 +55,13 @@ typedef struct {
         int32_t   i32;
         float     f32;
         uint8_t   b;     // bool
-        GGUFString str;
-        GGUFArray  arr;
+        BnGGUFString str;
+        BnGGUFArray  arr;
         uint64_t  u64;
         int64_t   i64;
         double    f64;
     } value;
-} GGUFKeyValue;
+} BnGGUFKeyValue;
 
 typedef struct {
     char    *name;
@@ -69,30 +69,30 @@ typedef struct {
     uint64_t dims[4];
     uint32_t type;
     uint64_t offset;
-} GGUFTensorInfo;
+} BnGGUFTensorInfo;
 
 typedef struct {
     uint32_t      version;
     uint64_t      n_tensors;
     uint64_t      n_kv;
-    GGUFKeyValue *kvs;
-    GGUFTensorInfo *tensors;
+    BnGGUFKeyValue *kvs;
+    BnGGUFTensorInfo *tensors;
     size_t        alignment;
     size_t        data_offset;
     uint8_t      *raw;       // pointer to start of buffer (for tensor data access)
     size_t        raw_size;  // total buffer size (for bounds checking)
-} GGUFFile;
+} BnGGUFFile;
 
-GGUFFile   *gguf_open(const uint8_t *buf, size_t size);
-void        gguf_free(GGUFFile *f);
-int         gguf_find_key(GGUFFile *f, const char *key);
-uint32_t    gguf_get_u32(GGUFFile *f, const char *key);
-float       gguf_get_f32(GGUFFile *f, const char *key);
-const char *gguf_get_str(GGUFFile *f, const char *key);
-uint64_t    gguf_get_arr_n(GGUFFile *f, const char *key);
-const char *gguf_get_arr_str(GGUFFile *f, const char *key, int i);
-const void *gguf_get_arr_data(GGUFFile *f, const char *key);
-int         gguf_find_tensor(GGUFFile *f, const char *name);
-void       *gguf_tensor_data(GGUFFile *f, int idx);
+BnGGUFFile *bn_gguf_open(const uint8_t *buf, size_t size);
+void        bn_gguf_free(BnGGUFFile *f);
+int         bn_gguf_find_key(BnGGUFFile *f, const char *key);
+uint32_t    bn_gguf_get_u32(BnGGUFFile *f, const char *key);
+float       bn_gguf_get_f32(BnGGUFFile *f, const char *key);
+const char *bn_gguf_get_str(BnGGUFFile *f, const char *key);
+uint64_t    bn_gguf_get_arr_n(BnGGUFFile *f, const char *key);
+const char *bn_gguf_get_arr_str(BnGGUFFile *f, const char *key, int i);
+const void *bn_gguf_get_arr_data(BnGGUFFile *f, const char *key);
+int         bn_gguf_find_tensor(BnGGUFFile *f, const char *name);
+void       *bn_gguf_tensor_data(BnGGUFFile *f, int idx);
 
-#endif // GGUF_H
+#endif // BN_GGUF_H

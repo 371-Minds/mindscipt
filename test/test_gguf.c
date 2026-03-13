@@ -51,12 +51,12 @@ static size_t build_test_gguf(uint8_t *buf, size_t buf_size) {
 
     // KV 1: string key → u32 value
     wb_str(&wb, "test.dim");
-    wb_u32(&wb, 4);           // type = GGUF_TYPE_UINT32
+    wb_u32(&wb, 4);           // type = BN_GGUF_TYPE_UINT32
     wb_u32(&wb, 512);         // value
 
     // KV 2: string key → string value
     wb_str(&wb, "general.architecture");
-    wb_u32(&wb, 8);           // type = GGUF_TYPE_STRING
+    wb_u32(&wb, 8);           // type = BN_GGUF_TYPE_STRING
     wb_str(&wb, "bitnet");
 
     // Tensor info
@@ -88,21 +88,21 @@ static void test_parse_synthetic(void) {
     uint8_t buf[4096];
     size_t size = build_test_gguf(buf, sizeof(buf));
 
-    GGUFFile *f = gguf_open(buf, size);
+    BnGGUFFile *f = bn_gguf_open(buf, size);
     assert(f != NULL);
     assert(f->version == 3);
     assert(f->n_tensors == 1);
     assert(f->n_kv == 2);
 
     // Check KV values
-    assert(gguf_get_u32(f, "test.dim") == 512);
+    assert(bn_gguf_get_u32(f, "test.dim") == 512);
 
-    const char *arch = gguf_get_str(f, "general.architecture");
+    const char *arch = bn_gguf_get_str(f, "general.architecture");
     assert(arch != NULL);
     assert(strcmp(arch, "bitnet") == 0);
 
     // Check tensor info
-    int ti = gguf_find_tensor(f, "test.weight");
+    int ti = bn_gguf_find_tensor(f, "test.weight");
     assert(ti >= 0);
     assert(f->tensors[ti].n_dims == 2);
     assert(f->tensors[ti].dims[0] == 256);
@@ -110,7 +110,7 @@ static void test_parse_synthetic(void) {
     assert(f->tensors[ti].type == 0);
 
     // Check tensor data
-    float *data = (float *)gguf_tensor_data(f, ti);
+    float *data = (float *)bn_gguf_tensor_data(f, ti);
     assert(data != NULL);
     assert(data[0] == 1.0f);
     assert(data[1] == 2.0f);
@@ -118,10 +118,10 @@ static void test_parse_synthetic(void) {
     assert(data[3] == 4.0f);
 
     // Check missing key
-    assert(gguf_find_key(f, "nonexistent") == -1);
-    assert(gguf_find_tensor(f, "nonexistent") == -1);
+    assert(bn_gguf_find_key(f, "nonexistent") == -1);
+    assert(bn_gguf_find_tensor(f, "nonexistent") == -1);
 
-    gguf_free(f);
+    bn_gguf_free(f);
     printf("PASSED\n");
 }
 
@@ -131,7 +131,7 @@ static void test_bad_magic(void) {
     uint8_t buf[32] = {0};
     buf[0] = 'B'; buf[1] = 'A'; buf[2] = 'D'; buf[3] = '!';
 
-    GGUFFile *f = gguf_open(buf, sizeof(buf));
+    BnGGUFFile *f = bn_gguf_open(buf, sizeof(buf));
     assert(f == NULL);
 
     printf("PASSED\n");
@@ -142,14 +142,14 @@ static void test_find_key(void) {
 
     uint8_t buf[4096];
     size_t size = build_test_gguf(buf, sizeof(buf));
-    GGUFFile *f = gguf_open(buf, size);
+    BnGGUFFile *f = bn_gguf_open(buf, size);
     assert(f != NULL);
 
-    assert(gguf_find_key(f, "test.dim") == 0);
-    assert(gguf_find_key(f, "general.architecture") == 1);
-    assert(gguf_find_key(f, "missing") == -1);
+    assert(bn_gguf_find_key(f, "test.dim") == 0);
+    assert(bn_gguf_find_key(f, "general.architecture") == 1);
+    assert(bn_gguf_find_key(f, "missing") == -1);
 
-    gguf_free(f);
+    bn_gguf_free(f);
     printf("PASSED\n");
 }
 

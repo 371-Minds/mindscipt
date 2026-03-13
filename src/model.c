@@ -4,17 +4,17 @@
 #include <string.h>
 #include <math.h>
 
-// --- Helper: load a QWeight from GGUF tensor + scale tensor ---
+// --- Helper: load a BnQWeight from GGUF tensor + scale tensor ---
 
-static int load_qweight(QWeight *w, GGUFFile *f, const char *weight_name, const char *scale_name) {
-    int ti = gguf_find_tensor(f, weight_name);
+static int load_qweight(BnQWeight *w, BnGGUFFile *f, const char *weight_name, const char *scale_name) {
+    int ti = bn_gguf_find_tensor(f, weight_name);
     if (ti < 0) {
         fprintf(stderr, "model: tensor '%s' not found\n", weight_name);
         return -1;
     }
 
-    GGUFTensorInfo *info = &f->tensors[ti];
-    w->data = gguf_tensor_data(f, ti);
+    BnGGUFTensorInfo *info = &f->tensors[ti];
+    w->data = bn_gguf_tensor_data(f, ti);
     if (!w->data) {
         fprintf(stderr, "model: tensor '%s' data out of bounds\n", weight_name);
         return -1;
@@ -23,7 +23,7 @@ static int load_qweight(QWeight *w, GGUFFile *f, const char *weight_name, const 
     w->rows = (int)info->dims[1];
     w->cols = (int)info->dims[0];
 
-    if (w->type == GGUF_TENSOR_I2_S) {
+    if (w->type == BN_GGUF_TENSOR_I2_S) {
         // I2_S: per-tensor scale stored at end of packed data (offset = nelements/4)
         size_t nelements = (size_t)w->rows * w->cols;
         const uint8_t *base = (const uint8_t *)w->data;
@@ -31,9 +31,9 @@ static int load_qweight(QWeight *w, GGUFFile *f, const char *weight_name, const 
         w->scale = *scale_ptr;
     } else {
         // TQ1_0/TQ2_0: companion .scale tensor
-        int si = gguf_find_tensor(f, scale_name);
+        int si = bn_gguf_find_tensor(f, scale_name);
         if (si >= 0) {
-            float *scale_ptr = (float *)gguf_tensor_data(f, si);
+            float *scale_ptr = (float *)bn_gguf_tensor_data(f, si);
             w->scale = scale_ptr ? *scale_ptr : 1.0f;
         } else {
             w->scale = 1.0f;
@@ -45,20 +45,20 @@ static int load_qweight(QWeight *w, GGUFFile *f, const char *weight_name, const 
 
 // --- Helper: load F32 norm weights from GGUF ---
 
-static float *load_f32_tensor(GGUFFile *f, const char *name) {
-    int ti = gguf_find_tensor(f, name);
+static float *load_f32_tensor(BnGGUFFile *f, const char *name) {
+    int ti = bn_gguf_find_tensor(f, name);
     if (ti < 0) return NULL;
-    return (float *)gguf_tensor_data(f, ti);
+    return (float *)bn_gguf_tensor_data(f, ti);
 }
 
 // --- Model loading ---
 
-int model_load(Model *m, GGUFFile *f, int max_seq_len) {
-    memset(m, 0, sizeof(Model));
-    Config *c = &m->config;
+int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len) {
+    memset(m, 0, sizeof(BnModel));
+    BnConfig *c = &m->config;
 
     // Try to detect architecture prefix
-    const char *arch = gguf_get_str(f, "general.architecture");
+    const char *arch = bn_gguf_get_str(f, "general.architecture");
     char prefix[64] = "llama";
     if (arch) {
         snprintf(prefix, sizeof(prefix), "%s", arch);
@@ -68,35 +68,35 @@ int model_load(Model *m, GGUFFile *f, int max_seq_len) {
     char key[128];
 
     snprintf(key, sizeof(key), "%s.embedding_length", prefix);
-    c->dim = (int)gguf_get_u32(f, key);
+    c->dim = (int)bn_gguf_get_u32(f, key);
 
     snprintf(key, sizeof(key), "%s.feed_forward_length", prefix);
-    c->hidden_dim = (int)gguf_get_u32(f, key);
+    c->hidden_dim = (int)bn_gguf_get_u32(f, key);
 
     snprintf(key, sizeof(key), "%s.block_count", prefix);
-    c->n_layers = (int)gguf_get_u32(f, key);
+    c->n_layers = (int)bn_gguf_get_u32(f, key);
 
     snprintf(key, sizeof(key), "%s.attention.head_count", prefix);
-    c->n_heads = (int)gguf_get_u32(f, key);
+    c->n_heads = (int)bn_gguf_get_u32(f, key);
 
     snprintf(key, sizeof(key), "%s.attention.head_count_kv", prefix);
-    c->n_kv_heads = (int)gguf_get_u32(f, key);
+    c->n_kv_heads = (int)bn_gguf_get_u32(f, key);
     if (c->n_kv_heads == 0) c->n_kv_heads = c->n_heads;
 
     snprintf(key, sizeof(key), "%s.context_length", prefix);
-    c->seq_len = (int)gguf_get_u32(f, key);
+    c->seq_len = (int)bn_gguf_get_u32(f, key);
     if (max_seq_len > 0 && max_seq_len < c->seq_len) c->seq_len = max_seq_len;
 
     snprintf(key, sizeof(key), "%s.rope.freq_base", prefix);
-    c->rope_theta = gguf_get_f32(f, key);
+    c->rope_theta = bn_gguf_get_f32(f, key);
     if (c->rope_theta == 0.0f) c->rope_theta = 10000.0f;
 
     snprintf(key, sizeof(key), "%s.attention.layer_norm_rms_epsilon", prefix);
-    c->norm_eps = gguf_get_f32(f, key);
+    c->norm_eps = bn_gguf_get_f32(f, key);
     if (c->norm_eps == 0.0f) c->norm_eps = 1e-5f;
 
     // Vocab size from tokenizer metadata
-    c->vocab_size = (int)gguf_get_arr_n(f, "tokenizer.ggml.tokens");
+    c->vocab_size = (int)bn_gguf_get_arr_n(f, "tokenizer.ggml.tokens");
 
     // #15, #38: Validate BEFORE computing derived dimensions to avoid division by zero
     if (c->dim <= 0 || c->n_layers <= 0 || c->n_heads <= 0 ||
@@ -123,7 +123,7 @@ int model_load(Model *m, GGUFFile *f, int max_seq_len) {
     }
 
     // Detect FFN gate and activation type
-    c->has_ffn_gate = (gguf_find_tensor(f, "blk.0.ffn_gate.weight") >= 0) ? 1 : 0;
+    c->has_ffn_gate = (bn_gguf_find_tensor(f, "blk.0.ffn_gate.weight") >= 0) ? 1 : 0;
 
     // Check for activation type: bitnet uses ReLU² (act_type=1)
     if (arch && strncmp(arch, "bitnet", 6) == 0) {
@@ -141,15 +141,15 @@ int model_load(Model *m, GGUFFile *f, int max_seq_len) {
     #endif
 
     // --- Load weights ---
-    Weights *w = &m->weights;
+    BnWeights *w = &m->weights;
 
     // Token embedding
-    int emb_idx = gguf_find_tensor(f, "token_embd.weight");
+    int emb_idx = bn_gguf_find_tensor(f, "token_embd.weight");
     if (emb_idx < 0) {
         fprintf(stderr, "model: token_embd.weight not found\n");
         return -1;
     }
-    w->token_embedding = gguf_tensor_data(f, emb_idx);
+    w->token_embedding = bn_gguf_tensor_data(f, emb_idx);
     if (!w->token_embedding) {
         fprintf(stderr, "model: token_embd.weight data out of bounds\n");
         return -1;
@@ -164,14 +164,14 @@ int model_load(Model *m, GGUFFile *f, int max_seq_len) {
     }
 
     // Allocate per-layer weights
-    w->layers = (LayerWeights *)calloc(c->n_layers, sizeof(LayerWeights));
+    w->layers = (BnLayerWeights *)calloc(c->n_layers, sizeof(BnLayerWeights));
     if (!w->layers) {
         fprintf(stderr, "model: failed to allocate layer weights\n");
         return -1;
     }
 
     for (int i = 0; i < c->n_layers; i++) {
-        LayerWeights *lw = &w->layers[i];
+        BnLayerWeights *lw = &w->layers[i];
         char wname[128], sname[128];
 
         // #25: Attention norms — must exist
@@ -229,9 +229,9 @@ int model_load(Model *m, GGUFFile *f, int max_seq_len) {
         if (load_qweight(&lw->ffn_down, f, wname, sname) != 0) goto fail_layers;
     }
 
-    // --- Allocate RunState ---
+    // --- Allocate BnRunState ---
     // #1, #14: Check all allocations and guard against overflow
-    RunState *s = &m->state;
+    BnRunState *s = &m->state;
 
     s->x       = (float *)calloc(c->dim, sizeof(float));
     s->xb      = (float *)calloc(c->dim, sizeof(float));
@@ -281,19 +281,19 @@ int model_load(Model *m, GGUFFile *f, int max_seq_len) {
     return 0;
 
 fail_state:
-    model_free(m);
+    bn_model_free(m);
     return -1;
 
 fail_layers:
-    model_free(m);
+    bn_model_free(m);
     return -1;
 }
 
-void model_free(Model *m) {
+void bn_model_free(BnModel *m) {
     if (!m) return;
-    tp_free(m->pool);
+    bn_tp_free(m->pool);
     free(m->weights.layers);
-    RunState *s = &m->state;
+    BnRunState *s = &m->state;
     free(s->x);
     free(s->xb);
     free(s->xb2);
@@ -306,11 +306,11 @@ void model_free(Model *m) {
     free(s->value_cache);
     free(s->x_q);
     free(s->rope_freq);
-    memset(m, 0, sizeof(Model));
+    memset(m, 0, sizeof(BnModel));
 }
 
 // #8: Bounds-check token before accessing embedding table
-void model_embed_token(const Model *m, float *out, int token) {
+void bn_model_embed_token(const BnModel *m, float *out, int token) {
     int dim = m->config.dim;
 
     if (token < 0 || token >= m->config.vocab_size) {
@@ -319,14 +319,14 @@ void model_embed_token(const Model *m, float *out, int token) {
         return;
     }
 
-    if (m->weights.emb_type == GGUF_TENSOR_F16) {
+    if (m->weights.emb_type == BN_GGUF_TENSOR_F16) {
         // Dequantize one row of F16 embedding
         const uint16_t *emb = (const uint16_t *)m->weights.token_embedding;
         const uint16_t *row = emb + (size_t)token * dim;
         for (int i = 0; i < dim; i++) {
-            out[i] = fp16_to_fp32(row[i]);
+            out[i] = bn_fp16_to_fp32(row[i]);
         }
-    } else if (m->weights.emb_type == GGUF_TENSOR_F32) {
+    } else if (m->weights.emb_type == BN_GGUF_TENSOR_F32) {
         const float *emb = (const float *)m->weights.token_embedding;
         memcpy(out, emb + (size_t)token * dim, dim * sizeof(float));
     } else {

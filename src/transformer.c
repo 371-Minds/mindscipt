@@ -56,8 +56,8 @@ static void softmax(float *x, int size) {
 // --- GQA attention range function ---
 
 typedef struct {
-    const Config *c;
-    RunState *s;
+    const BnConfig *c;
+    BnRunState *s;
     size_t loff;
     int pos;
     int kv_mul;
@@ -67,8 +67,8 @@ typedef struct {
 
 static void gqa_range(void *ctx, int h_start, int h_end) {
     GQACtx *g = (GQACtx *)ctx;
-    const Config *c = g->c;
-    RunState *s = g->s;
+    const BnConfig *c = g->c;
+    BnRunState *s = g->s;
     int head_size = g->head_size;
     int kv_dim = g->kv_dim;
     int kv_mul = g->kv_mul;
@@ -203,7 +203,7 @@ static void logits_f16_scalar_range(void *ctx, int v_start, int v_end) {
         const uint16_t *row = emb + (size_t)v * dim;
         float sum = 0.0f;
         for (int d = 0; d < dim; d++) {
-            sum += fp16_to_fp32(row[d]) * x[d];
+            sum += bn_fp16_to_fp32(row[d]) * x[d];
         }
         lc->logits[v] = sum;
     }
@@ -228,10 +228,10 @@ static void logits_f32_range(void *ctx, int v_start, int v_end) {
 
 // --- Forward pass ---
 
-float *transformer_forward(Model *m, int token, int pos) {
-    Config *c = &m->config;
-    Weights *w = &m->weights;
-    RunState *s = &m->state;
+float *bn_transformer_forward(BnModel *m, int token, int pos) {
+    BnConfig *c = &m->config;
+    BnWeights *w = &m->weights;
+    BnRunState *s = &m->state;
     int dim = c->dim;
     int hidden_dim = c->hidden_dim;
     int kv_dim = c->kv_dim;
@@ -251,7 +251,7 @@ float *transformer_forward(Model *m, int token, int pos) {
     }
 
     // Embed the token
-    model_embed_token(m, s->x, token);
+    bn_model_embed_token(m, s->x, token);
 
     // Precompute RoPE cos/sin for this position (128 trig calls total,
     // vs 96,000 if computed per-head per-layer)
@@ -265,7 +265,7 @@ float *transformer_forward(Model *m, int token, int pos) {
 
     // Process each layer
     for (int l = 0; l < c->n_layers; l++) {
-        LayerWeights *lw = &w->layers[l];
+        BnLayerWeights *lw = &w->layers[l];
         size_t loff = (size_t)l * c->seq_len * kv_dim;
         float *key_cache_row   = s->key_cache   + loff + (size_t)pos * kv_dim;
         float *value_cache_row = s->value_cache + loff + (size_t)pos * kv_dim;
@@ -274,14 +274,14 @@ float *transformer_forward(Model *m, int token, int pos) {
 
         rmsnorm(s->xb, s->x, lw->attn_norm, dim, c->norm_eps);
 
-        // QKV projections (unified path — ternary_matvec_batch handles SDOT internally)
+        // QKV projections (unified path — bn_quant_matvec_batch handles SDOT internally)
         {
-            MatvecTask qkv[3] = {
+            BnMatvecTask qkv[3] = {
                 { s->q,            &lw->wq },
                 { key_cache_row,   &lw->wk },
                 { value_cache_row, &lw->wv },
             };
-            ternary_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
+            bn_quant_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
         }
 
         // RoPE using precomputed cos/sin (no trig calls here)
@@ -301,8 +301,8 @@ float *transformer_forward(Model *m, int token, int pos) {
         // GQA attention
         {
             GQACtx gctx = { c, s, loff, pos, kv_mul, head_size, kv_dim };
-            TPTask gqa = { gqa_range, &gctx, c->n_heads };
-            tp_dispatch(m->pool, &gqa, 1);
+            BnTPTask gqa = { gqa_range, &gctx, c->n_heads };
+            bn_tp_dispatch(m->pool, &gqa, 1);
         }
 
         // Attention sub-norm + wo projection
@@ -310,8 +310,8 @@ float *transformer_forward(Model *m, int token, int pos) {
             rmsnorm(s->xb, s->xb, lw->attn_sub_norm, dim, c->norm_eps);
 
         {
-            MatvecTask wo[1] = {{ s->xb2, &lw->wo }};
-            ternary_matvec_batch(wo, 1, s->xb, s->x_q, m->pool);
+            BnMatvecTask wo[1] = {{ s->xb2, &lw->wo }};
+            bn_quant_matvec_batch(wo, 1, s->xb, s->x_q, m->pool);
         }
 
         // Residual connection
@@ -329,11 +329,11 @@ float *transformer_forward(Model *m, int token, int pos) {
         if (c->has_ffn_gate) {
             // Gate + Up in one dispatch
             {
-                MatvecTask ffn[2] = {
+                BnMatvecTask ffn[2] = {
                     { s->hb,  &lw->ffn_gate },
                     { s->hb2, &lw->ffn_up   },
                 };
-                ternary_matvec_batch(ffn, 2, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch(ffn, 2, s->xb, s->x_q, m->pool);
             }
 
             // Activation
@@ -358,8 +358,8 @@ float *transformer_forward(Model *m, int token, int pos) {
             }
         } else {
             {
-                MatvecTask ffn[1] = {{ s->hb, &lw->ffn_up }};
-                ternary_matvec_batch(ffn, 1, s->xb, s->x_q, m->pool);
+                BnMatvecTask ffn[1] = {{ s->hb, &lw->ffn_up }};
+                bn_quant_matvec_batch(ffn, 1, s->xb, s->x_q, m->pool);
             }
 
             if (c->act_type == 1) {
@@ -380,8 +380,8 @@ float *transformer_forward(Model *m, int token, int pos) {
             rmsnorm(s->hb, s->hb, lw->ffn_sub_norm, hidden_dim, c->norm_eps);
 
         {
-            MatvecTask down[1] = {{ s->xb, &lw->ffn_down }};
-            ternary_matvec_batch(down, 1, s->hb, s->x_q, m->pool);
+            BnMatvecTask down[1] = {{ s->xb, &lw->ffn_down }};
+            bn_quant_matvec_batch(down, 1, s->hb, s->x_q, m->pool);
         }
 
         // Residual connection
@@ -404,7 +404,7 @@ float *transformer_forward(Model *m, int token, int pos) {
     rmsnorm(s->x, s->x, w->output_norm, dim, c->norm_eps);
 
     // Tied embeddings: logits = token_embedding^T @ x
-    if (m->weights.emb_type == GGUF_TENSOR_F16) {
+    if (m->weights.emb_type == BN_GGUF_TENSOR_F16) {
         const uint16_t *emb = (const uint16_t *)w->token_embedding;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
         // Convert x to F16 once for native F16 FMA
@@ -415,23 +415,23 @@ float *transformer_forward(Model *m, int token, int pos) {
             vst1q_u16(x_f16 + d, vreinterpretq_u16_f16(vcombine_f16(lo, hi)));
         }
         LogitsCtx lctx = { s->logits, (const float *)(void *)x_f16, emb, dim };
-        TPTask logits_task = { logits_f16_native_range, &lctx, c->vocab_size };
-        tp_dispatch(m->pool, &logits_task, 1);
+        BnTPTask logits_task = { logits_f16_native_range, &lctx, c->vocab_size };
+        bn_tp_dispatch(m->pool, &logits_task, 1);
 #elif defined(__ARM_NEON)
         LogitsCtx lctx = { s->logits, s->x, emb, dim };
-        TPTask logits_task = { logits_f16_neon_range, &lctx, c->vocab_size };
-        tp_dispatch(m->pool, &logits_task, 1);
+        BnTPTask logits_task = { logits_f16_neon_range, &lctx, c->vocab_size };
+        bn_tp_dispatch(m->pool, &logits_task, 1);
 #else
         LogitsCtx lctx = { s->logits, s->x, emb, dim };
-        TPTask logits_task = { logits_f16_scalar_range, &lctx, c->vocab_size };
-        tp_dispatch(m->pool, &logits_task, 1);
+        BnTPTask logits_task = { logits_f16_scalar_range, &lctx, c->vocab_size };
+        bn_tp_dispatch(m->pool, &logits_task, 1);
 #endif
     } else {
         // F32 embeddings
         const float *emb = (const float *)w->token_embedding;
         LogitsCtx lctx = { s->logits, s->x, emb, dim };
-        TPTask logits_task = { logits_f32_range, &lctx, c->vocab_size };
-        tp_dispatch(m->pool, &logits_task, 1);
+        BnTPTask logits_task = { logits_f32_range, &lctx, c->vocab_size };
+        bn_tp_dispatch(m->pool, &logits_task, 1);
     }
 
     return s->logits;

@@ -1,26 +1,26 @@
-#ifndef QUANT_H
-#define QUANT_H
+#ifndef BN_QUANT_H
+#define BN_QUANT_H
 
 #include <stdint.h>
 #include "threadpool.h"
 
-#define QK_K 256
+#define BN_QK_K 256
 
 // TQ1_0: base-3 ternary packing, 256 weights per block
 // qs packs 240 values (5 per byte in base-3), qh packs remaining 16 (4 per byte)
 // Total: 48 + 4 + 2 = 54 bytes per 256-element block (1.6875 bpw)
 typedef struct {
-    uint8_t  qs[(QK_K - 4 * QK_K / 64) / 5];  // 48 bytes: (256-16)/5
-    uint8_t  qh[QK_K / 64];                    // 4 bytes
+    uint8_t  qs[(BN_QK_K - 4 * BN_QK_K / 64) / 5];  // 48 bytes: (256-16)/5
+    uint8_t  qh[BN_QK_K / 64];                    // 4 bytes
     uint16_t d;                                  // FP16 scale
-} BlockTQ1;
+} BnBlockTQ1;
 
 // TQ2_0: 2-bit ternary packing, 256 weights per block
 // 64 bytes qs (4 weights per byte), 2 bytes scale per block
 typedef struct {
-    uint8_t  qs[QK_K / 4];  // 64 bytes
+    uint8_t  qs[BN_QK_K / 4];  // 64 bytes
     uint16_t d;              // FP16 scale
-} BlockTQ2;
+} BnBlockTQ2;
 
 // I2_S: Microsoft BitNet 2-bit ternary, no per-block scale
 // Interleaved byte layout: each byte packs 4 values from 4 sub-rows of 32
@@ -30,31 +30,31 @@ typedef struct {
 // Ternary weight tensor descriptor (zero-copy into GGUF buffer)
 typedef struct {
     const void *data;   // packed weight data
-    int type;           // GGUF_TENSOR_TQ1_0, TQ2_0, or I2_S
+    int type;           // BN_GGUF_TENSOR_TQ1_0, TQ2_0, or I2_S
     int rows, cols;
     float scale;        // per-tensor scale (from .scale tensor or embedded in data)
-} QWeight;
+} BnQWeight;
 
-float    fp16_to_fp32(uint16_t h);
-uint16_t fp32_to_fp16(float f);
-void     dequant_tq1_block(const BlockTQ1 *block, float *out);
-void     dequant_tq2_block(const BlockTQ2 *block, float *out);
-void     dequant_i2s_row(const uint8_t *data, float *out, int n, float scale);
-void     ternary_matvec(float *out, const QWeight *W, const float *x,
-                         int8_t *x_q_buf, ThreadPool *pool);
+float    bn_fp16_to_fp32(uint16_t h);
+uint16_t bn_fp32_to_fp16(float f);
+void     bn_quant_dequant_tq1(const BnBlockTQ1 *block, float *out);
+void     bn_quant_dequant_tq2(const BnBlockTQ2 *block, float *out);
+void     bn_quant_dequant_i2s(const uint8_t *data, float *out, int n, float scale);
+void     bn_quant_matvec(float *out, const BnQWeight *W, const float *x,
+                         int8_t *x_q_buf, BnThreadPool *pool);
 
 // Batch matvec: run multiple independent matvecs with a single dispatch
 typedef struct {
     float *out;
-    const QWeight *W;
-} MatvecTask;
+    const BnQWeight *W;
+} BnMatvecTask;
 
-void ternary_matvec_batch(const MatvecTask *tasks, int n_tasks,
-                           const float *x, int8_t *x_q_buf, ThreadPool *pool);
+void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
+                           const float *x, int8_t *x_q_buf, BnThreadPool *pool);
 
 // Quantize float vector to int8, returns scale = amax/127.
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-float quantize_x_to_i8(const float *x, int8_t *x_q, int n);
+float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n);
 #endif
 
-#endif // QUANT_H
+#endif // BN_QUANT_H

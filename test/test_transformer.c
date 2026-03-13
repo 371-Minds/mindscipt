@@ -128,7 +128,7 @@ static void test_fp16_embed(void) {
     uint16_t fp16_vals[] = {0x3C00, 0x4000, 0xBC00, 0x0000};  // 1.0, 2.0, -1.0, 0.0
     float f32_vals[4];
     for (int i = 0; i < 4; i++) {
-        f32_vals[i] = fp16_to_fp32(fp16_vals[i]);
+        f32_vals[i] = bn_fp16_to_fp32(fp16_vals[i]);
     }
 
     assert(fabsf(f32_vals[0] - 1.0f) < 1e-6f);

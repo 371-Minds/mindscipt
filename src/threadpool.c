@@ -9,15 +9,15 @@
 #endif
 
 typedef struct {
-    ThreadPool *pool;
+    BnThreadPool *pool;
     int tid;
 } WorkerArg;
 
-struct ThreadPool {
+struct BnThreadPool {
     pthread_t    *threads;
     int           n_workers;   // background threads
     int           n_threads;   // n_workers + 1 (main)
-    const TPTask *tasks;
+    const BnTPTask *tasks;
     int           n_tasks;
     pthread_mutex_t mtx;
     pthread_cond_t  work_cond;
@@ -29,7 +29,7 @@ struct ThreadPool {
 };
 
 // Execute all tasks for a given thread id
-static void tp_execute(const ThreadPool *pool, int tid) {
+static void tp_execute(const BnThreadPool *pool, int tid) {
     int nt = pool->n_threads;
     for (int t = 0; t < pool->n_tasks; t++) {
         int n = pool->tasks[t].n;
@@ -43,7 +43,7 @@ static void tp_execute(const ThreadPool *pool, int tid) {
 
 static void *worker_loop(void *arg) {
     WorkerArg *wa = (WorkerArg *)arg;
-    ThreadPool *pool = wa->pool;
+    BnThreadPool *pool = wa->pool;
     int tid = wa->tid;
     free(wa);
 
@@ -78,10 +78,10 @@ static void *worker_loop(void *arg) {
     }
 }
 
-ThreadPool *tp_create(int n_workers) {
+BnThreadPool *bn_tp_create(int n_workers) {
     if (n_workers <= 0) return NULL;
 
-    ThreadPool *pool = (ThreadPool *)calloc(1, sizeof(ThreadPool));
+    BnThreadPool *pool = (BnThreadPool *)calloc(1, sizeof(BnThreadPool));
     if (!pool) return NULL;
 
     pool->n_workers = n_workers;
@@ -132,7 +132,7 @@ fail:
     return NULL;
 }
 
-void tp_free(ThreadPool *pool) {
+void bn_tp_free(BnThreadPool *pool) {
     if (!pool) return;
 
     pthread_mutex_lock(&pool->mtx);
@@ -151,7 +151,7 @@ void tp_free(ThreadPool *pool) {
     free(pool);
 }
 
-void tp_dispatch(ThreadPool *pool, const TPTask *tasks, int n_tasks) {
+void bn_tp_dispatch(BnThreadPool *pool, const BnTPTask *tasks, int n_tasks) {
     if (n_tasks <= 0) return;
 
     // Serial fallback when no pool
@@ -164,7 +164,7 @@ void tp_dispatch(ThreadPool *pool, const TPTask *tasks, int n_tasks) {
         return;
     }
 
-    assert(!pool->dispatching && "tp_dispatch is not reentrant");
+    assert(!pool->dispatching && "bn_tp_dispatch is not reentrant");
     pool->dispatching = 1;
 
     // Set up work and wake workers
@@ -189,6 +189,6 @@ void tp_dispatch(ThreadPool *pool, const TPTask *tasks, int n_tasks) {
     pool->dispatching = 0;
 }
 
-int tp_num_threads(const ThreadPool *pool) {
+int bn_tp_num_threads(const BnThreadPool *pool) {
     return pool ? pool->n_threads : 1;
 }

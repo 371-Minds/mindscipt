@@ -1,5 +1,5 @@
-#ifndef MODEL_H
-#define MODEL_H
+#ifndef BN_MODEL_H
+#define BN_MODEL_H
 
 #include "platform.h"
 #include "gguf.h"
@@ -12,21 +12,21 @@ typedef struct {
     float rope_theta, norm_eps;
     int head_size, kv_dim, kv_mul;  // derived
     int has_ffn_gate, act_type;     // 0=SiLU, 1=ReLU²
-} Config;
+} BnConfig;
 
 typedef struct {
     float *attn_norm, *attn_sub_norm;       // RMSNorm weights [dim]
-    QWeight wq, wk, wv, wo;                 // ternary attention weights
+    BnQWeight wq, wk, wv, wo;                 // ternary attention weights
     float *ffn_norm, *ffn_sub_norm;         // RMSNorm weights
-    QWeight ffn_gate, ffn_up, ffn_down;     // ternary FFN weights
-} LayerWeights;
+    BnQWeight ffn_gate, ffn_up, ffn_down;     // ternary FFN weights
+} BnLayerWeights;
 
 typedef struct {
     const void *token_embedding;  // raw F16 data (dequant on demand)
     int emb_type;                 // tensor type (F16, Q6_K, etc.)
     float *output_norm;           // [dim]
-    LayerWeights *layers;         // [n_layers]
-} Weights;
+    BnLayerWeights *layers;         // [n_layers]
+} BnWeights;
 
 typedef struct {
     float *x, *xb, *xb2;         // [dim] activation buffers
@@ -38,18 +38,18 @@ typedef struct {
     float *value_cache;           // [n_layers * seq_len * kv_dim]
     int8_t *x_q;                  // [max(dim, hidden_dim)] scratch for int8 quantized x
     float *rope_freq;             // [head_size/2] precomputed RoPE frequencies
-} RunState;
+} BnRunState;
 
 typedef struct {
-    Config config;
-    Weights weights;
-    RunState state;
-    MappedFile file;  // keeps mmap/buffer alive
-    ThreadPool *pool; // thread pool for parallel dispatch
-} Model;
+    BnConfig config;
+    BnWeights weights;
+    BnRunState state;
+    BnMappedFile file;  // keeps mmap/buffer alive
+    BnThreadPool *pool; // thread pool for parallel dispatch
+} BnModel;
 
-int  model_load(Model *m, GGUFFile *f, int max_seq_len);
-void model_free(Model *m);
-void model_embed_token(const Model *m, float *out, int token);
+int  bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len);
+void bn_model_free(BnModel *m);
+void bn_model_embed_token(const BnModel *m, float *out, int token);
 
-#endif // MODEL_H
+#endif // BN_MODEL_H

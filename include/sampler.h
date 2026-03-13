@@ -1,5 +1,5 @@
-#ifndef SAMPLER_H
-#define SAMPLER_H
+#ifndef BN_SAMPLER_H
+#define BN_SAMPLER_H
 
 #include <stdint.h>
 
@@ -8,9 +8,9 @@ typedef struct {
     float    temperature;
     float    topp;
     uint64_t rng_state;
-} Sampler;
+} BnSampler;
 
-void sampler_init(Sampler *s, int vocab_size, float temp, float topp, uint64_t seed);
-int  sampler_sample(Sampler *s, float *logits);
+void bn_sampler_init(BnSampler *s, int vocab_size, float temp, float topp, uint64_t seed);
+int  bn_sampler_sample(BnSampler *s, float *logits);
 
-#endif // SAMPLER_H
+#endif // BN_SAMPLER_H

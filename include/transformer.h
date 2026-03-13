@@ -1,9 +1,9 @@
-#ifndef TRANSFORMER_H
-#define TRANSFORMER_H
+#ifndef BN_TRANSFORMER_H
+#define BN_TRANSFORMER_H
 
 #include "model.h"
 
 // Run one token through the transformer, returns pointer to logits
-float *transformer_forward(Model *m, int token, int pos);
+float *bn_transformer_forward(BnModel *m, int token, int pos);
 
-#endif // TRANSFORMER_H
+#endif // BN_TRANSFORMER_H

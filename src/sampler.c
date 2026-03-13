@@ -13,7 +13,7 @@ static float rng_float(uint64_t *state) {
     return (rng_next(state) >> 8) / 16777216.0f;
 }
 
-void sampler_init(Sampler *s, int vocab_size, float temp, float topp, uint64_t seed) {
+void bn_sampler_init(BnSampler *s, int vocab_size, float temp, float topp, uint64_t seed) {
     s->vocab_size = vocab_size;
     s->temperature = temp;
     s->topp = topp;
@@ -108,7 +108,7 @@ static int sample_topp(float *probs, int n, float topp, uint64_t *rng) {
     return result;
 }
 
-int sampler_sample(Sampler *s, float *logits) {
+int bn_sampler_sample(BnSampler *s, float *logits) {
     if (s->temperature == 0.0f) {
         return argmax(logits, s->vocab_size);
     }

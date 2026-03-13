@@ -78,8 +78,8 @@ static char *read_string(Reader *r) {
 }
 
 // #3: NULL-check malloc return
-static GGUFString read_gguf_string(Reader *r) {
-    GGUFString s = {0};
+static BnGGUFString read_gguf_string(Reader *r) {
+    BnGGUFString s = {0};
     s.len = read_u64(r);
     if (r->error || !reader_ok(r, s.len)) { r->error = 1; return s; }
     if (s.len > (uint64_t)1 << 30) { r->error = 1; return s; }
@@ -94,38 +94,38 @@ static GGUFString read_gguf_string(Reader *r) {
 // Size of a scalar GGUF value type
 static size_t gguf_type_size(uint32_t type) {
     switch (type) {
-        case GGUF_TYPE_UINT8:   return 1;
-        case GGUF_TYPE_INT8:    return 1;
-        case GGUF_TYPE_UINT16:  return 2;
-        case GGUF_TYPE_INT16:   return 2;
-        case GGUF_TYPE_UINT32:  return 4;
-        case GGUF_TYPE_INT32:   return 4;
-        case GGUF_TYPE_FLOAT32: return 4;
-        case GGUF_TYPE_BOOL:    return 1;
-        case GGUF_TYPE_UINT64:  return 8;
-        case GGUF_TYPE_INT64:   return 8;
-        case GGUF_TYPE_FLOAT64: return 8;
+        case BN_GGUF_TYPE_UINT8:   return 1;
+        case BN_GGUF_TYPE_INT8:    return 1;
+        case BN_GGUF_TYPE_UINT16:  return 2;
+        case BN_GGUF_TYPE_INT16:   return 2;
+        case BN_GGUF_TYPE_UINT32:  return 4;
+        case BN_GGUF_TYPE_INT32:   return 4;
+        case BN_GGUF_TYPE_FLOAT32: return 4;
+        case BN_GGUF_TYPE_BOOL:    return 1;
+        case BN_GGUF_TYPE_UINT64:  return 8;
+        case BN_GGUF_TYPE_INT64:   return 8;
+        case BN_GGUF_TYPE_FLOAT64: return 8;
         default: return 0;
     }
 }
 
-static void read_kv_value(Reader *r, GGUFKeyValue *kv) {
+static void read_kv_value(Reader *r, BnGGUFKeyValue *kv) {
     if (r->error) return;
     switch (kv->type) {
-        case GGUF_TYPE_UINT8:   kv->value.u8 = read_u8(r);   break;
-        case GGUF_TYPE_INT8:    kv->value.i8 = (int8_t)read_u8(r); break;
-        case GGUF_TYPE_UINT16:  kv->value.u16 = read_u16(r);  break;
-        case GGUF_TYPE_INT16:   kv->value.i16 = (int16_t)read_u16(r); break;
-        case GGUF_TYPE_UINT32:  kv->value.u32 = read_u32(r);  break;
-        case GGUF_TYPE_INT32:   kv->value.i32 = (int32_t)read_u32(r); break;
-        case GGUF_TYPE_FLOAT32: kv->value.f32 = read_f32(r);  break;
-        case GGUF_TYPE_BOOL:    kv->value.b = read_u8(r);     break;
-        case GGUF_TYPE_STRING:  kv->value.str = read_gguf_string(r); break;
-        case GGUF_TYPE_UINT64:  kv->value.u64 = read_u64(r);  break;
-        case GGUF_TYPE_INT64:   kv->value.i64 = (int64_t)read_u64(r); break;
-        case GGUF_TYPE_FLOAT64: kv->value.f64 = read_f64(r);  break;
-        case GGUF_TYPE_ARRAY: {
-            GGUFArray *a = &kv->value.arr;
+        case BN_GGUF_TYPE_UINT8:   kv->value.u8 = read_u8(r);   break;
+        case BN_GGUF_TYPE_INT8:    kv->value.i8 = (int8_t)read_u8(r); break;
+        case BN_GGUF_TYPE_UINT16:  kv->value.u16 = read_u16(r);  break;
+        case BN_GGUF_TYPE_INT16:   kv->value.i16 = (int16_t)read_u16(r); break;
+        case BN_GGUF_TYPE_UINT32:  kv->value.u32 = read_u32(r);  break;
+        case BN_GGUF_TYPE_INT32:   kv->value.i32 = (int32_t)read_u32(r); break;
+        case BN_GGUF_TYPE_FLOAT32: kv->value.f32 = read_f32(r);  break;
+        case BN_GGUF_TYPE_BOOL:    kv->value.b = read_u8(r);     break;
+        case BN_GGUF_TYPE_STRING:  kv->value.str = read_gguf_string(r); break;
+        case BN_GGUF_TYPE_UINT64:  kv->value.u64 = read_u64(r);  break;
+        case BN_GGUF_TYPE_INT64:   kv->value.i64 = (int64_t)read_u64(r); break;
+        case BN_GGUF_TYPE_FLOAT64: kv->value.f64 = read_f64(r);  break;
+        case BN_GGUF_TYPE_ARRAY: {
+            BnGGUFArray *a = &kv->value.arr;
             a->elem_type = read_u32(r);
             a->n = read_u64(r);
             a->data = NULL;
@@ -133,10 +133,10 @@ static void read_kv_value(Reader *r, GGUFKeyValue *kv) {
             if (r->error) break;
 
             // #4: Overflow check on array size
-            if (a->elem_type == GGUF_TYPE_STRING) {
-                if (a->n > SIZE_MAX / sizeof(GGUFString)) { r->error = 1; break; }
+            if (a->elem_type == BN_GGUF_TYPE_STRING) {
+                if (a->n > SIZE_MAX / sizeof(BnGGUFString)) { r->error = 1; break; }
                 // #18: NULL-check malloc
-                a->strings = (GGUFString *)malloc((size_t)a->n * sizeof(GGUFString));
+                a->strings = (BnGGUFString *)malloc((size_t)a->n * sizeof(BnGGUFString));
                 if (!a->strings) { r->error = 1; break; }
                 for (uint64_t i = 0; i < a->n; i++) {
                     a->strings[i] = read_gguf_string(r);
@@ -162,7 +162,7 @@ static size_t align_up(size_t offset, size_t alignment) {
     return offset + (alignment - (offset % alignment)) % alignment;
 }
 
-GGUFFile *gguf_open(const uint8_t *buf, size_t size) {
+BnGGUFFile *bn_gguf_open(const uint8_t *buf, size_t size) {
     Reader r = { buf, 0, size, 0 };
 
     // Check minimum size and magic
@@ -174,7 +174,7 @@ GGUFFile *gguf_open(const uint8_t *buf, size_t size) {
         return NULL;
     }
 
-    GGUFFile *f = (GGUFFile *)calloc(1, sizeof(GGUFFile));
+    BnGGUFFile *f = (BnGGUFFile *)calloc(1, sizeof(BnGGUFFile));
     if (!f) return NULL;
     f->raw = (uint8_t *)buf;
     f->raw_size = size;  // #13: store buffer size for bounds checking
@@ -198,7 +198,7 @@ GGUFFile *gguf_open(const uint8_t *buf, size_t size) {
     }
 
     // Read KV pairs
-    f->kvs = (GGUFKeyValue *)calloc((size_t)f->n_kv, sizeof(GGUFKeyValue));
+    f->kvs = (BnGGUFKeyValue *)calloc((size_t)f->n_kv, sizeof(BnGGUFKeyValue));
     if (f->n_kv > 0 && !f->kvs) { free(f); return NULL; }
 
     for (uint64_t i = 0; i < f->n_kv; i++) {
@@ -211,13 +211,13 @@ GGUFFile *gguf_open(const uint8_t *buf, size_t size) {
 
         // Check for alignment override
         if (f->kvs[i].key && strcmp(f->kvs[i].key, "general.alignment") == 0
-            && f->kvs[i].type == GGUF_TYPE_UINT32) {
+            && f->kvs[i].type == BN_GGUF_TYPE_UINT32) {
             f->alignment = f->kvs[i].value.u32;
         }
     }
 
     // Read tensor infos
-    f->tensors = (GGUFTensorInfo *)calloc((size_t)f->n_tensors, sizeof(GGUFTensorInfo));
+    f->tensors = (BnGGUFTensorInfo *)calloc((size_t)f->n_tensors, sizeof(BnGGUFTensorInfo));
     if (f->n_tensors > 0 && !f->tensors) goto fail;
 
     for (uint64_t i = 0; i < f->n_tensors; i++) {
@@ -249,19 +249,19 @@ GGUFFile *gguf_open(const uint8_t *buf, size_t size) {
     return f;
 
 fail:
-    gguf_free(f);
+    bn_gguf_free(f);
     return NULL;
 }
 
-void gguf_free(GGUFFile *f) {
+void bn_gguf_free(BnGGUFFile *f) {
     if (!f) return;
     if (f->kvs) {
         for (uint64_t i = 0; i < f->n_kv; i++) {
             free(f->kvs[i].key);
-            if (f->kvs[i].type == GGUF_TYPE_STRING) {
+            if (f->kvs[i].type == BN_GGUF_TYPE_STRING) {
                 free(f->kvs[i].value.str.str);
-            } else if (f->kvs[i].type == GGUF_TYPE_ARRAY) {
-                GGUFArray *a = &f->kvs[i].value.arr;
+            } else if (f->kvs[i].type == BN_GGUF_TYPE_ARRAY) {
+                BnGGUFArray *a = &f->kvs[i].value.arr;
                 if (a->strings) {
                     for (uint64_t j = 0; j < a->n; j++) {
                         free(a->strings[j].str);
@@ -281,7 +281,7 @@ void gguf_free(GGUFFile *f) {
     free(f);
 }
 
-int gguf_find_key(GGUFFile *f, const char *key) {
+int bn_gguf_find_key(BnGGUFFile *f, const char *key) {
     for (uint64_t i = 0; i < f->n_kv; i++) {
         if (f->kvs[i].key && strcmp(f->kvs[i].key, key) == 0) {
             // #22: Guard against truncation of huge index
@@ -293,52 +293,52 @@ int gguf_find_key(GGUFFile *f, const char *key) {
 }
 
 // #21: Type-validated getters
-uint32_t gguf_get_u32(GGUFFile *f, const char *key) {
-    int i = gguf_find_key(f, key);
+uint32_t bn_gguf_get_u32(BnGGUFFile *f, const char *key) {
+    int i = bn_gguf_find_key(f, key);
     if (i < 0) return 0;
-    if (f->kvs[i].type != GGUF_TYPE_UINT32) return 0;
+    if (f->kvs[i].type != BN_GGUF_TYPE_UINT32) return 0;
     return f->kvs[i].value.u32;
 }
 
-float gguf_get_f32(GGUFFile *f, const char *key) {
-    int i = gguf_find_key(f, key);
+float bn_gguf_get_f32(BnGGUFFile *f, const char *key) {
+    int i = bn_gguf_find_key(f, key);
     if (i < 0) return 0.0f;
-    if (f->kvs[i].type != GGUF_TYPE_FLOAT32) return 0.0f;
+    if (f->kvs[i].type != BN_GGUF_TYPE_FLOAT32) return 0.0f;
     return f->kvs[i].value.f32;
 }
 
-const char *gguf_get_str(GGUFFile *f, const char *key) {
-    int i = gguf_find_key(f, key);
+const char *bn_gguf_get_str(BnGGUFFile *f, const char *key) {
+    int i = bn_gguf_find_key(f, key);
     if (i < 0) return NULL;
-    if (f->kvs[i].type != GGUF_TYPE_STRING) return NULL;
+    if (f->kvs[i].type != BN_GGUF_TYPE_STRING) return NULL;
     return f->kvs[i].value.str.str;
 }
 
-uint64_t gguf_get_arr_n(GGUFFile *f, const char *key) {
-    int i = gguf_find_key(f, key);
+uint64_t bn_gguf_get_arr_n(BnGGUFFile *f, const char *key) {
+    int i = bn_gguf_find_key(f, key);
     if (i < 0) return 0;
-    if (f->kvs[i].type != GGUF_TYPE_ARRAY) return 0;
+    if (f->kvs[i].type != BN_GGUF_TYPE_ARRAY) return 0;
     return f->kvs[i].value.arr.n;
 }
 
 // #34: Explicit negative idx check
-const char *gguf_get_arr_str(GGUFFile *f, const char *key, int idx) {
-    int i = gguf_find_key(f, key);
+const char *bn_gguf_get_arr_str(BnGGUFFile *f, const char *key, int idx) {
+    int i = bn_gguf_find_key(f, key);
     if (i < 0) return NULL;
-    if (f->kvs[i].type != GGUF_TYPE_ARRAY) return NULL;
-    GGUFArray *a = &f->kvs[i].value.arr;
+    if (f->kvs[i].type != BN_GGUF_TYPE_ARRAY) return NULL;
+    BnGGUFArray *a = &f->kvs[i].value.arr;
     if (!a->strings || idx < 0 || (uint64_t)idx >= a->n) return NULL;
     return a->strings[idx].str;
 }
 
-const void *gguf_get_arr_data(GGUFFile *f, const char *key) {
-    int i = gguf_find_key(f, key);
+const void *bn_gguf_get_arr_data(BnGGUFFile *f, const char *key) {
+    int i = bn_gguf_find_key(f, key);
     if (i < 0) return NULL;
-    if (f->kvs[i].type != GGUF_TYPE_ARRAY) return NULL;
+    if (f->kvs[i].type != BN_GGUF_TYPE_ARRAY) return NULL;
     return f->kvs[i].value.arr.data;
 }
 
-int gguf_find_tensor(GGUFFile *f, const char *name) {
+int bn_gguf_find_tensor(BnGGUFFile *f, const char *name) {
     for (uint64_t i = 0; i < f->n_tensors; i++) {
         if (f->tensors[i].name && strcmp(f->tensors[i].name, name) == 0) {
             if (i > (uint64_t)INT32_MAX) return -1;
@@ -349,7 +349,7 @@ int gguf_find_tensor(GGUFFile *f, const char *name) {
 }
 
 // #13: Validate that tensor data pointer falls within the mapped buffer
-void *gguf_tensor_data(GGUFFile *f, int idx) {
+void *bn_gguf_tensor_data(BnGGUFFile *f, int idx) {
     if (idx < 0 || (uint64_t)idx >= f->n_tensors) return NULL;
     size_t offset = f->data_offset + f->tensors[idx].offset;
     if (offset >= f->raw_size) return NULL;

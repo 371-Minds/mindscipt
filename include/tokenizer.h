@@ -1,5 +1,5 @@
-#ifndef TOKENIZER_H
-#define TOKENIZER_H
+#ifndef BN_TOKENIZER_H
+#define BN_TOKENIZER_H
 
 #include "gguf.h"
 
@@ -11,12 +11,12 @@ typedef struct {
     int     max_token_length;
     // internal: sorted index for binary search during encoding
     int    *sorted_indices;
-} Tokenizer;
+} BnTokenizer;
 
-int         tokenizer_init(Tokenizer *t, GGUFFile *f);
-void        tokenizer_free(Tokenizer *t);
-int         tokenizer_encode(const Tokenizer *t, const char *text, int add_bos,
+int         bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f);
+void        bn_tokenizer_free(BnTokenizer *t);
+int         bn_tokenizer_encode(const BnTokenizer *t, const char *text, int add_bos,
                              int *tokens, int max_tokens);
-const char *tokenizer_decode(const Tokenizer *t, int token);
+const char *bn_tokenizer_decode(const BnTokenizer *t, int token);
 
-#endif // TOKENIZER_H
+#endif // BN_TOKENIZER_H

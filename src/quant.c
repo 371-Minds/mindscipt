@@ -31,7 +31,7 @@ static inline float neon_reduce4(float32x4_t a, float32x4_t b,
 
 // --- FP16 <-> FP32 conversion ---
 
-float fp16_to_fp32(uint16_t h) {
+float bn_fp16_to_fp32(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000) << 16;
     uint32_t exp  = (h >> 10) & 0x1F;
     uint32_t mant = h & 0x03FF;
@@ -60,7 +60,7 @@ float fp16_to_fp32(uint16_t h) {
     return result;
 }
 
-uint16_t fp32_to_fp16(float val) {
+uint16_t bn_fp32_to_fp16(float val) {
     uint32_t f;
     memcpy(&f, &val, 4);
 
@@ -80,8 +80,8 @@ uint16_t fp32_to_fp16(float val) {
 // --- TQ2_0 dequantization ---
 // 2-bit packing: 4 values per byte, map {0,1,2} -> {-1,0,+1}
 
-void dequant_tq2_block(const BlockTQ2 *block, float *out) {
-    float d = fp16_to_fp32(block->d);
+void bn_quant_dequant_tq2(const BnBlockTQ2 *block, float *out) {
+    float d = bn_fp16_to_fp32(block->d);
     int idx = 0;
 
     // Two groups of 32 bytes
@@ -98,9 +98,9 @@ void dequant_tq2_block(const BlockTQ2 *block, float *out) {
 // --- TQ1_0 dequantization ---
 // Base-3 packing: 5 values per byte in qs (240 values), 4 values per byte in qh (16 values)
 
-void dequant_tq1_block(const BlockTQ1 *block, float *out) {
+void bn_quant_dequant_tq1(const BnBlockTQ1 *block, float *out) {
     static const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
-    float d = fp16_to_fp32(block->d);
+    float d = bn_fp16_to_fp32(block->d);
     int idx = 0;
 
     // Process qs: 48 bytes, in two chunks (32 + 16)
@@ -131,8 +131,8 @@ void dequant_tq1_block(const BlockTQ1 *block, float *out) {
         }
     }
 
-    // #35: Assert we produced exactly QK_K values (160 + 80 + 16 = 256)
-    assert(idx == QK_K);
+    // #35: Assert we produced exactly BN_QK_K values (160 + 80 + 16 = 256)
+    assert(idx == BN_QK_K);
 }
 
 // --- I2_S dequantization (Microsoft BitNet format) ---
@@ -143,7 +143,7 @@ void dequant_tq1_block(const BlockTQ1 *block, float *out) {
 // #36: I2_S uses an interleaved byte layout where each byte contains 2-bit values
 // from 4 sub-rows of 32 elements. This means each 128-element chunk always uses
 // exactly 32 bytes. Model dimensions are always multiples of 128 in practice.
-void dequant_i2s_row(const uint8_t *data, float *out, int n, float scale) {
+void bn_quant_dequant_i2s(const uint8_t *data, float *out, int n, float scale) {
     static const float map2bit[4] = { -1.0f, 0.0f, +1.0f, 0.0f };
     int done = 0;
 
@@ -178,7 +178,7 @@ void dequant_i2s_row(const uint8_t *data, float *out, int n, float scale) {
 
 // Quantize float vector x[n] to int8, returning scale = amax/127.
 // x_q[n] = round(x[i] / scale), clamped to [-127, 127].
-float quantize_x_to_i8(const float *x, int8_t *x_q, int n) {
+float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n) {
     // Find absolute max via NEON
     float32x4_t vmax = vdupq_n_f32(0);
     int i = 0;
@@ -231,7 +231,7 @@ float quantize_x_to_i8(const float *x, int8_t *x_q, int n) {
 // Context for I2_S SDOT range function
 typedef struct {
     float *out;
-    const QWeight *W;
+    const BnQWeight *W;
     const int8_t *x_q;
     float combined_scale;
 } I2SCtx;
@@ -299,7 +299,7 @@ static void i2s_sdot_range(void *ctx, int row_start, int row_end) {
 // I2_S float NEON range context
 typedef struct {
     float *out;
-    const QWeight *W;
+    const BnQWeight *W;
     const float *x;
 } I2SFloatCtx;
 
@@ -379,24 +379,24 @@ static void i2s_scalar_range(void *ctx, int row_start, int row_end) {
 // TQ2_0 range context
 typedef struct {
     float *out;
-    const QWeight *W;
+    const BnQWeight *W;
     const float *x;
 } TQ2Ctx;
 
 static void tq2_range(void *ctx, int row_start, int row_end) {
     TQ2Ctx *c = (TQ2Ctx *)ctx;
-    const BlockTQ2 *blocks = (const BlockTQ2 *)c->W->data;
-    int n_blocks_per_row = c->W->cols / QK_K;
+    const BnBlockTQ2 *blocks = (const BnBlockTQ2 *)c->W->data;
+    int n_blocks_per_row = c->W->cols / BN_QK_K;
     float tensor_scale = c->W->scale;
     const float *x = c->x;
 
     for (int row = row_start; row < row_end; row++) {
         float row_sum = 0.0f;
         for (int b = 0; b < n_blocks_per_row; b++) {
-            const BlockTQ2 *blk = &blocks[row * n_blocks_per_row + b];
+            const BnBlockTQ2 *blk = &blocks[row * n_blocks_per_row + b];
             __builtin_prefetch(blk + 2, 0, 0);
-            float d = fp16_to_fp32(blk->d);
-            const float *xb = x + b * QK_K;
+            float d = bn_fp16_to_fp32(blk->d);
+            const float *xb = x + b * BN_QK_K;
 #ifdef __ARM_NEON
             float32x4_t accA0 = vdupq_n_f32(0), accA1 = vdupq_n_f32(0);
             float32x4_t accA2 = vdupq_n_f32(0), accA3 = vdupq_n_f32(0);
@@ -449,14 +449,14 @@ static void tq2_range(void *ctx, int row_start, int row_end) {
 // TQ1_0 range context
 typedef struct {
     float *out;
-    const QWeight *W;
+    const BnQWeight *W;
     const float *x;
 } TQ1Ctx;
 
 static void tq1_range(void *ctx, int row_start, int row_end) {
     TQ1Ctx *c = (TQ1Ctx *)ctx;
-    const BlockTQ1 *blocks = (const BlockTQ1 *)c->W->data;
-    int n_blocks_per_row = c->W->cols / QK_K;
+    const BnBlockTQ1 *blocks = (const BnBlockTQ1 *)c->W->data;
+    int n_blocks_per_row = c->W->cols / BN_QK_K;
     float tensor_scale = c->W->scale;
     const float *x = c->x;
     static const uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
@@ -464,11 +464,11 @@ static void tq1_range(void *ctx, int row_start, int row_end) {
     for (int row = row_start; row < row_end; row++) {
         float row_sum = 0.0f;
         for (int b = 0; b < n_blocks_per_row; b++) {
-            const BlockTQ1 *blk = &blocks[row * n_blocks_per_row + b];
+            const BnBlockTQ1 *blk = &blocks[row * n_blocks_per_row + b];
             __builtin_prefetch(blk + 2, 0, 0);
-            float d = fp16_to_fp32(blk->d);
+            float d = bn_fp16_to_fp32(blk->d);
             float block_sum = 0.0f;
-            const float *xb = x + b * QK_K;
+            const float *xb = x + b * BN_QK_K;
 #ifdef __ARM_NEON
             float32x4_t accA0 = vdupq_n_f32(0), accA1 = vdupq_n_f32(0);
             float32x4_t accA2 = vdupq_n_f32(0), accA3 = vdupq_n_f32(0);
@@ -555,35 +555,35 @@ static void tq1_range(void *ctx, int row_start, int row_end) {
 // --- Ternary matrix-vector multiply ---
 // out[rows] = W[rows x cols] @ x[cols]
 
-void ternary_matvec(float *out, const QWeight *W, const float *x,
-                     int8_t *x_q_buf, ThreadPool *pool) {
+void bn_quant_matvec(float *out, const BnQWeight *W, const float *x,
+                     int8_t *x_q_buf, BnThreadPool *pool) {
 
-    if (W->type == GGUF_TENSOR_I2_S) {
+    if (W->type == BN_GGUF_TENSOR_I2_S) {
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
         // SDOT path: quantize x once, then use integer dot products
-        float x_scale = quantize_x_to_i8(x, x_q_buf, W->cols);
+        float x_scale = bn_quant_x_to_i8(x, x_q_buf, W->cols);
         I2SCtx ctx = { out, W, x_q_buf, W->scale * x_scale };
-        TPTask task = { i2s_sdot_range, &ctx, W->rows };
-        tp_dispatch(pool, &task, 1);
+        BnTPTask task = { i2s_sdot_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
 #elif defined(__ARM_NEON)
         (void)x_q_buf;
         I2SFloatCtx ctx = { out, W, x };
-        TPTask task = { i2s_neon_range, &ctx, W->rows };
-        tp_dispatch(pool, &task, 1);
+        BnTPTask task = { i2s_neon_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
 #else
         (void)x_q_buf;
         I2SFloatCtx ctx = { out, W, x };
-        TPTask task = { i2s_scalar_range, &ctx, W->rows };
-        tp_dispatch(pool, &task, 1);
+        BnTPTask task = { i2s_scalar_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
 #endif
         return;
     }
 
-    if (W->type == GGUF_TENSOR_TQ2_0) {
+    if (W->type == BN_GGUF_TENSOR_TQ2_0) {
         (void)x_q_buf;
         TQ2Ctx ctx = { out, W, x };
-        TPTask task = { tq2_range, &ctx, W->rows };
-        tp_dispatch(pool, &task, 1);
+        BnTPTask task = { tq2_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
         return;
     }
 
@@ -591,16 +591,16 @@ void ternary_matvec(float *out, const QWeight *W, const float *x,
     {
         (void)x_q_buf;
         TQ1Ctx ctx = { out, W, x };
-        TPTask task = { tq1_range, &ctx, W->rows };
-        tp_dispatch(pool, &task, 1);
+        BnTPTask task = { tq1_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
     }
 }
 
 // --- Batch ternary matvec ---
 // Runs multiple independent matvecs with a single dispatch.
 
-void ternary_matvec_batch(const MatvecTask *tasks, int n_tasks,
-                           const float *x, int8_t *x_q_buf, ThreadPool *pool) {
+void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
+                           const float *x, int8_t *x_q_buf, BnThreadPool *pool) {
     if (n_tasks <= 0) return;
 
     int cols = tasks[0].W->cols;
@@ -608,26 +608,26 @@ void ternary_matvec_batch(const MatvecTask *tasks, int n_tasks,
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     int all_i2s = 1;
     for (int t = 0; t < n_tasks; t++) {
-        if (tasks[t].W->type != GGUF_TENSOR_I2_S) { all_i2s = 0; break; }
+        if (tasks[t].W->type != BN_GGUF_TENSOR_I2_S) { all_i2s = 0; break; }
     }
 
     if (all_i2s) {
-        assert(n_tasks <= 4 && "ternary_matvec_batch: max 4 tasks");
+        assert(n_tasks <= 4 && "bn_quant_matvec_batch: max 4 tasks");
 
         // Quantize x to int8 once, shared across all tasks
-        float x_scale = quantize_x_to_i8(x, x_q_buf, cols);
+        float x_scale = bn_quant_x_to_i8(x, x_q_buf, cols);
 
-        // Build one TPTask per matvec task
+        // Build one BnTPTask per matvec task
         I2SCtx ctxs[4];
-        TPTask tp_tasks[4];
+        BnTPTask tp_tasks[4];
 
         for (int t = 0; t < n_tasks; t++) {
             ctxs[t] = (I2SCtx){ tasks[t].out, tasks[t].W, x_q_buf,
                                 tasks[t].W->scale * x_scale };
-            tp_tasks[t] = (TPTask){ i2s_sdot_range, &ctxs[t], tasks[t].W->rows };
+            tp_tasks[t] = (BnTPTask){ i2s_sdot_range, &ctxs[t], tasks[t].W->rows };
         }
 
-        tp_dispatch(pool, tp_tasks, n_tasks);
+        bn_tp_dispatch(pool, tp_tasks, n_tasks);
         return;
     }
 #else
@@ -637,6 +637,6 @@ void ternary_matvec_batch(const MatvecTask *tasks, int n_tasks,
 
     // Fallback: use existing per-task matvec
     for (int t = 0; t < n_tasks; t++) {
-        ternary_matvec(tasks[t].out, tasks[t].W, x, x_q_buf, pool);
+        bn_quant_matvec(tasks[t].out, tasks[t].W, x, x_q_buf, pool);
     }
 }

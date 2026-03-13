@@ -13,8 +13,8 @@
 #include <time.h>
 #endif
 
-MappedFile platform_load_file(const char *path) {
-    MappedFile f = {0};
+BnMappedFile bn_platform_load_file(const char *path) {
+    BnMappedFile f = {0};
 #ifdef __EMSCRIPTEN__
     FILE *fp = fopen(path, "rb");
     if (!fp) return f;
@@ -49,18 +49,18 @@ MappedFile platform_load_file(const char *path) {
     return f;
 }
 
-// #19, #20: platform_load_buffer wraps an external buffer without taking ownership.
+// #19, #20: bn_platform_load_buffer wraps an external buffer without taking ownership.
 // The is_mmap=2 flag distinguishes it from both mmap'd and malloc'd buffers,
-// preventing platform_unload_file from freeing memory it doesn't own.
-MappedFile platform_load_buffer(const uint8_t *buf, size_t size) {
-    MappedFile f = {0};
+// preventing bn_platform_unload_file from freeing memory it doesn't own.
+BnMappedFile bn_platform_load_buffer(const uint8_t *buf, size_t size) {
+    BnMappedFile f = {0};
     f.data = (uint8_t *)buf;  // intentional const-discard for zero-copy interface
     f.size = size;
     f.is_mmap = 2;  // 2 = externally owned, do not free
     return f;
 }
 
-void platform_unload_file(MappedFile *f) {
+void bn_platform_unload_file(BnMappedFile *f) {
     if (!f || !f->data) return;
 #ifdef __EMSCRIPTEN__
     if (f->is_mmap != 2) {  // Don't free externally-owned buffers
@@ -76,7 +76,7 @@ void platform_unload_file(MappedFile *f) {
     f->size = 0;
 }
 
-double platform_time_ms(void) {
+double bn_platform_time_ms(void) {
 #ifdef __EMSCRIPTEN__
     return emscripten_get_now();
 #else

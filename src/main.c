@@ -92,21 +92,21 @@ int main(int argc, char **argv) {
 
     // Load model file
     fprintf(stderr, "Loading %s...\n", args.model_path);
-    double t0 = platform_time_ms();
+    double t0 = bn_platform_time_ms();
 
-    MappedFile mf = platform_load_file(args.model_path);
+    BnMappedFile mf = bn_platform_load_file(args.model_path);
     if (!mf.data) {
         fprintf(stderr, "Failed to load file: %s\n", args.model_path);
         return 1;
     }
     fprintf(stderr, "File loaded: %.1f MB (%.0f ms)\n",
-            mf.size / (1024.0 * 1024.0), platform_time_ms() - t0);
+            mf.size / (1024.0 * 1024.0), bn_platform_time_ms() - t0);
 
     // Parse GGUF
-    GGUFFile *gf = gguf_open(mf.data, mf.size);
+    BnGGUFFile *gf = bn_gguf_open(mf.data, mf.size);
     if (!gf) {
         fprintf(stderr, "Failed to parse GGUF\n");
-        platform_unload_file(&mf);
+        bn_platform_unload_file(&mf);
         return 1;
     }
     fprintf(stderr, "GGUF v%u: %llu tensors, %llu kv pairs\n",
@@ -114,36 +114,36 @@ int main(int argc, char **argv) {
             (unsigned long long)gf->n_kv);
 
     // Load model
-    Model model;
-    if (model_load(&model, gf, args.max_seq_len) != 0) {
+    BnModel model;
+    if (bn_model_load(&model, gf, args.max_seq_len) != 0) {
         fprintf(stderr, "Failed to load model\n");
-        gguf_free(gf);
-        platform_unload_file(&mf);
+        bn_gguf_free(gf);
+        bn_platform_unload_file(&mf);
         return 1;
     }
     model.file = mf;  // keep mmap alive
 
     // Create thread pool
-    model.pool = tp_create(n_workers);
+    model.pool = bn_tp_create(n_workers);
     if (model.pool) {
         fprintf(stderr, "Thread pool: %d threads (%d workers + main)\n",
-                tp_num_threads(model.pool), n_workers);
+                bn_tp_num_threads(model.pool), n_workers);
     } else if (n_workers > 0) {
         fprintf(stderr, "Warning: failed to create thread pool, running single-threaded\n");
     }
 
-    Config *cfg = &model.config;
+    BnConfig *cfg = &model.config;
 
     fprintf(stderr, "Model: dim=%d layers=%d heads=%d vocab=%d seq=%d\n",
             cfg->dim, cfg->n_layers, cfg->n_heads, cfg->vocab_size, cfg->seq_len);
 
     // Initialize tokenizer
-    Tokenizer tokenizer;
-    if (tokenizer_init(&tokenizer, gf) != 0) {
+    BnTokenizer tokenizer;
+    if (bn_tokenizer_init(&tokenizer, gf) != 0) {
         fprintf(stderr, "Failed to init tokenizer\n");
-        model_free(&model);
-        gguf_free(gf);
-        platform_unload_file(&mf);
+        bn_model_free(&model);
+        bn_gguf_free(gf);
+        bn_platform_unload_file(&mf);
         return 1;
     }
     fprintf(stderr, "Tokenizer: %d tokens\n", tokenizer.vocab_size);
@@ -153,33 +153,33 @@ int main(int argc, char **argv) {
     int *prompt_tokens = (int *)malloc(max_prompt_tokens * sizeof(int));
     if (!prompt_tokens) {
         fprintf(stderr, "Failed to allocate prompt token buffer\n");
-        tokenizer_free(&tokenizer);
-        model_free(&model);
-        gguf_free(gf);
-        platform_unload_file(&mf);
+        bn_tokenizer_free(&tokenizer);
+        bn_model_free(&model);
+        bn_gguf_free(gf);
+        bn_platform_unload_file(&mf);
         return 1;
     }
-    int n_prompt = tokenizer_encode(&tokenizer, args.prompt, 1, prompt_tokens,
+    int n_prompt = bn_tokenizer_encode(&tokenizer, args.prompt, 1, prompt_tokens,
                                     max_prompt_tokens);
     fprintf(stderr, "Prompt tokens (%d): ", n_prompt);
     for (int i = 0; i < n_prompt; i++) fprintf(stderr, "%d ", prompt_tokens[i]);
     fprintf(stderr, "\n");
 
     // Initialize sampler
-    Sampler sampler;
-    sampler_init(&sampler, cfg->vocab_size, args.temperature, args.topp, args.seed);
+    BnSampler sampler;
+    bn_sampler_init(&sampler, cfg->vocab_size, args.temperature, args.topp, args.seed);
 
     // Generation loop
     fprintf(stderr, "Generating %d tokens...\n", args.n_tokens);
-    double gen_start = platform_time_ms();
+    double gen_start = bn_platform_time_ms();
     int token = prompt_tokens[0];
     int pos = 0;
     int n_generated = 0;
 
     for (int i = 0; i < n_prompt + args.n_tokens; i++) {
-        float *logits = transformer_forward(&model, token, pos);
+        float *logits = bn_transformer_forward(&model, token, pos);
         if (!logits) {
-            fprintf(stderr, "\n[transformer_forward returned NULL at pos %d]\n", pos);
+            fprintf(stderr, "\n[bn_transformer_forward returned NULL at pos %d]\n", pos);
             break;
         }
 
@@ -189,7 +189,7 @@ int main(int argc, char **argv) {
             next = prompt_tokens[i + 1];
         } else {
             // Generate
-            next = sampler_sample(&sampler, logits);
+            next = bn_sampler_sample(&sampler, logits);
             n_generated++;
 
             // Check for EOS/EOT
@@ -200,7 +200,7 @@ int main(int argc, char **argv) {
 
         // Print token (skip BOS)
         if (i >= n_prompt - 1) {
-            const char *piece = tokenizer_decode(&tokenizer, next);
+            const char *piece = bn_tokenizer_decode(&tokenizer, next);
             if (!piece) piece = "";
             #ifdef DEBUG
             fprintf(stderr, "[tok %d = \"%s\" raw=\"%s\"]\n", next, piece, tokenizer.vocab[next]);
@@ -218,7 +218,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    double gen_end = platform_time_ms();
+    double gen_end = bn_platform_time_ms();
     double gen_time = gen_end - gen_start;
     double total_time = gen_end - t0;
 
@@ -233,10 +233,10 @@ int main(int argc, char **argv) {
 
     // Cleanup
     free(prompt_tokens);
-    tokenizer_free(&tokenizer);
-    model_free(&model);
-    gguf_free(gf);
-    platform_unload_file(&mf);
+    bn_tokenizer_free(&tokenizer);
+    bn_model_free(&model);
+    bn_gguf_free(gf);
+    bn_platform_unload_file(&mf);
 
     return 0;
 }

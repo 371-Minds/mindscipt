@@ -8,7 +8,7 @@
 
 // #6: Use qsort_r (or compatible) to avoid global mutable state.
 // macOS/BSD and glibc have qsort_r but with different signatures.
-// We use a portable approach: store context pointer in Tokenizer struct
+// We use a portable approach: store context pointer in BnTokenizer struct
 // and use a platform-appropriate qsort_r.
 
 #if defined(__APPLE__) || defined(__FreeBSD__)
@@ -46,7 +46,7 @@ static int cmp_vocab_indirect_fallback(const void *a, const void *b) {
 #endif
 
 // Binary search for a token string in sorted vocab
-static int vocab_lookup(const Tokenizer *t, const char *str) {
+static int vocab_lookup(const BnTokenizer *t, const char *str) {
     int lo = 0, hi = t->vocab_size - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
@@ -58,10 +58,10 @@ static int vocab_lookup(const Tokenizer *t, const char *str) {
     return -1;
 }
 
-int tokenizer_init(Tokenizer *t, GGUFFile *f) {
-    memset(t, 0, sizeof(Tokenizer));
+int bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f) {
+    memset(t, 0, sizeof(BnTokenizer));
 
-    t->vocab_size = (int)gguf_get_arr_n(f, "tokenizer.ggml.tokens");
+    t->vocab_size = (int)bn_gguf_get_arr_n(f, "tokenizer.ggml.tokens");
     if (t->vocab_size == 0) {
         fprintf(stderr, "tokenizer: no tokens found in GGUF\n");
         return -1;
@@ -76,7 +76,7 @@ int tokenizer_init(Tokenizer *t, GGUFFile *f) {
     t->max_token_length = 0;
 
     for (int i = 0; i < t->vocab_size; i++) {
-        const char *tok = gguf_get_arr_str(f, "tokenizer.ggml.tokens", i);
+        const char *tok = bn_gguf_get_arr_str(f, "tokenizer.ggml.tokens", i);
         // #33: Check strdup return
         t->vocab[i] = tok ? strdup(tok) : strdup("");
         if (!t->vocab[i]) {
@@ -94,29 +94,29 @@ int tokenizer_init(Tokenizer *t, GGUFFile *f) {
     // #16: Check allocation
     t->scores = (float *)calloc(t->vocab_size, sizeof(float));
     if (!t->scores) {
-        tokenizer_free(t);
+        bn_tokenizer_free(t);
         return -1;
     }
-    const void *scores_data = gguf_get_arr_data(f, "tokenizer.ggml.scores");
+    const void *scores_data = bn_gguf_get_arr_data(f, "tokenizer.ggml.scores");
     if (scores_data) {
         memcpy(t->scores, scores_data, t->vocab_size * sizeof(float));
     }
 
     // Special token IDs
     int idx;
-    idx = gguf_find_key(f, "tokenizer.ggml.bos_token_id");
-    t->bos_id = (idx >= 0) ? (int)gguf_get_u32(f, "tokenizer.ggml.bos_token_id") : 1;
+    idx = bn_gguf_find_key(f, "tokenizer.ggml.bos_token_id");
+    t->bos_id = (idx >= 0) ? (int)bn_gguf_get_u32(f, "tokenizer.ggml.bos_token_id") : 1;
 
-    idx = gguf_find_key(f, "tokenizer.ggml.eos_token_id");
-    t->eos_id = (idx >= 0) ? (int)gguf_get_u32(f, "tokenizer.ggml.eos_token_id") : 2;
+    idx = bn_gguf_find_key(f, "tokenizer.ggml.eos_token_id");
+    t->eos_id = (idx >= 0) ? (int)bn_gguf_get_u32(f, "tokenizer.ggml.eos_token_id") : 2;
 
-    idx = gguf_find_key(f, "tokenizer.ggml.eot_token_id");
-    t->eot_id = (idx >= 0) ? (int)gguf_get_u32(f, "tokenizer.ggml.eot_token_id") : -1;
+    idx = bn_gguf_find_key(f, "tokenizer.ggml.eot_token_id");
+    t->eot_id = (idx >= 0) ? (int)bn_gguf_get_u32(f, "tokenizer.ggml.eot_token_id") : -1;
 
     // #16: Build sorted index for binary search
     t->sorted_indices = (int *)malloc(t->vocab_size * sizeof(int));
     if (!t->sorted_indices) {
-        tokenizer_free(t);
+        bn_tokenizer_free(t);
         return -1;
     }
     for (int i = 0; i < t->vocab_size; i++) t->sorted_indices[i] = i;
@@ -127,7 +127,7 @@ int tokenizer_init(Tokenizer *t, GGUFFile *f) {
     return 0;
 }
 
-void tokenizer_free(Tokenizer *t) {
+void bn_tokenizer_free(BnTokenizer *t) {
     if (!t) return;
     if (t->vocab) {
         for (int i = 0; i < t->vocab_size; i++) free(t->vocab[i]);
@@ -138,7 +138,7 @@ void tokenizer_free(Tokenizer *t) {
 }
 
 // Encode text using BPE merge algorithm
-int tokenizer_encode(const Tokenizer *t, const char *text, int add_bos,
+int bn_tokenizer_encode(const BnTokenizer *t, const char *text, int add_bos,
                      int *tokens, int max_tokens) {
     if (!text || !tokens || max_tokens <= 0) return 0;
 
@@ -319,12 +319,12 @@ static int decode_bpe_cp(const unsigned char **p) {
     return c0;
 }
 
-// #7: Decode buffer is now per-Tokenizer to avoid global mutable state.
+// #7: Decode buffer is now per-BnTokenizer to avoid global mutable state.
 // For backwards compatibility, we use a thread-local static buffer.
 // The caller must consume or copy the result before the next call.
 static _Thread_local char tl_decode_buf[1024];
 
-const char *tokenizer_decode(const Tokenizer *t, int token) {
+const char *bn_tokenizer_decode(const BnTokenizer *t, int token) {
     if (token < 0 || token >= t->vocab_size) return "";
     const char *raw = t->vocab[token];
 

@@ -31,7 +31,7 @@ static size_t build_tokenizer_gguf(uint8_t *buf, size_t buf_size) {
 
     // KV 1: tokenizer.ggml.tokens (string array)
     WB_STR(wb, "tokenizer.ggml.tokens");
-    WB_U32(wb, 9);           // GGUF_TYPE_ARRAY
+    WB_U32(wb, 9);           // BN_GGUF_TYPE_ARRAY
     WB_U32(wb, 8);           // elem_type = STRING
     WB_U64(wb, 10);          // count
     const char *tokens[] = {"<bos>", "<eos>", "h", "e", "l", "o", "he", "hel", "lo", "hello"};
@@ -39,7 +39,7 @@ static size_t build_tokenizer_gguf(uint8_t *buf, size_t buf_size) {
 
     // KV 2: tokenizer.ggml.scores (float array)
     WB_STR(wb, "tokenizer.ggml.scores");
-    WB_U32(wb, 9);           // GGUF_TYPE_ARRAY
+    WB_U32(wb, 9);           // BN_GGUF_TYPE_ARRAY
     WB_U32(wb, 6);           // elem_type = FLOAT32
     WB_U64(wb, 10);          // count
     float scores[] = {0,0, 0,0,0,0, 1,2,3,4};
@@ -47,12 +47,12 @@ static size_t build_tokenizer_gguf(uint8_t *buf, size_t buf_size) {
 
     // KV 3: bos_token_id
     WB_STR(wb, "tokenizer.ggml.bos_token_id");
-    WB_U32(wb, 4);           // GGUF_TYPE_UINT32
+    WB_U32(wb, 4);           // BN_GGUF_TYPE_UINT32
     WB_U32(wb, 0);
 
     // KV 4: eos_token_id
     WB_STR(wb, "tokenizer.ggml.eos_token_id");
-    WB_U32(wb, 4);           // GGUF_TYPE_UINT32
+    WB_U32(wb, 4);           // BN_GGUF_TYPE_UINT32
     WB_U32(wb, 1);
 
     #undef WB_WRITE
@@ -70,11 +70,11 @@ static void test_tokenizer_init(void) {
     uint8_t buf[8192];
     size_t size = build_tokenizer_gguf(buf, sizeof(buf));
 
-    GGUFFile *gf = gguf_open(buf, size);
+    BnGGUFFile *gf = bn_gguf_open(buf, size);
     assert(gf != NULL);
 
-    Tokenizer t;
-    int rc = tokenizer_init(&t, gf);
+    BnTokenizer t;
+    int rc = bn_tokenizer_init(&t, gf);
     assert(rc == 0);
     assert(t.vocab_size == 10);
     assert(t.bos_id == 0);
@@ -82,8 +82,8 @@ static void test_tokenizer_init(void) {
     assert(strcmp(t.vocab[0], "<bos>") == 0);
     assert(strcmp(t.vocab[9], "hello") == 0);
 
-    tokenizer_free(&t);
-    gguf_free(gf);
+    bn_tokenizer_free(&t);
+    bn_gguf_free(gf);
     printf("PASSED\n");
 }
 
@@ -92,16 +92,16 @@ static void test_tokenizer_decode(void) {
 
     uint8_t buf[8192];
     size_t size = build_tokenizer_gguf(buf, sizeof(buf));
-    GGUFFile *gf = gguf_open(buf, size);
-    Tokenizer t;
-    tokenizer_init(&t, gf);
+    BnGGUFFile *gf = bn_gguf_open(buf, size);
+    BnTokenizer t;
+    bn_tokenizer_init(&t, gf);
 
-    assert(strcmp(tokenizer_decode(&t, 0), "<bos>") == 0);
-    assert(strcmp(tokenizer_decode(&t, 2), "h") == 0);
-    assert(strcmp(tokenizer_decode(&t, 9), "hello") == 0);
+    assert(strcmp(bn_tokenizer_decode(&t, 0), "<bos>") == 0);
+    assert(strcmp(bn_tokenizer_decode(&t, 2), "h") == 0);
+    assert(strcmp(bn_tokenizer_decode(&t, 9), "hello") == 0);
 
-    tokenizer_free(&t);
-    gguf_free(gf);
+    bn_tokenizer_free(&t);
+    bn_gguf_free(gf);
     printf("PASSED\n");
 }
 
@@ -110,15 +110,15 @@ static void test_tokenizer_encode(void) {
 
     uint8_t buf[8192];
     size_t size = build_tokenizer_gguf(buf, sizeof(buf));
-    GGUFFile *gf = gguf_open(buf, size);
-    Tokenizer t;
-    tokenizer_init(&t, gf);
+    BnGGUFFile *gf = bn_gguf_open(buf, size);
+    BnTokenizer t;
+    bn_tokenizer_init(&t, gf);
 
     int tokens[32];
     int n;
 
     // Encode "hello" with BOS
-    n = tokenizer_encode(&t, "hello", 1, tokens, 32);
+    n = bn_tokenizer_encode(&t, "hello", 1, tokens, 32);
     assert(n >= 2);  // at least BOS + "hello"
     assert(tokens[0] == 0);  // BOS
 
@@ -128,8 +128,8 @@ static void test_tokenizer_encode(void) {
     // tokens[1] should be 9 ("hello")
     assert(tokens[1] == 9);
 
-    tokenizer_free(&t);
-    gguf_free(gf);
+    bn_tokenizer_free(&t);
+    bn_gguf_free(gf);
     printf("PASSED\n");
 }
 
