@@ -41,45 +41,42 @@ Development roadmap for bitnet.c.
 - [ ] x86 AVX2 kernels for ternary matvec
 - [ ] WASM SIMD128 kernels using `wasm_simd128.h` intrinsics
 
-## Phase 5: Memory & Performance — Partially Done
+## Phase 5: Memory & Performance — Done
 
-### Completed
 - [x] Pthread thread pool (~2μs condvar dispatch, replaces OMP fork/join)
 - [x] Arena allocator for RunState (single allocation for all buffers)
 - [x] RoPE frequency + cos/sin precomputation
 - [x] Preallocated sampler candidates buffer (eliminates per-token malloc)
 - [x] Prefetch hints in I2_S SDOT, TQ1_0, TQ2_0 kernels
-
-### Remaining
-- [ ] KV cache quantization (reduce from FP32 to FP16 or INT8)
-- [ ] Streaming KV cache (sliding window for long sequences)
-- [ ] Batch inference (process multiple tokens per forward pass for prompt)
-- [ ] Profile-guided optimization (PGO build)
-- [ ] INT8 output embeddings (reduce logits data from 656 MB to 328 MB per token)
+- [x] KV cache quantization (F16 KV via --kv16)
+- [x] Sliding window KV cache (ring buffer, continues past seq_len)
+- [x] Batch inference (bn_transformer_prefill)
+- [x] Profile-guided optimization (PGO build)
+- [x] INT8 output embeddings (~52.5 tok/s)
 
 ## Performance Analysis (M1 Max, bitnet-b1.58-2B-4T)
 
-### Current: ~42 tok/s (8 P-cores), ~98% of hardware bandwidth ceiling
+### Current: ~52.5 tok/s (8 P-cores)
 
-The workload is **DRAM bandwidth-bound**. Each token reads ~1.15 GB from memory:
+The workload is **DRAM bandwidth-bound**. Each token reads ~0.83 GB from memory:
 
 | Component | Data Read | % of Total |
 |---|---|---|
-| 30× layer I2_S weights (Q/K/V/O + gate/up/down) | 497 MB | 43% |
-| Logits (F16 embedding × 128K vocab) | 656 MB | 57% |
+| 30× layer I2_S weights (Q/K/V/O + gate/up/down) | 497 MB | 60% |
+| Logits (INT8 embedding × 128K vocab) | 328 MB | 40% |
 | KV cache (pos-dependent) | ~18 MB | <2% |
 
 M1 Max CPU aggregate DRAM bandwidth: ~55 GB/s (CPU-only; the 400 GB/s spec is GPU-inclusive).
-At 42 tok/s × 1.15 GB = **48 GB/s sustained** — 87% of max bandwidth.
+At 52.5 tok/s × 0.83 GB = **~43 GB/s sustained** — 79% of max bandwidth.
 
 ### Scaling behavior (bandwidth-limited)
 
 | Cores | Est. BW (GB/s) | Est. tok/s | Speedup vs 1 |
 |---|---|---|---|
-| 1 | 7 | 6 | 1.0× |
-| 2 | 14 | 12 | 2.0× |
-| 4 | 28 | 24 | 4.0× |
-| 8 | 55 | 43 | 7.1× |
+| 1 | 7 | 8 | 1.0× |
+| 2 | 14 | 17 | 2.0× |
+| 4 | 28 | 33 | 4.0× |
+| 8 | 55 | 53 | 6.6× |
 
 Diminishing returns start at ~4 cores as DRAM interface saturates.
 
@@ -87,9 +84,9 @@ Diminishing returns start at ~4 cores as DRAM interface saturates.
 
 Only **reducing data volume** helps at this point:
 
-1. **INT8 output embeddings** — halves logits data (656→328 MB). Est. ~55 tok/s (+30%).
-2. **KV cache quantization** — reduces attention data at long positions.
-3. **Prompt batching** — process multiple prompt tokens per forward pass (amortize logits).
+1. **Speculative decoding** — use a smaller draft model to reduce per-token cost.
+2. **KV cache quantization to INT8** — further reduces attention data at long positions.
+3. **Weight clustering / pruning** — reduce I2_S weight data below 497 MB.
 
 ### Optimization history
 
@@ -98,8 +95,9 @@ Only **reducing data volume** helps at this point:
 | Baseline (naive C) | ~15.5 | — |
 | SDOT int8 accumulation + batch matvec | ~33 | +113% |
 | Arithmetic ternary decode + RoPE precompute | ~38 | +15% |
-| Pthread thread pool (replace OMP) | ~38 | latency improvement |
-| Arena allocator + sh_log + FP16 native logits | ~42 | +10% |
+| Pthread thread pool (replace OMP) | ~41 | +8% |
+| Arena allocator + sh_log + FP16 native logits | ~46 | +12% |
+| INT8 output embeddings + SDOT logits | ~52.5 | +14% |
 
 ## Phase 6: Extended Model Support
 
@@ -111,7 +109,7 @@ Only **reducing data volume** helps at this point:
 
 ## Phase 7: Developer Experience
 
-- [ ] Interactive mode (REPL-style multi-turn conversation)
+- [x] Interactive mode (--chat REPL with sliding window)
 - [ ] Token probability output mode (for debugging/research)
 - [ ] JSON output mode (structured generation metadata)
 - [ ] Model info dump command (`--info` to print config without inference)

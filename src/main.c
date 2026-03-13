@@ -244,12 +244,6 @@ int main(int argc, char **argv) {
             if (len == 0) continue;
             if (strcmp(line, "/quit") == 0) break;
 
-            // Check context space
-            if (pos >= cfg->seq_len - 1) {
-                fprintf(stderr, "Context full (%d/%d tokens). Exiting.\n", pos, cfg->seq_len);
-                break;
-            }
-
             // Encode "User: {line}"
             char user_buf[4096 + 16];
             snprintf(user_buf, sizeof(user_buf), "User: %s", line);
@@ -266,12 +260,11 @@ int main(int argc, char **argv) {
 
             // Feed prompt tokens through forward pass
             float *logits = NULL;
-            if (!args.no_prefill && n > 1 && pos + n < cfg->seq_len) {
+            if (!args.no_prefill && n > 1) {
                 logits = bn_transformer_prefill(&model, tokens, n, pos);
                 pos += n;
             } else {
                 for (int i = 0; i < n; i++) {
-                    if (pos >= cfg->seq_len - 1) break;
                     logits = bn_transformer_forward(&model, tokens[i], pos);
                     pos++;
                 }
@@ -320,21 +313,14 @@ int main(int argc, char **argv) {
                     fflush(stdout);
                 }
 
-                if (pos >= cfg->seq_len - 1) {
-                    fprintf(stderr, "\nContext full (%d/%d tokens).\n", pos, cfg->seq_len);
-                    break;
-                }
-
                 logits = bn_transformer_forward(&model, next, pos);
                 pos++;
                 if (!logits) break;
             }
 
             // Feed EOT into KV cache to close the assistant turn
-            if (pos < cfg->seq_len - 1) {
-                bn_transformer_forward(&model, tokenizer.eot_id, pos);
-                pos++;
-            }
+            bn_transformer_forward(&model, tokenizer.eot_id, pos);
+            pos++;
 
             printf("\n");
         }
@@ -400,11 +386,6 @@ int main(int argc, char **argv) {
                 if (!piece) piece = "";
                 printf("%s", piece);
                 fflush(stdout);
-
-                if (pos >= cfg->seq_len) {
-                    SH_LOG_WARN("Reached max sequence length");
-                    break;
-                }
 
                 logits = bn_transformer_forward(&model, next, pos);
                 pos++;

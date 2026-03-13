@@ -276,9 +276,6 @@ static void test_transformer_bounds(void) {
     logits = bn_transformer_forward(&m, 0, -1);
     assert(logits == NULL);
 
-    logits = bn_transformer_forward(&m, 0, 512);  // == seq_len
-    assert(logits == NULL);
-
     printf("PASSED\n");
 }
 

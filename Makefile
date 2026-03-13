@@ -35,7 +35,7 @@ src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # --- Tests ---
-.PHONY: debug test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_prefill test_kv_f16 clean
+.PHONY: debug test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_prefill test_kv_f16 pgo clean
 
 test: test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety
 
@@ -76,5 +76,21 @@ test_kv_f16: test/test_kv_f16.c src/platform.c src/gguf.c src/quant.c src/model.
              src/sh_arena.c src/sh_log.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+PGO_MODEL ?= models/bitnet-b1.58-2B-4T.gguf
+
+pgo:
+	@echo "=== PGO Step 1: Instrumented build ==="
+	$(MAKE) clean
+	$(MAKE) bitnet CFLAGS="$(CFLAGS) -fprofile-instr-generate" LDFLAGS="$(LDFLAGS) -fprofile-instr-generate"
+	@echo "=== PGO Step 2: Training run ==="
+	LLVM_PROFILE_FILE=default.profraw ./bitnet $(PGO_MODEL) -p "The meaning of life is" -n 128
+	@echo "=== PGO Step 3: Merge profile ==="
+	xcrun llvm-profdata merge -output=default.profdata default.profraw
+	@echo "=== PGO Step 4: Optimized rebuild ==="
+	$(MAKE) clean
+	$(MAKE) bitnet CFLAGS="$(CFLAGS) -fprofile-instr-use=default.profdata"
+	@rm -f default.profraw default.profdata
+	@echo "=== PGO build complete ==="
+
 clean:
-	rm -f bitnet src/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_e2e test_prefill test_kv_f16
+	rm -f bitnet src/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_e2e test_prefill test_kv_f16 default.profraw default.profdata

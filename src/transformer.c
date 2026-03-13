@@ -61,9 +61,11 @@ typedef struct {
     BnRunState *s;
     size_t loff;
     int pos;
+    int n_kv;       // min(pos+1, seq_len) — number of valid KV entries
     int kv_mul;
     int head_size;
     int kv_dim;
+    int seq_len;    // cache size for modular indexing
 } GQACtx;
 
 static void gqa_range(void *ctx, int h_start, int h_end) {
@@ -73,17 +75,20 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
     int head_size = g->head_size;
     int kv_dim = g->kv_dim;
     int kv_mul = g->kv_mul;
-    int pos = g->pos;
+    int n_kv = g->n_kv;
+    int seq_len = g->seq_len;
+    int start = g->pos - n_kv + 1;
     size_t loff = g->loff;
     int kv_f16 = c->kv_f16;
 
     for (int h = h_start; h < h_end; h++) {
         float *q_h = s->q + h * head_size;
-        float *att = s->att + h * c->seq_len;
+        float *att = s->att + h * seq_len;
         int kv_h = h / kv_mul;
         float inv_sqrt_hs = 1.0f / sqrtf((float)head_size);
 
-        for (int t = 0; t <= pos; t++) {
+        for (int i = 0; i < n_kv; i++) {
+            int t = (start + i) % seq_len;
             float k_buf[head_size];
             const float *k_t;
             if (kv_f16) {
@@ -110,19 +115,20 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
                 a3 = vmlaq_f32(a3, vld1q_f32(q_h + d + 12), vld1q_f32(k_t + d + 12));
             }
             float32x4_t sum = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
-            att[t] = neon_hsum_f32(sum) * inv_sqrt_hs;
+            att[i] = neon_hsum_f32(sum) * inv_sqrt_hs;
 #else
             float score = 0.0f;
             for (int d = 0; d < head_size; d++) score += q_h[d] * k_t[d];
-            att[t] = score * inv_sqrt_hs;
+            att[i] = score * inv_sqrt_hs;
 #endif
         }
 
-        softmax(att, pos + 1);
+        softmax(att, n_kv);
 
         float *xb_h = s->xb + h * head_size;
         memset(xb_h, 0, head_size * sizeof(float));
-        for (int t = 0; t <= pos; t++) {
+        for (int i = 0; i < n_kv; i++) {
+            int t = (start + i) % seq_len;
             float v_buf[head_size];
             const float *v_t;
             if (kv_f16) {
@@ -139,7 +145,7 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
             } else {
                 v_t = s->value_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
             }
-            float a = att[t];
+            float a = att[i];
 #ifdef __ARM_NEON
             float32x4_t a_v = vdupq_n_f32(a);
             for (int d = 0; d < head_size; d += 16) {
@@ -167,9 +173,10 @@ static void flash_gqa_range(void *ctx, int h_start, int h_end) {
     int head_size = g->head_size;
     int kv_dim = g->kv_dim;
     int kv_mul = g->kv_mul;
-    int pos = g->pos;
+    int n_kv = g->n_kv;
+    int seq_len = g->seq_len;
+    int start = g->pos - n_kv + 1;
     size_t loff = g->loff;
-    int n_pos = pos + 1;
     int kv_f16 = c->kv_f16;
     float inv_sqrt_hs = 1.0f / sqrtf((float)head_size);
 
@@ -184,11 +191,12 @@ static void flash_gqa_range(void *ctx, int h_start, int h_end) {
         float running_sum = 0.0f;
 
         // Single pass over KV cache in tiles
-        for (int t_start = 0; t_start < n_pos; t_start += FLASH_ATTN_TILE) {
-            int t_end = t_start + FLASH_ATTN_TILE;
-            if (t_end > n_pos) t_end = n_pos;
+        for (int ti_start = 0; ti_start < n_kv; ti_start += FLASH_ATTN_TILE) {
+            int ti_end = ti_start + FLASH_ATTN_TILE;
+            if (ti_end > n_kv) ti_end = n_kv;
 
-            for (int t = t_start; t < t_end; t++) {
+            for (int ti = ti_start; ti < ti_end; ti++) {
+                int t = (start + ti) % seq_len;
                 float k_buf[head_size];
                 const float *k_t;
                 if (kv_f16) {
@@ -202,11 +210,12 @@ static void flash_gqa_range(void *ctx, int h_start, int h_end) {
                     k_t = s->key_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
                 }
 
-                if (t + 1 < t_end) {
+                if (ti + 1 < ti_end) {
+                    int t_next = (start + ti + 1) % seq_len;
                     if (kv_f16)
-                        __builtin_prefetch((const uint16_t *)s->key_cache + loff + (size_t)(t+1) * kv_dim + kv_h * head_size, 0, 0);
+                        __builtin_prefetch((const uint16_t *)s->key_cache + loff + (size_t)t_next * kv_dim + kv_h * head_size, 0, 0);
                     else
-                        __builtin_prefetch(s->key_cache + loff + (size_t)(t+1) * kv_dim + kv_h * head_size, 0, 0);
+                        __builtin_prefetch(s->key_cache + loff + (size_t)t_next * kv_dim + kv_h * head_size, 0, 0);
                 }
 
                 // Score: dot(Q, K) * scale
@@ -423,8 +432,8 @@ static int forward_layers(BnModel *m, int token, int pos) {
         return -1;
     }
 
-    // #10: Validate pos bounds to prevent KV-cache OOB write
-    if (pos < 0 || pos >= c->seq_len) {
+    // #10: Validate pos bounds
+    if (pos < 0) {
         SH_LOG_ERROR("Position out of range");
         return -1;
     }
@@ -443,11 +452,12 @@ static int forward_layers(BnModel *m, int token, int pos) {
     }
 
     // Process each layer
+    int cache_pos = pos % c->seq_len;
     for (int l = 0; l < c->n_layers; l++) {
         BnLayerWeights *lw = &w->layers[l];
         size_t loff = (size_t)l * c->seq_len * kv_dim;
-        float *key_cache_row   = s->key_cache   + loff + (size_t)pos * kv_dim;
-        float *value_cache_row = s->value_cache + loff + (size_t)pos * kv_dim;
+        float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
+        float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
 
         // ---- Attention block ----
 
@@ -480,8 +490,8 @@ static int forward_layers(BnModel *m, int token, int pos) {
             }
 
             // Convert F32 → F16 into cache
-            uint16_t *kc = (uint16_t *)s->key_cache   + loff + (size_t)pos * kv_dim;
-            uint16_t *vc = (uint16_t *)s->value_cache + loff + (size_t)pos * kv_dim;
+            uint16_t *kc = (uint16_t *)s->key_cache   + loff + (size_t)cache_pos * kv_dim;
+            uint16_t *vc = (uint16_t *)s->value_cache + loff + (size_t)cache_pos * kv_dim;
 #ifdef __ARM_NEON
             for (int i = 0; i < kv_dim; i += 4) {
                 float32x4_t kv4 = vld1q_f32(k_tmp + i);
@@ -523,7 +533,8 @@ static int forward_layers(BnModel *m, int token, int pos) {
 
         // GQA attention
         {
-            GQACtx gctx = { c, s, loff, pos, kv_mul, head_size, kv_dim };
+            int n_kv = (pos + 1 < c->seq_len) ? pos + 1 : c->seq_len;
+            GQACtx gctx = { c, s, loff, pos, n_kv, kv_mul, head_size, kv_dim, c->seq_len };
 #ifdef __ARM_NEON
             bn_tp_fn attn_fn = c->flash_attn ? flash_gqa_range : gqa_range;
 #else
