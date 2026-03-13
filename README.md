@@ -4,7 +4,7 @@ A clean-room, pure C inference engine for [BitNet b1.58](https://arxiv.org/abs/2
 
 Inspired by Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) — a beautifully minimal LLaMA inference implementation in a single C file — **bitnet.c** takes the same philosophy and applies it to Microsoft's [BitNet](https://github.com/microsoft/BitNet) architecture with its 1.58-bit ternary weights.
 
-Where Microsoft's official BitNet inference framework depends on a modified llama.cpp fork (~100K+ lines of C++), bitnet.c delivers a complete inference pipeline in ~4,100 lines of modular, readable C.
+Where Microsoft's official BitNet inference framework depends on a modified llama.cpp fork (~100K+ lines of C++), bitnet.c delivers a complete inference pipeline in ~4,500 lines of modular, readable C.
 
 ## Features
 
@@ -13,6 +13,7 @@ Where Microsoft's official BitNet inference framework depends on a modified llam
 - **I2_S, TQ1_0, & TQ2_0 formats** — native support for Microsoft's I2_S and GGML ternary quantization
 - **Full transformer forward pass** — RoPE, GQA, RMSNorm, sub-norms, tied embeddings
 - **Flash GQA attention** — online softmax with KV-head grouping, single-pass over KV cache
+- **Optional F16 KV cache** — `--kv16` halves attention DRAM bandwidth with minimal precision loss
 - **ARM NEON/SDOT optimizations** — SDOT int8 matvec, native FP16 logits, INT8 output embeddings
 - **Pthread thread pool** — persistent workers with condvar dispatch (~2us), replaces OpenMP
 - **BPE tokenizer** — loaded directly from GGUF metadata
@@ -50,8 +51,11 @@ Usage: ./bitnet <model.gguf> [options]
   --topp <float>  Top-p sampling (default: 0.9)
   --seed <int>    Random seed (default: 42)
   --maxseq <int>  Max sequence length (default: model max)
+  --flash         Use flash attention (online softmax)
   --chat          Interactive chat REPL mode
   --repeat-penalty <float>  Repetition penalty (default: 1.0, chat: 1.1)
+  --kv16          Store KV cache in FP16 (halves attention DRAM bandwidth)
+  --no-prefill    Disable batch prompt prefill (compute logits for every token)
 ```
 
 ### Chat Mode
@@ -120,14 +124,17 @@ bitnet.c/
 │   ├── test_tokenizer.c    # BPE encode/decode tests
 │   ├── test_threadpool.c   # Thread pool dispatch tests
 │   ├── test_safety.c       # Safety/bounds-checking regression tests
-│   └── test_e2e.c      # End-to-end greedy decode test
+│   ├── test_prefill.c      # Prefill vs sequential correctness test
+│   ├── test_kv_f16.c       # F16 KV cache correctness test
+│   └── test_e2e.c          # End-to-end greedy decode test
 ├── wasm/
 │   ├── api.c           # WASM-exported API wrapper
 │   ├── build.sh        # Emscripten build script
 │   ├── worker.js       # Web Worker for non-blocking inference
 │   └── index.html      # Browser demo
 ├── docs/
-│   └── roadmap.md      # Development roadmap
+│   ├── roadmap.md      # Development roadmap
+│   └── audit.md        # Security/correctness audit
 └── Makefile
 ```
 
@@ -176,7 +183,7 @@ Benchmarked on Apple M1 Max (8 P-cores, 32 GB), `bitnet-b1.58-2B-4T` (I2_S forma
 | Baseline (scalar C) | ~15.5 | 1.0x |
 | + SDOT int8 accumulation + batch matvec | ~33 | 2.1x |
 | + Arithmetic ternary decode + RoPE precompute | ~38 | 2.5x |
-| + Pthread thread pool (replace OpenMP) | ~38 | 2.5x |
+| + Pthread thread pool (replace OpenMP) | ~41 | 2.6x |
 | + Arena allocator + native FP16 logits + prefetch | ~46 | 3.0x |
 | + INT8 output embeddings (SDOT logits) | **~52** | **3.4x** |
 
@@ -214,6 +221,7 @@ BitNet b1.58 is a transformer variant where all linear layer weights are constra
 
 | Format | Bits/Weight | Packing | Block Size |
 |--------|-------------|---------|------------|
+| I2_S   | 2.0         | 2-bit interleaved (4 values/byte) + per-tensor scale | 128 |
 | TQ1_0  | 1.6875      | Base-3 (5 values/byte) + residual | 256 |
 | TQ2_0  | 2.0625      | 2-bit fields (4 values/byte) | 256 |
 
@@ -223,9 +231,9 @@ BitNet b1.58 is a transformer variant where all linear layer weights are constra
 |-----------|------|
 | GGUF buffer (weights + F16 embeddings) | ~620 MB |
 | INT8 embedding cache (128K × 2560) | ~329 MB |
-| KV cache (30 layers × 2048 × 640 × 4 × 2) | ~298 MB |
+| KV cache (30 layers × 2048 × 640 × 4 × 2) | ~298 MB (~149 MB with `--kv16`) |
 | RunState activations | ~3 MB |
-| **Total** | **~1,250 MB** |
+| **Total** | **~1,250 MB** (~1,101 MB with `--kv16`) |
 
 ## Design Decisions
 

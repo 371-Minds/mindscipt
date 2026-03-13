@@ -30,6 +30,7 @@ typedef struct {
     float repeat_penalty;
     int repeat_set;     // whether user explicitly set --repeat-penalty
     int no_prefill;
+    int kv_f16;
 } CLIArgs;
 
 static void print_usage(const char *prog) {
@@ -44,6 +45,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --flash         Use flash attention (online softmax)\n");
     fprintf(stderr, "  --chat          Interactive chat REPL mode\n");
     fprintf(stderr, "  --repeat-penalty <float>  Repetition penalty (default: 1.0, chat: 1.1)\n");
+    fprintf(stderr, "  --kv16          Store KV cache in FP16 (halves attention DRAM bandwidth)\n");
     fprintf(stderr, "  --no-prefill    Disable batch prompt prefill (compute logits for every token)\n");
 }
 
@@ -81,6 +83,8 @@ static CLIArgs parse_args(int argc, char **argv) {
             args.flash_attn = 1;
         } else if (strcmp(argv[i], "--chat") == 0) {
             args.chat = 1;
+        } else if (strcmp(argv[i], "--kv16") == 0) {
+            args.kv_f16 = 1;
         } else if (strcmp(argv[i], "--no-prefill") == 0) {
             args.no_prefill = 1;
         } else if (strcmp(argv[i], "--repeat-penalty") == 0 && i + 1 < argc) {
@@ -145,7 +149,7 @@ int main(int argc, char **argv) {
 
     // Load model
     BnModel model;
-    if (bn_model_load(&model, gf, args.max_seq_len) != 0) {
+    if (bn_model_load(&model, gf, args.max_seq_len, args.kv_f16) != 0) {
         SH_LOG_ERROR("Failed to load model");
         bn_gguf_free(gf);
         bn_platform_unload_file(&mf);

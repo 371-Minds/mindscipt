@@ -17,6 +17,7 @@ typedef struct {
     int head_size, kv_dim, kv_mul;  // derived
     int has_ffn_gate, act_type;     // 0=SiLU, 1=ReLU²
     int flash_attn;                 // use flash attention (online softmax)
+    int kv_f16;                     // store KV cache in FP16 (halves attention DRAM bandwidth)
 } BnConfig;
 
 typedef struct {
@@ -56,7 +57,7 @@ typedef struct {
     SHArena *arena;     // arena for all RunState buffers
 } BnModel;
 
-int  bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len);
+int  bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16);
 void bn_model_free(BnModel *m);
 void bn_model_embed_token(const BnModel *m, float *out, int token);
 

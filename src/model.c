@@ -55,9 +55,10 @@ static float *load_f32_tensor(BnGGUFFile *f, const char *name) {
 
 // --- Model loading ---
 
-int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len) {
+int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     memset(m, 0, sizeof(BnModel));
     BnConfig *c = &m->config;
+    c->kv_f16 = kv_f16;
 
     // Try to detect architecture prefix
     const char *arch = bn_gguf_get_str(f, "general.architecture");
@@ -272,7 +273,8 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len) {
     arena_size += 2 * (size_t)c->hidden_dim * sizeof(float);  // hb, hb2
     arena_size += att_size * sizeof(float);                     // att
     arena_size += (size_t)c->vocab_size * sizeof(float);       // logits
-    arena_size += 2 * kv_cache_size * sizeof(float);           // key_cache, value_cache
+    size_t kv_elem_size = c->kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    arena_size += 2 * kv_cache_size * kv_elem_size;           // key_cache, value_cache
     arena_size += (size_t)x_q_size * sizeof(int8_t);           // x_q
     arena_size += (size_t)half_head * sizeof(float);           // rope_freq
     arena_size += emb_i8_bytes + emb_i8_scales_bytes;          // INT8 embeddings
@@ -292,8 +294,8 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len) {
     s->hb2         = (float *)sh_arena_calloc(m->arena, c->hidden_dim, sizeof(float));
     s->att         = (float *)sh_arena_calloc(m->arena, att_size, sizeof(float));
     s->logits      = (float *)sh_arena_calloc(m->arena, c->vocab_size, sizeof(float));
-    s->key_cache   = (float *)sh_arena_calloc(m->arena, kv_cache_size, sizeof(float));
-    s->value_cache = (float *)sh_arena_calloc(m->arena, kv_cache_size, sizeof(float));
+    s->key_cache   = (float *)sh_arena_calloc(m->arena, kv_cache_size, kv_elem_size);
+    s->value_cache = (float *)sh_arena_calloc(m->arena, kv_cache_size, kv_elem_size);
     s->x_q         = (int8_t *)sh_arena_calloc(m->arena, x_q_size, sizeof(int8_t));
     s->rope_freq   = (float *)sh_arena_alloc(m->arena, half_head * sizeof(float));
 

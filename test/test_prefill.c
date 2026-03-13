@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
     }
 
     BnModel model;
-    if (bn_model_load(&model, gf, 2048) != 0) {
+    if (bn_model_load(&model, gf, 2048, 0) != 0) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }

@@ -35,7 +35,7 @@ src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # --- Tests ---
-.PHONY: debug test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_prefill clean
+.PHONY: debug test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_prefill test_kv_f16 clean
 
 test: test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety
 
@@ -71,5 +71,10 @@ test_prefill: test/test_prefill.c src/platform.c src/gguf.c src/quant.c src/mode
               src/sh_arena.c src/sh_log.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+test_kv_f16: test/test_kv_f16.c src/platform.c src/gguf.c src/quant.c src/model.c \
+             src/transformer.c src/tokenizer.c src/sampler.c src/threadpool.c \
+             src/sh_arena.c src/sh_log.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 clean:
-	rm -f bitnet src/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_e2e test_prefill
+	rm -f bitnet src/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_e2e test_prefill test_kv_f16

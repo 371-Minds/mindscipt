@@ -75,6 +75,7 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
     int kv_mul = g->kv_mul;
     int pos = g->pos;
     size_t loff = g->loff;
+    int kv_f16 = c->kv_f16;
 
     for (int h = h_start; h < h_end; h++) {
         float *q_h = s->q + h * head_size;
@@ -83,7 +84,22 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
         float inv_sqrt_hs = 1.0f / sqrtf((float)head_size);
 
         for (int t = 0; t <= pos; t++) {
-            float *k_t = s->key_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+            float k_buf[head_size];
+            const float *k_t;
+            if (kv_f16) {
+                const uint16_t *k_f16 = (const uint16_t *)s->key_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+#ifdef __ARM_NEON
+                for (int d = 0; d < head_size; d += 4) {
+                    float16x4_t hv = vreinterpret_f16_u16(vld1_u16(k_f16 + d));
+                    vst1q_f32(k_buf + d, vcvt_f32_f16(hv));
+                }
+#else
+                for (int d = 0; d < head_size; d++) k_buf[d] = bn_fp16_to_fp32(k_f16[d]);
+#endif
+                k_t = k_buf;
+            } else {
+                k_t = s->key_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+            }
 #ifdef __ARM_NEON
             float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
             float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
@@ -107,7 +123,22 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
         float *xb_h = s->xb + h * head_size;
         memset(xb_h, 0, head_size * sizeof(float));
         for (int t = 0; t <= pos; t++) {
-            float *v_t = s->value_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+            float v_buf[head_size];
+            const float *v_t;
+            if (kv_f16) {
+                const uint16_t *v_f16 = (const uint16_t *)s->value_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+#ifdef __ARM_NEON
+                for (int d = 0; d < head_size; d += 4) {
+                    float16x4_t hv = vreinterpret_f16_u16(vld1_u16(v_f16 + d));
+                    vst1q_f32(v_buf + d, vcvt_f32_f16(hv));
+                }
+#else
+                for (int d = 0; d < head_size; d++) v_buf[d] = bn_fp16_to_fp32(v_f16[d]);
+#endif
+                v_t = v_buf;
+            } else {
+                v_t = s->value_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+            }
             float a = att[t];
 #ifdef __ARM_NEON
             float32x4_t a_v = vdupq_n_f32(a);
@@ -131,6 +162,7 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
 
 static void flash_gqa_range(void *ctx, int h_start, int h_end) {
     GQACtx *g = (GQACtx *)ctx;
+    const BnConfig *c = g->c;
     BnRunState *s = g->s;
     int head_size = g->head_size;
     int kv_dim = g->kv_dim;
@@ -138,6 +170,7 @@ static void flash_gqa_range(void *ctx, int h_start, int h_end) {
     int pos = g->pos;
     size_t loff = g->loff;
     int n_pos = pos + 1;
+    int kv_f16 = c->kv_f16;
     float inv_sqrt_hs = 1.0f / sqrtf((float)head_size);
 
     for (int h = h_start; h < h_end; h++) {
@@ -156,10 +189,25 @@ static void flash_gqa_range(void *ctx, int h_start, int h_end) {
             if (t_end > n_pos) t_end = n_pos;
 
             for (int t = t_start; t < t_end; t++) {
-                float *k_t = s->key_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+                float k_buf[head_size];
+                const float *k_t;
+                if (kv_f16) {
+                    const uint16_t *k_f16 = (const uint16_t *)s->key_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+                    for (int d = 0; d < head_size; d += 4) {
+                        float16x4_t hv = vreinterpret_f16_u16(vld1_u16(k_f16 + d));
+                        vst1q_f32(k_buf + d, vcvt_f32_f16(hv));
+                    }
+                    k_t = k_buf;
+                } else {
+                    k_t = s->key_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+                }
 
-                if (t + 1 < t_end)
-                    __builtin_prefetch(s->key_cache + loff + (size_t)(t+1) * kv_dim + kv_h * head_size, 0, 0);
+                if (t + 1 < t_end) {
+                    if (kv_f16)
+                        __builtin_prefetch((const uint16_t *)s->key_cache + loff + (size_t)(t+1) * kv_dim + kv_h * head_size, 0, 0);
+                    else
+                        __builtin_prefetch(s->key_cache + loff + (size_t)(t+1) * kv_dim + kv_h * head_size, 0, 0);
+                }
 
                 // Score: dot(Q, K) * scale
                 float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
@@ -173,7 +221,18 @@ static void flash_gqa_range(void *ctx, int h_start, int h_end) {
                 float score = neon_hsum_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3))) * inv_sqrt_hs;
 
                 // Online softmax update
-                float *v_t = s->value_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+                float v_buf[head_size];
+                const float *v_t;
+                if (kv_f16) {
+                    const uint16_t *v_f16 = (const uint16_t *)s->value_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+                    for (int d = 0; d < head_size; d += 4) {
+                        float16x4_t hv = vreinterpret_f16_u16(vld1_u16(v_f16 + d));
+                        vst1q_f32(v_buf + d, vcvt_f32_f16(hv));
+                    }
+                    v_t = v_buf;
+                } else {
+                    v_t = s->value_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+                }
                 __builtin_prefetch(v_t, 0, 0);
 
                 float old_max = running_max;
@@ -394,28 +453,72 @@ static int forward_layers(BnModel *m, int token, int pos) {
 
         rmsnorm(s->xb, s->x, lw->attn_norm, dim, c->norm_eps);
 
-        // QKV projections (unified path — bn_quant_matvec_batch handles SDOT internally)
-        {
+        if (c->kv_f16) {
+            // F16 KV cache: write K/V to temp F32 buffers, apply RoPE, convert to F16
+            float *k_tmp = s->hb, *v_tmp = s->hb2;  // [hidden_dim] >= kv_dim
+            BnMatvecTask qkv[3] = {
+                { s->q,  &lw->wq },
+                { k_tmp, &lw->wk },
+                { v_tmp, &lw->wv },
+            };
+            bn_quant_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
+
+            // RoPE on Q
+            for (int i = 0; i < dim; i += 2) {
+                int fi = (i / 2) % half_head;
+                float v0 = s->q[i], v1 = s->q[i + 1];
+                s->q[i]     = v0 * rope_cos[fi] - v1 * rope_sin[fi];
+                s->q[i + 1] = v0 * rope_sin[fi] + v1 * rope_cos[fi];
+            }
+
+            // RoPE on K temp buffer
+            for (int i = 0; i < kv_dim; i += 2) {
+                int fi = (i / 2) % half_head;
+                float v0 = k_tmp[i], v1 = k_tmp[i + 1];
+                k_tmp[i]     = v0 * rope_cos[fi] - v1 * rope_sin[fi];
+                k_tmp[i + 1] = v0 * rope_sin[fi] + v1 * rope_cos[fi];
+            }
+
+            // Convert F32 → F16 into cache
+            uint16_t *kc = (uint16_t *)s->key_cache   + loff + (size_t)pos * kv_dim;
+            uint16_t *vc = (uint16_t *)s->value_cache + loff + (size_t)pos * kv_dim;
+#ifdef __ARM_NEON
+            for (int i = 0; i < kv_dim; i += 4) {
+                float32x4_t kv4 = vld1q_f32(k_tmp + i);
+                float16x4_t kh4 = vcvt_f16_f32(kv4);
+                vst1_u16(kc + i, vreinterpret_u16_f16(kh4));
+                float32x4_t vv4 = vld1q_f32(v_tmp + i);
+                float16x4_t vh4 = vcvt_f16_f32(vv4);
+                vst1_u16(vc + i, vreinterpret_u16_f16(vh4));
+            }
+#else
+            for (int i = 0; i < kv_dim; i++) {
+                kc[i] = bn_fp32_to_fp16(k_tmp[i]);
+                vc[i] = bn_fp32_to_fp16(v_tmp[i]);
+            }
+#endif
+        } else {
+            // F32 KV cache: matvec directly into cache, RoPE in-place
             BnMatvecTask qkv[3] = {
                 { s->q,            &lw->wq },
                 { key_cache_row,   &lw->wk },
                 { value_cache_row, &lw->wv },
             };
             bn_quant_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
-        }
 
-        // RoPE using precomputed cos/sin (no trig calls here)
-        for (int i = 0; i < dim; i += 2) {
-            int fi = (i / 2) % half_head;
-            float v0 = s->q[i], v1 = s->q[i + 1];
-            s->q[i]     = v0 * rope_cos[fi] - v1 * rope_sin[fi];
-            s->q[i + 1] = v0 * rope_sin[fi] + v1 * rope_cos[fi];
-        }
-        for (int i = 0; i < kv_dim; i += 2) {
-            int fi = (i / 2) % half_head;
-            float v0 = key_cache_row[i], v1 = key_cache_row[i + 1];
-            key_cache_row[i]     = v0 * rope_cos[fi] - v1 * rope_sin[fi];
-            key_cache_row[i + 1] = v0 * rope_sin[fi] + v1 * rope_cos[fi];
+            // RoPE using precomputed cos/sin (no trig calls here)
+            for (int i = 0; i < dim; i += 2) {
+                int fi = (i / 2) % half_head;
+                float v0 = s->q[i], v1 = s->q[i + 1];
+                s->q[i]     = v0 * rope_cos[fi] - v1 * rope_sin[fi];
+                s->q[i + 1] = v0 * rope_sin[fi] + v1 * rope_cos[fi];
+            }
+            for (int i = 0; i < kv_dim; i += 2) {
+                int fi = (i / 2) % half_head;
+                float v0 = key_cache_row[i], v1 = key_cache_row[i + 1];
+                key_cache_row[i]     = v0 * rope_cos[fi] - v1 * rope_sin[fi];
+                key_cache_row[i + 1] = v0 * rope_sin[fi] + v1 * rope_cos[fi];
+            }
         }
 
         // GQA attention
