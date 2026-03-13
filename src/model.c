@@ -158,6 +158,8 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len) {
         return -1;
     }
     w->emb_type = f->tensors[emb_idx].type;
+    w->emb_out_i8 = NULL;
+    w->emb_out_scales = NULL;
 
     // #24: Output norm — must exist
     w->output_norm = load_f32_tensor(f, "output_norm.weight");
@@ -253,7 +255,18 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len) {
     int x_q_size = c->dim > c->hidden_dim ? c->dim : c->hidden_dim;
     int half_head = c->head_size / 2;
 
-    // Compute total arena capacity (all RunState buffers)
+    // INT8 embedding size (DOTPROD + F16 only)
+    size_t emb_i8_bytes = 0;
+    size_t emb_i8_scales_bytes = 0;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    int want_i8_emb = (w->emb_type == BN_GGUF_TENSOR_F16);
+    if (want_i8_emb) {
+        emb_i8_bytes = (size_t)c->vocab_size * c->dim;
+        emb_i8_scales_bytes = (size_t)c->vocab_size * sizeof(float);
+    }
+#endif
+
+    // Compute total arena capacity (all RunState buffers + INT8 embeddings)
     size_t arena_size = 0;
     arena_size += 4 * (size_t)c->dim * sizeof(float);         // x, xb, xb2, q
     arena_size += 2 * (size_t)c->hidden_dim * sizeof(float);  // hb, hb2
@@ -262,7 +275,8 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len) {
     arena_size += 2 * kv_cache_size * sizeof(float);           // key_cache, value_cache
     arena_size += (size_t)x_q_size * sizeof(int8_t);           // x_q
     arena_size += (size_t)half_head * sizeof(float);           // rope_freq
-    arena_size += 12 * SH_ARENA_ALIGN;                         // alignment padding
+    arena_size += emb_i8_bytes + emb_i8_scales_bytes;          // INT8 embeddings
+    arena_size += 14 * SH_ARENA_ALIGN;                         // alignment padding
 
     m->arena = sh_arena_create(arena_size);
     if (!m->arena) {
@@ -296,6 +310,24 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len) {
         s->rope_freq[i] = 1.0f / powf(c->rope_theta, (float)(2 * i) / (float)c->head_size);
     }
 
+    // Quantize F16 embeddings to INT8 for fast SDOT logits kernel
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    if (want_i8_emb) {
+        w->emb_out_i8 = (int8_t *)sh_arena_alloc(m->arena, emb_i8_bytes);
+        w->emb_out_scales = (float *)sh_arena_alloc(m->arena, emb_i8_scales_bytes);
+        if (w->emb_out_i8 && w->emb_out_scales) {
+            bn_quant_f16_rows_to_i8((const uint16_t *)w->token_embedding,
+                                    w->emb_out_i8, w->emb_out_scales,
+                                    c->vocab_size, c->dim);
+            SH_LOG_DEBUG("INT8 embeddings ready", "vocab", "ok");
+        } else {
+            w->emb_out_i8 = NULL;
+            w->emb_out_scales = NULL;
+            SH_LOG_DEBUG("INT8 embedding arena alloc failed, using F16 fallback");
+        }
+    }
+#endif
+
     return 0;
 
 fail_state:
@@ -311,7 +343,7 @@ void bn_model_free(BnModel *m) {
     if (!m) return;
     bn_tp_free(m->pool);
     free(m->weights.layers);
-    sh_arena_free(m->arena);
+    sh_arena_free(m->arena);  // frees INT8 embeddings too
     memset(m, 0, sizeof(BnModel));
 }
 

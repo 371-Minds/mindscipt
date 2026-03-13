@@ -69,6 +69,10 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
 // Quantize float vector to int8, returns scale = amax/127.
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n);
+
+// Quantize F16 rows to INT8 + per-row scales for INT8 logits kernel.
+void bn_quant_f16_rows_to_i8(const uint16_t *f16, int8_t *i8_out,
+                              float *scales_out, int n_rows, int dim);
 #endif
 
 #endif // BN_QUANT_H

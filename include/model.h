@@ -28,6 +28,8 @@ typedef struct {
 typedef struct {
     const void *token_embedding;  // raw F16 data (dequant on demand)
     int emb_type;                 // tensor type (F16, Q6_K, etc.)
+    int8_t *emb_out_i8;          // [vocab_size * dim] INT8 copy for logits (NULL if unused)
+    float  *emb_out_scales;      // [vocab_size] per-row scales (NULL if unused)
     float *output_norm;           // [dim]
     BnLayerWeights *layers;         // [n_layers]
 } BnWeights;

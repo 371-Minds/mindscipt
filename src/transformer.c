@@ -126,6 +126,43 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
 
 // --- Logits range functions ---
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+typedef struct {
+    float *logits;
+    const int8_t *emb_i8;
+    const float *emb_scales;
+    const int8_t *x_q;
+    float x_scale;
+    int dim;
+} LogitsI8Ctx;
+
+static void logits_i8_sdot_range(void *ctx, int v_start, int v_end) {
+    LogitsI8Ctx *lc = (LogitsI8Ctx *)ctx;
+    const int8_t *emb_i8 = lc->emb_i8;
+    const float *emb_scales = lc->emb_scales;
+    const int8_t *x_q = lc->x_q;
+    float x_scale = lc->x_scale;
+    int dim = lc->dim;
+
+    for (int v = v_start; v < v_end; v++) {
+        const int8_t *row = emb_i8 + (size_t)v * dim;
+        __builtin_prefetch(row + (size_t)dim, 0, 0);
+        int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
+        int32x4_t acc2 = vdupq_n_s32(0), acc3 = vdupq_n_s32(0);
+        for (int d = 0; d < dim; d += 64) {
+            __builtin_prefetch(row + d + 128, 0, 0);
+            acc0 = vdotq_s32(acc0, vld1q_s8(row+d),    vld1q_s8(x_q+d));
+            acc1 = vdotq_s32(acc1, vld1q_s8(row+d+16), vld1q_s8(x_q+d+16));
+            acc2 = vdotq_s32(acc2, vld1q_s8(row+d+32), vld1q_s8(x_q+d+32));
+            acc3 = vdotq_s32(acc3, vld1q_s8(row+d+48), vld1q_s8(x_q+d+48));
+        }
+        int32x4_t sum4 = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+        int32_t total = vaddvq_s32(sum4);
+        lc->logits[v] = (float)total * emb_scales[v] * x_scale;
+    }
+}
+#endif // __ARM_NEON && __ARM_FEATURE_DOTPROD
+
 typedef struct {
     float *logits;
     const float *x;
@@ -408,27 +445,39 @@ float *bn_transformer_forward(BnModel *m, int token, int pos) {
 
     // Tied embeddings: logits = token_embedding^T @ x
     if (m->weights.emb_type == BN_GGUF_TENSOR_F16) {
-        const uint16_t *emb = (const uint16_t *)w->token_embedding;
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-        // Convert x to F16 once for native F16 FMA
-        uint16_t x_f16[dim];
-        for (int d = 0; d < dim; d += 8) {
-            float16x4_t lo = vcvt_f16_f32(vld1q_f32(s->x + d));
-            float16x4_t hi = vcvt_f16_f32(vld1q_f32(s->x + d + 4));
-            vst1q_u16(x_f16 + d, vreinterpretq_u16_f16(vcombine_f16(lo, hi)));
-        }
-        LogitsCtx lctx = { s->logits, (const float *)(void *)x_f16, emb, dim };
-        BnTPTask logits_task = { logits_f16_native_range, &lctx, c->vocab_size };
-        bn_tp_dispatch(m->pool, &logits_task, 1);
-#elif defined(__ARM_NEON)
-        LogitsCtx lctx = { s->logits, s->x, emb, dim };
-        BnTPTask logits_task = { logits_f16_neon_range, &lctx, c->vocab_size };
-        bn_tp_dispatch(m->pool, &logits_task, 1);
-#else
-        LogitsCtx lctx = { s->logits, s->x, emb, dim };
-        BnTPTask logits_task = { logits_f16_scalar_range, &lctx, c->vocab_size };
-        bn_tp_dispatch(m->pool, &logits_task, 1);
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+        if (w->emb_out_i8) {
+            // INT8 SDOT path: quantize x once, dot against pre-quantized embeddings
+            float x_scale = bn_quant_x_to_i8(s->x, s->x_q, dim);
+            LogitsI8Ctx lctx = { s->logits, w->emb_out_i8, w->emb_out_scales,
+                                 s->x_q, x_scale, dim };
+            BnTPTask logits_task = { logits_i8_sdot_range, &lctx, c->vocab_size };
+            bn_tp_dispatch(m->pool, &logits_task, 1);
+        } else
 #endif
+        {
+            const uint16_t *emb = (const uint16_t *)w->token_embedding;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            // Convert x to F16 once for native F16 FMA
+            uint16_t x_f16[dim];
+            for (int d = 0; d < dim; d += 8) {
+                float16x4_t lo = vcvt_f16_f32(vld1q_f32(s->x + d));
+                float16x4_t hi = vcvt_f16_f32(vld1q_f32(s->x + d + 4));
+                vst1q_u16(x_f16 + d, vreinterpretq_u16_f16(vcombine_f16(lo, hi)));
+            }
+            LogitsCtx lctx = { s->logits, (const float *)(void *)x_f16, emb, dim };
+            BnTPTask logits_task = { logits_f16_native_range, &lctx, c->vocab_size };
+            bn_tp_dispatch(m->pool, &logits_task, 1);
+#elif defined(__ARM_NEON)
+            LogitsCtx lctx = { s->logits, s->x, emb, dim };
+            BnTPTask logits_task = { logits_f16_neon_range, &lctx, c->vocab_size };
+            bn_tp_dispatch(m->pool, &logits_task, 1);
+#else
+            LogitsCtx lctx = { s->logits, s->x, emb, dim };
+            BnTPTask logits_task = { logits_f16_scalar_range, &lctx, c->vocab_size };
+            bn_tp_dispatch(m->pool, &logits_task, 1);
+#endif
+        }
     } else {
         // F32 embeddings
         const float *emb = (const float *)w->token_embedding;
