@@ -50,4 +50,21 @@ typedef struct {
 void ternary_matvec_batch(const MatvecTask *tasks, int n_tasks,
                            const float *x, int8_t *x_q_buf);
 
+// Inner batch matvec: must be called from within #pragma omp parallel.
+// x_scale_out must point to a shared float (written by one thread, read by all).
+// Includes an omp barrier at the end to ensure outputs are complete.
+void ternary_matvec_batch_inner(const MatvecTask *tasks, int n_tasks,
+                                 const float *x, int8_t *x_q_buf,
+                                 float *x_scale_out);
+
+// Low-level SDOT primitives for building merged parallel regions.
+// quantize_x_to_i8: quantize float vector to int8, returns scale = amax/127.
+// i2s_matvec_sdot: I2_S matvec using SDOT, must be inside #pragma omp parallel.
+//                  Uses #pragma omp for nowait internally.
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+float quantize_x_to_i8(const float *x, int8_t *x_q, int n);
+void  i2s_matvec_sdot(float *out, const QWeight *W,
+                       const int8_t *x_q, float x_scale);
+#endif
+
 #endif // QUANT_H

@@ -2,6 +2,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -106,46 +107,68 @@ float *transformer_forward(Model *m, int token, int pos) {
     // Embed the token
     model_embed_token(m, s->x, token);
 
+    // Precompute RoPE cos/sin for this position (128 trig calls total,
+    // vs 96,000 if computed per-head per-layer)
+    int half_head = head_size / 2;
+    float rope_cos[half_head], rope_sin[half_head];
+    for (int i = 0; i < half_head; i++) {
+        float angle = pos * s->rope_freq[i];
+        rope_cos[i] = cosf(angle);
+        rope_sin[i] = sinf(angle);
+    }
+
     // Process each layer
     for (int l = 0; l < c->n_layers; l++) {
         LayerWeights *lw = &w->layers[l];
-
-        // ---- Attention block ----
-
-        // RMSNorm before attention
-        rmsnorm(s->xb, s->x, lw->attn_norm, dim, c->norm_eps);
-
-        // QKV projections (ternary matmul) — batched to reduce OMP fork/join
         size_t loff = (size_t)l * c->seq_len * kv_dim;
         float *key_cache_row   = s->key_cache   + loff + (size_t)pos * kv_dim;
         float *value_cache_row = s->value_cache + loff + (size_t)pos * kv_dim;
 
-        MatvecTask qkv[3] = {
-            { s->q,            &lw->wq },
-            { key_cache_row,   &lw->wk },
-            { value_cache_row, &lw->wv },
-        };
-        ternary_matvec_batch(qkv, 3, s->xb, s->x_q);
+        // ---- Attention block ----
 
-        // RoPE on q and k (using precomputed frequency table)
-        rope(s->q, dim, head_size, pos, s->rope_freq);
-        rope(key_cache_row, kv_dim, head_size, pos, s->rope_freq);
+        rmsnorm(s->xb, s->x, lw->attn_norm, dim, c->norm_eps);
 
-        // Grouped Query Attention (GQA)
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+        // Direct SDOT path: pre-quantize, then fork once for all QKV matvecs.
+        // Avoids ternary_matvec_batch indirection and per-call malloc.
+        {
+            float x_scale = quantize_x_to_i8(s->xb, s->x_q, dim);
+            #ifdef _OPENMP
+            #pragma omp parallel
+            #endif
+            {
+                i2s_matvec_sdot(s->q, &lw->wq, s->x_q, x_scale);
+                i2s_matvec_sdot(key_cache_row, &lw->wk, s->x_q, x_scale);
+                i2s_matvec_sdot(value_cache_row, &lw->wv, s->x_q, x_scale);
+            }
+        }
+
+        // RoPE using precomputed cos/sin (no trig calls here)
+        for (int i = 0; i < dim; i += 2) {
+            int fi = (i / 2) % half_head;
+            float v0 = s->q[i], v1 = s->q[i + 1];
+            s->q[i]     = v0 * rope_cos[fi] - v1 * rope_sin[fi];
+            s->q[i + 1] = v0 * rope_sin[fi] + v1 * rope_cos[fi];
+        }
+        for (int i = 0; i < kv_dim; i += 2) {
+            int fi = (i / 2) % half_head;
+            float v0 = key_cache_row[i], v1 = key_cache_row[i + 1];
+            key_cache_row[i]     = v0 * rope_cos[fi] - v1 * rope_sin[fi];
+            key_cache_row[i + 1] = v0 * rope_sin[fi] + v1 * rope_cos[fi];
+        }
+
+        // GQA
         #ifdef _OPENMP
         #pragma omp parallel for
         #endif
         for (int h = 0; h < c->n_heads; h++) {
             float *q_h = s->q + h * head_size;
             float *att = s->att + h * c->seq_len;
-            int kv_h = h / kv_mul;  // which KV head this query head attends to
-
-            // Attention scores: q · k for all positions up to pos
-            {
+            int kv_h = h / kv_mul;
             float inv_sqrt_hs = 1.0f / sqrtf((float)head_size);
+
             for (int t = 0; t <= pos; t++) {
                 float *k_t = s->key_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
-#ifdef __ARM_NEON
                 float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
                 float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
                 for (int d = 0; d < head_size; d += 16) {
@@ -156,29 +179,15 @@ float *transformer_forward(Model *m, int token, int pos) {
                 }
                 float32x4_t sum = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
                 att[t] = neon_hsum_f32(sum) * inv_sqrt_hs;
-#else
-                float score = 0.0f;
-                #ifdef _OPENMP
-                #pragma omp simd reduction(+:score)
-                #endif
-                for (int d = 0; d < head_size; d++) {
-                    score += q_h[d] * k_t[d];
-                }
-                att[t] = score * inv_sqrt_hs;
-#endif
-            }
             }
 
-            // Softmax over attention scores
             softmax(att, pos + 1);
 
-            // Weighted sum of values
             float *xb_h = s->xb + h * head_size;
             memset(xb_h, 0, head_size * sizeof(float));
             for (int t = 0; t <= pos; t++) {
                 float *v_t = s->value_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
                 float a = att[t];
-#ifdef __ARM_NEON
                 float32x4_t a_v = vdupq_n_f32(a);
                 for (int d = 0; d < head_size; d += 16) {
                     vst1q_f32(xb_h + d,      vmlaq_f32(vld1q_f32(xb_h + d),      a_v, vld1q_f32(v_t + d)));
@@ -186,93 +195,125 @@ float *transformer_forward(Model *m, int token, int pos) {
                     vst1q_f32(xb_h + d + 8,  vmlaq_f32(vld1q_f32(xb_h + d + 8),  a_v, vld1q_f32(v_t + d + 8)));
                     vst1q_f32(xb_h + d + 12, vmlaq_f32(vld1q_f32(xb_h + d + 12), a_v, vld1q_f32(v_t + d + 12)));
                 }
-#else
-                #ifdef _OPENMP
-                #pragma omp simd
-                #endif
-                for (int d = 0; d < head_size; d++) {
-                    xb_h[d] += a * v_t[d];
-                }
-#endif
             }
         }
 
-        // Attention sub-norm (BitNet-specific)
-        if (lw->attn_sub_norm) {
+        // Attention sub-norm + wo projection
+        if (lw->attn_sub_norm)
             rmsnorm(s->xb, s->xb, lw->attn_sub_norm, dim, c->norm_eps);
+
+        {
+            float x_scale = quantize_x_to_i8(s->xb, s->x_q, dim);
+            #ifdef _OPENMP
+            #pragma omp parallel
+            #endif
+            {
+                i2s_matvec_sdot(s->xb2, &lw->wo, s->x_q, x_scale);
+            }
+        }
+#else
+        // Non-DOTPROD fallback
+        {
+            MatvecTask qkv[3] = {
+                { s->q,            &lw->wq },
+                { key_cache_row,   &lw->wk },
+                { value_cache_row, &lw->wv },
+            };
+            ternary_matvec_batch(qkv, 3, s->xb, s->x_q);
         }
 
-        // Output projection: Wo @ xb → xb2
-        ternary_matvec(s->xb2, &lw->wo, s->xb);
+        rope(s->q, dim, head_size, pos, s->rope_freq);
+        rope(key_cache_row, kv_dim, head_size, pos, s->rope_freq);
+
+        #ifdef _OPENMP
+        #pragma omp parallel for
+        #endif
+        for (int h = 0; h < c->n_heads; h++) {
+            float *q_h = s->q + h * head_size;
+            float *att = s->att + h * c->seq_len;
+            int kv_h = h / kv_mul;
+            float inv_sqrt_hs = 1.0f / sqrtf((float)head_size);
+            for (int t = 0; t <= pos; t++) {
+                float *k_t = s->key_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+                float score = 0.0f;
+                for (int d = 0; d < head_size; d++) score += q_h[d] * k_t[d];
+                att[t] = score * inv_sqrt_hs;
+            }
+            softmax(att, pos + 1);
+            float *xb_h = s->xb + h * head_size;
+            memset(xb_h, 0, head_size * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                float *v_t = s->value_cache + loff + (size_t)t * kv_dim + kv_h * head_size;
+                float a = att[t];
+                for (int d = 0; d < head_size; d++) xb_h[d] += a * v_t[d];
+            }
+        }
+
+        if (lw->attn_sub_norm)
+            rmsnorm(s->xb, s->xb, lw->attn_sub_norm, dim, c->norm_eps);
+
+        {
+            MatvecTask wo[1] = {{ s->xb2, &lw->wo }};
+            ternary_matvec_batch(wo, 1, s->xb, s->x_q);
+        }
+#endif
 
         // Residual connection
 #ifdef __ARM_NEON
         for (int i = 0; i < dim; i += 4)
             vst1q_f32(s->x + i, vaddq_f32(vld1q_f32(s->x + i), vld1q_f32(s->xb2 + i)));
 #else
-        #ifdef _OPENMP
-        #pragma omp simd
-        #endif
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
 #endif
 
         // ---- FFN block ----
 
-        // RMSNorm before FFN
         rmsnorm(s->xb, s->x, lw->ffn_norm, dim, c->norm_eps);
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
         if (c->has_ffn_gate) {
-            // SwiGLU / Gated: gate * activation(up) — batched
-            MatvecTask ffn[2] = {
-                { s->hb,  &lw->ffn_gate },
-                { s->hb2, &lw->ffn_up   },
-            };
-            ternary_matvec_batch(ffn, 2, s->xb, s->x_q);
-
-            if (c->act_type == 1) {
-                // BitNet b1.58 with ReLU²: relu²(gate) * up
-#ifdef __ARM_NEON
+            // Gate + Up in one fork/join
+            {
+                float x_scale = quantize_x_to_i8(s->xb, s->x_q, dim);
+                #ifdef _OPENMP
+                #pragma omp parallel
+                #endif
                 {
-                    float32x4_t zero = vdupq_n_f32(0);
-                    for (int i = 0; i < hidden_dim; i += 4) {
-                        float32x4_t g = vmaxq_f32(vld1q_f32(s->hb + i), zero);
-                        vst1q_f32(s->hb + i, vmulq_f32(vmulq_f32(g, g), vld1q_f32(s->hb2 + i)));
-                    }
+                    i2s_matvec_sdot(s->hb, &lw->ffn_gate, s->x_q, x_scale);
+                    i2s_matvec_sdot(s->hb2, &lw->ffn_up, s->x_q, x_scale);
                 }
-#else
-                #ifdef _OPENMP
-                #pragma omp simd
-                #endif
-                for (int i = 0; i < hidden_dim; i++) {
-                    float g = s->hb[i] > 0 ? s->hb[i] : 0;  // ReLU
-                    s->hb[i] = g * g * s->hb2[i];            // ReLU² * up
+            }
+
+            // Activation
+            if (c->act_type == 1) {
+                float32x4_t zero = vdupq_n_f32(0);
+                for (int i = 0; i < hidden_dim; i += 4) {
+                    float32x4_t g = vmaxq_f32(vld1q_f32(s->hb + i), zero);
+                    vst1q_f32(s->hb + i, vmulq_f32(vmulq_f32(g, g), vld1q_f32(s->hb2 + i)));
                 }
-#endif
             } else {
-                // SiLU (SwiGLU): silu(gate) * up
-                #ifdef _OPENMP
-                #pragma omp simd
-                #endif
                 for (int i = 0; i < hidden_dim; i++) {
                     float g = s->hb[i];
                     s->hb[i] = (g / (1.0f + expf(-g))) * s->hb2[i];
                 }
             }
         } else {
-            // No gate: just up + activation
-            ternary_matvec(s->hb, &lw->ffn_up, s->xb);
-            if (c->act_type == 1) {
+            {
+                float x_scale = quantize_x_to_i8(s->xb, s->x_q, dim);
                 #ifdef _OPENMP
-                #pragma omp simd
+                #pragma omp parallel
                 #endif
+                {
+                    i2s_matvec_sdot(s->hb, &lw->ffn_up, s->x_q, x_scale);
+                }
+            }
+
+            if (c->act_type == 1) {
                 for (int i = 0; i < hidden_dim; i++) {
                     float v = s->hb[i] > 0 ? s->hb[i] : 0;
                     s->hb[i] = v * v;
                 }
             } else {
-                #ifdef _OPENMP
-                #pragma omp simd
-                #endif
                 for (int i = 0; i < hidden_dim; i++) {
                     float v = s->hb[i];
                     s->hb[i] = v / (1.0f + expf(-v));
@@ -280,22 +321,69 @@ float *transformer_forward(Model *m, int token, int pos) {
             }
         }
 
-        // FFN sub-norm (BitNet-specific)
-        if (lw->ffn_sub_norm) {
+        // FFN sub-norm + down projection
+        if (lw->ffn_sub_norm)
             rmsnorm(s->hb, s->hb, lw->ffn_sub_norm, hidden_dim, c->norm_eps);
+
+        {
+            float x_scale = quantize_x_to_i8(s->hb, s->x_q, hidden_dim);
+            #ifdef _OPENMP
+            #pragma omp parallel
+            #endif
+            {
+                i2s_matvec_sdot(s->xb, &lw->ffn_down, s->x_q, x_scale);
+            }
+        }
+#else
+        // Non-DOTPROD fallback
+        if (c->has_ffn_gate) {
+            MatvecTask ffn[2] = {
+                { s->hb,  &lw->ffn_gate },
+                { s->hb2, &lw->ffn_up   },
+            };
+            ternary_matvec_batch(ffn, 2, s->xb, s->x_q);
+
+            if (c->act_type == 1) {
+                for (int i = 0; i < hidden_dim; i++) {
+                    float g = s->hb[i] > 0 ? s->hb[i] : 0;
+                    s->hb[i] = g * g * s->hb2[i];
+                }
+            } else {
+                for (int i = 0; i < hidden_dim; i++) {
+                    float g = s->hb[i];
+                    s->hb[i] = (g / (1.0f + expf(-g))) * s->hb2[i];
+                }
+            }
+        } else {
+            MatvecTask ffn[1] = {{ s->hb, &lw->ffn_up }};
+            ternary_matvec_batch(ffn, 1, s->xb, s->x_q);
+            if (c->act_type == 1) {
+                for (int i = 0; i < hidden_dim; i++) {
+                    float v = s->hb[i] > 0 ? s->hb[i] : 0;
+                    s->hb[i] = v * v;
+                }
+            } else {
+                for (int i = 0; i < hidden_dim; i++) {
+                    float v = s->hb[i];
+                    s->hb[i] = v / (1.0f + expf(-v));
+                }
+            }
         }
 
-        // Down projection
-        ternary_matvec(s->xb, &lw->ffn_down, s->hb);
+        if (lw->ffn_sub_norm)
+            rmsnorm(s->hb, s->hb, lw->ffn_sub_norm, hidden_dim, c->norm_eps);
+
+        {
+            MatvecTask down[1] = {{ s->xb, &lw->ffn_down }};
+            ternary_matvec_batch(down, 1, s->hb, s->x_q);
+        }
+#endif
 
         // Residual connection
 #ifdef __ARM_NEON
         for (int i = 0; i < dim; i += 4)
             vst1q_f32(s->x + i, vaddq_f32(vld1q_f32(s->x + i), vld1q_f32(s->xb + i)));
 #else
-        #ifdef _OPENMP
-        #pragma omp simd
-        #endif
         for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
 #endif
 

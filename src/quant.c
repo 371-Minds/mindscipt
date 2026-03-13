@@ -177,7 +177,7 @@ void dequant_i2s_row(const uint8_t *data, float *out, int n, float scale) {
 
 // Quantize float vector x[n] to int8, returning scale = amax/127.
 // x_q[n] = round(x[i] / scale), clamped to [-127, 127].
-static float quantize_x_to_i8(const float *x, int8_t *x_q, int n) {
+float quantize_x_to_i8(const float *x, int8_t *x_q, int n) {
     // Find absolute max via NEON
     float32x4_t vmax = vdupq_n_f32(0);
     int i = 0;
@@ -229,8 +229,8 @@ static float quantize_x_to_i8(const float *x, int8_t *x_q, int n) {
 
 // SDOT I2_S matvec inner loop — called from within an OMP parallel region.
 // Accumulates int32, converts at the end. Uses omp for nowait.
-static void i2s_matvec_sdot(float *out, const QWeight *W,
-                             const int8_t *x_q, float x_scale) {
+void i2s_matvec_sdot(float *out, const QWeight *W,
+                      const int8_t *x_q, float x_scale) {
     int row_bytes = W->cols / 4;
     const uint8_t *base = (const uint8_t *)W->data;
     float combined_scale = W->scale * x_scale;
@@ -245,8 +245,8 @@ static void i2s_matvec_sdot(float *out, const QWeight *W,
 
         int32x4_t iaccA = vdupq_n_s32(0), iaccB = vdupq_n_s32(0);
         int32x4_t iaccC = vdupq_n_s32(0), iaccD = vdupq_n_s32(0);
-        const uint8x16_t neon_zero = vdupq_n_u8(0);
-        const uint8x16_t neon_two  = vdupq_n_u8(2);
+        const int8x16_t one = vdupq_n_s8(1);
+        const uint8x16_t mask3 = vdupq_n_u8(3);
 
         while (done < cols) {
             __builtin_prefetch(rd + 128, 0, 0);
@@ -254,20 +254,11 @@ static void i2s_matvec_sdot(float *out, const QWeight *W,
                 uint8x16_t raw = vld1q_u8(rd + h * 16);
                 const int8_t *xp = x_q + done + h * 16;
 
-                uint8x16_t v0 = vshrq_n_u8(raw, 6);
-                uint8x16_t v1 = vandq_u8(vshrq_n_u8(raw, 4), vdupq_n_u8(3));
-                uint8x16_t v2 = vandq_u8(vshrq_n_u8(raw, 2), vdupq_n_u8(3));
-                uint8x16_t v3 = vandq_u8(raw, vdupq_n_u8(3));
-
-                // Decode ternary: 0→-1, 1→0, 2→+1
-                int8x16_t t0 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v0, neon_zero)),
-                                         vreinterpretq_s8_u8(vceqq_u8(v0, neon_two)));
-                int8x16_t t1 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v1, neon_zero)),
-                                         vreinterpretq_s8_u8(vceqq_u8(v1, neon_two)));
-                int8x16_t t2 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v2, neon_zero)),
-                                         vreinterpretq_s8_u8(vceqq_u8(v2, neon_two)));
-                int8x16_t t3 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v3, neon_zero)),
-                                         vreinterpretq_s8_u8(vceqq_u8(v3, neon_two)));
+                // Arithmetic ternary decode: (bits - 1) maps {0,1,2} → {-1,0,+1}
+                int8x16_t t0 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 6)), one);
+                int8x16_t t1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(raw, 4), mask3)), one);
+                int8x16_t t2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(raw, 2), mask3)), one);
+                int8x16_t t3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask3)), one);
 
                 // SDOT: 16 int8×int8 multiply-adds per instruction
                 int8x16_t xv0 = vld1q_s8(xp + 0*32);
@@ -329,26 +320,18 @@ void ternary_matvec(float *out, const QWeight *W, const float *x) {
             float32x4_t accA2 = vdupq_n_f32(0), accA3 = vdupq_n_f32(0);
             float32x4_t accB0 = vdupq_n_f32(0), accB1 = vdupq_n_f32(0);
             float32x4_t accB2 = vdupq_n_f32(0), accB3 = vdupq_n_f32(0);
-            const uint8x16_t neon_zero = vdupq_n_u8(0);
-            const uint8x16_t neon_two  = vdupq_n_u8(2);
+            const int8x16_t one = vdupq_n_s8(1);
+            const uint8x16_t mask3 = vdupq_n_u8(3);
             while (done < cols) {
                 __builtin_prefetch(rd + 128, 0, 0);
                 __builtin_prefetch(rd + 192, 0, 0);
                 for (int h = 0; h < 2; h++) {
                     uint8x16_t raw = vld1q_u8(rd + h * 16);
                     const float *xp = x + done + h * 16;
-                    uint8x16_t v0 = vshrq_n_u8(raw, 6);
-                    uint8x16_t v1 = vandq_u8(vshrq_n_u8(raw, 4), vdupq_n_u8(3));
-                    uint8x16_t v2 = vandq_u8(vshrq_n_u8(raw, 2), vdupq_n_u8(3));
-                    uint8x16_t v3 = vandq_u8(raw, vdupq_n_u8(3));
-                    int8x16_t t0 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v0, neon_zero)),
-                                             vreinterpretq_s8_u8(vceqq_u8(v0, neon_two)));
-                    int8x16_t t1 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v1, neon_zero)),
-                                             vreinterpretq_s8_u8(vceqq_u8(v1, neon_two)));
-                    int8x16_t t2 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v2, neon_zero)),
-                                             vreinterpretq_s8_u8(vceqq_u8(v2, neon_two)));
-                    int8x16_t t3 = vsubq_s8(vreinterpretq_s8_u8(vceqq_u8(v3, neon_zero)),
-                                             vreinterpretq_s8_u8(vceqq_u8(v3, neon_two)));
+                    int8x16_t t0 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 6)), one);
+                    int8x16_t t1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(raw, 4), mask3)), one);
+                    int8x16_t t2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(raw, 2), mask3)), one);
+                    int8x16_t t3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask3)), one);
                     neon_acc_i8x16_f32(t0, xp + 0*32, &accA0, &accA1, &accA2, &accA3);
                     neon_acc_i8x16_f32(t1, xp + 1*32, &accB0, &accB1, &accB2, &accB3);
                     neon_acc_i8x16_f32(t2, xp + 2*32, &accA0, &accA1, &accA2, &accA3);
@@ -597,5 +580,58 @@ void ternary_matvec_batch(const MatvecTask *tasks, int n_tasks,
     // Fallback: use existing per-task matvec (each forks its own OMP region)
     for (int t = 0; t < n_tasks; t++) {
         ternary_matvec(tasks[t].out, tasks[t].W, x);
+    }
+}
+
+// --- Inner batch matvec (for use inside persistent OMP parallel region) ---
+// Must be called from within #pragma omp parallel.
+// Uses omp single for serial quantization, omp for nowait for SDOT rows,
+// and omp barrier to ensure all outputs are complete.
+
+void ternary_matvec_batch_inner(const MatvecTask *tasks, int n_tasks,
+                                 const float *x, int8_t *x_q_buf,
+                                 float *x_scale_out) {
+    if (n_tasks <= 0) return;
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    int all_i2s = 1;
+    for (int t = 0; t < n_tasks; t++) {
+        if (tasks[t].W->type != 36) { all_i2s = 0; break; }
+    }
+
+    if (all_i2s) {
+        int cols = tasks[0].W->cols;
+
+        // One thread quantizes x; implicit barrier makes x_q_buf visible to all
+        #ifdef _OPENMP
+        #pragma omp single
+        #endif
+        {
+            *x_scale_out = quantize_x_to_i8(x, x_q_buf, cols);
+        }
+
+        float x_scale = *x_scale_out;
+        for (int t = 0; t < n_tasks; t++) {
+            i2s_matvec_sdot(tasks[t].out, tasks[t].W, x_q_buf, x_scale);
+        }
+
+        #ifdef _OPENMP
+        #pragma omp barrier
+        #endif
+        return;
+    }
+#else
+    (void)x_q_buf;
+    (void)x_scale_out;
+#endif
+
+    // Fallback: serialize (non-I2S types, rare in production)
+    #ifdef _OPENMP
+    #pragma omp single
+    #endif
+    {
+        for (int t = 0; t < n_tasks; t++) {
+            ternary_matvec(tasks[t].out, tasks[t].W, x);
+        }
     }
 }
