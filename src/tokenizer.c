@@ -125,6 +125,10 @@ int bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f) {
     // #6: Use platform qsort_r to avoid global mutable state
     SORT_VOCAB(t->sorted_indices, t->vocab_size, t->vocab);
 
+    // Fallback: resolve eot_id from vocab if GGUF metadata didn't provide it
+    if (t->eot_id < 0)
+        t->eot_id = vocab_lookup(t, "<|eot_id|>");
+
     return 0;
 }
 
@@ -267,6 +271,10 @@ int bn_tokenizer_encode(const BnTokenizer *t, const char *text, int add_bos,
 
     free(work);
     return n_tokens;
+}
+
+int bn_tokenizer_lookup(const BnTokenizer *t, const char *str) {
+    return vocab_lookup(t, str);
 }
 
 // GPT-2/GPT-4 byte-level BPE reverse mapping.

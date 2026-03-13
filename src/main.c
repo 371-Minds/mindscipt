@@ -25,6 +25,10 @@ typedef struct {
     uint64_t seed;
     int max_seq_len;
     int flash_attn;
+    int chat;
+    int temp_set;       // whether user explicitly set --temp
+    float repeat_penalty;
+    int repeat_set;     // whether user explicitly set --repeat-penalty
 } CLIArgs;
 
 static void print_usage(const char *prog) {
@@ -37,6 +41,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --seed <int>    Random seed (default: 42)\n");
     fprintf(stderr, "  --maxseq <int>  Max sequence length (default: model max)\n");
     fprintf(stderr, "  --flash         Use flash attention (online softmax)\n");
+    fprintf(stderr, "  --chat          Interactive chat REPL mode\n");
+    fprintf(stderr, "  --repeat-penalty <float>  Repetition penalty (default: 1.0, chat: 1.1)\n");
 }
 
 static CLIArgs parse_args(int argc, char **argv) {
@@ -62,6 +68,7 @@ static CLIArgs parse_args(int argc, char **argv) {
             args.n_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
             args.temperature = (float)atof(argv[++i]);
+            args.temp_set = 1;
         } else if (strcmp(argv[i], "--topp") == 0 && i + 1 < argc) {
             args.topp = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
@@ -70,6 +77,11 @@ static CLIArgs parse_args(int argc, char **argv) {
             args.max_seq_len = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--flash") == 0) {
             args.flash_attn = 1;
+        } else if (strcmp(argv[i], "--chat") == 0) {
+            args.chat = 1;
+        } else if (strcmp(argv[i], "--repeat-penalty") == 0 && i + 1 < argc) {
+            args.repeat_penalty = (float)atof(argv[++i]);
+            args.repeat_set = 1;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -175,96 +187,237 @@ int main(int argc, char **argv) {
         SH_LOG_INFO("Tokenizer loaded", "tokens", vs);
     }
 
-    // #30: Encode prompt -- upper bound is 1 token per byte + BOS + margin
-    int max_prompt_tokens = (int)strlen(args.prompt) + 3;
-    int *prompt_tokens = (int *)malloc(max_prompt_tokens * sizeof(int));
-    if (!prompt_tokens) {
-        SH_LOG_ERROR("Failed to allocate prompt token buffer");
-        bn_tokenizer_free(&tokenizer);
-        bn_model_free(&model);
-        bn_gguf_free(gf);
-        bn_platform_unload_file(&mf);
-        return 1;
+    // Apply chat-mode sampling defaults if user didn't explicitly set temp
+    if (args.chat && !args.temp_set) {
+        args.temperature = 0.5f;
+        args.topp = 0.9f;
     }
-    int n_prompt = bn_tokenizer_encode(&tokenizer, args.prompt, 1, prompt_tokens,
-                                    max_prompt_tokens);
-    {
-        char np[16]; snprintf(np, sizeof(np), "%d", n_prompt);
-        SH_LOG_INFO("Prompt encoded", "n_tokens", np);
+    if (args.chat && !args.repeat_set) {
+        args.repeat_penalty = 1.1f;
     }
 
     // Initialize sampler
     BnSampler sampler;
     bn_sampler_init(&sampler, cfg->vocab_size, args.temperature, args.topp, args.seed);
+    if (args.repeat_penalty > 1.0f)
+        bn_sampler_set_repeat_penalty(&sampler, args.repeat_penalty, 64);
 
-    // Generation loop
-    {
-        char nt[16]; snprintf(nt, sizeof(nt), "%d", args.n_tokens);
-        SH_LOG_INFO("Starting generation", "n_tokens", nt);
-    }
-    double gen_start = bn_platform_time_ms();
-    int token = prompt_tokens[0];
-    int pos = 0;
-    int n_generated = 0;
-
-    for (int i = 0; i < n_prompt + args.n_tokens; i++) {
-        float *logits = bn_transformer_forward(&model, token, pos);
-        if (!logits) {
-            SH_LOG_ERROR("Forward pass returned NULL");
-            break;
+    if (args.chat) {
+        // --- Chat REPL mode ---
+        int max_tokens = 4096 + 64;  // generous buffer for encoded turns
+        int *tokens = (int *)malloc(max_tokens * sizeof(int));
+        if (!tokens) {
+            SH_LOG_ERROR("Failed to allocate token buffer");
+            bn_sampler_free(&sampler);
+            bn_tokenizer_free(&tokenizer);
+            bn_model_free(&model);
+            bn_gguf_free(gf);
+            bn_platform_unload_file(&mf);
+            return 1;
         }
 
-        int next;
-        if (i < n_prompt - 1) {
-            // Still in prompt: force-feed next prompt token
-            next = prompt_tokens[i + 1];
-        } else {
-            // Generate
-            next = bn_sampler_sample(&sampler, logits);
-            n_generated++;
+        int pos = 0;
 
-            // Check for EOS/EOT
-            if (next == tokenizer.eos_id || next == tokenizer.eot_id) {
+        // Feed BOS at pos=0
+        bn_transformer_forward(&model, tokenizer.bos_id, pos);
+        pos++;
+
+        char line[4096];
+        while (1) {
+            printf("> ");
+            fflush(stdout);
+            if (!fgets(line, sizeof(line), stdin)) break;
+
+            // Strip trailing newline
+            size_t len = strlen(line);
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+                line[--len] = '\0';
+
+            if (len == 0) continue;
+            if (strcmp(line, "/quit") == 0) break;
+
+            // Check context space
+            if (pos >= cfg->seq_len - 1) {
+                fprintf(stderr, "Context full (%d/%d tokens). Exiting.\n", pos, cfg->seq_len);
+                break;
+            }
+
+            // Encode "User: {line}"
+            char user_buf[4096 + 16];
+            snprintf(user_buf, sizeof(user_buf), "User: %s", line);
+            int n = bn_tokenizer_encode(&tokenizer, user_buf, 0, tokens, max_tokens);
+
+            // Append eot_id
+            if (n < max_tokens)
+                tokens[n++] = tokenizer.eot_id;
+
+            // Encode "Assistant: "
+            int n2 = bn_tokenizer_encode(&tokenizer, "Assistant: ", 0,
+                                         tokens + n, max_tokens - n);
+            n += n2;
+
+            // Feed prompt tokens through forward pass
+            float *logits = NULL;
+            for (int i = 0; i < n; i++) {
+                if (pos >= cfg->seq_len - 1) break;
+                logits = bn_transformer_forward(&model, tokens[i], pos);
+                pos++;
+            }
+
+            if (!logits) {
+                SH_LOG_ERROR("Forward pass returned NULL during prompt");
+                break;
+            }
+
+            // Generate until eot_id, eos_id, or seq_len
+            // Loop detector: ring buffer of recent tokens, check for repeating n-grams
+            #define LOOP_BUF_SIZE 32
+            #define LOOP_NGRAM    4
+            int loop_buf[LOOP_BUF_SIZE];
+            int loop_idx = 0, gen_count = 0;
+            memset(loop_buf, -1, sizeof(loop_buf));
+
+            for (int i = 0; i < args.n_tokens; i++) {
+                int next = bn_sampler_sample(&sampler, logits);
+
+                if (next == tokenizer.eot_id || next == tokenizer.eos_id)
+                    break;
+
+                // Record token in ring buffer and check for loops
+                loop_buf[loop_idx] = next;
+                loop_idx = (loop_idx + 1) % LOOP_BUF_SIZE;
+                gen_count++;
+
+                if (gen_count >= 2 * LOOP_NGRAM) {
+                    // Check if last LOOP_NGRAM tokens match the LOOP_NGRAM before them
+                    int looping = 1;
+                    for (int k = 0; k < LOOP_NGRAM; k++) {
+                        int a = loop_buf[((loop_idx - 1 - k) % LOOP_BUF_SIZE + LOOP_BUF_SIZE) % LOOP_BUF_SIZE];
+                        int b = loop_buf[((loop_idx - 1 - k - LOOP_NGRAM) % LOOP_BUF_SIZE + LOOP_BUF_SIZE) % LOOP_BUF_SIZE];
+                        if (a != b) { looping = 0; break; }
+                    }
+                    if (looping) break;
+                }
+
+                bn_sampler_accept(&sampler, next);
+
+                const char *piece = bn_tokenizer_decode(&tokenizer, next);
+                if (piece) {
+                    printf("%s", piece);
+                    fflush(stdout);
+                }
+
+                if (pos >= cfg->seq_len - 1) {
+                    fprintf(stderr, "\nContext full (%d/%d tokens).\n", pos, cfg->seq_len);
+                    break;
+                }
+
+                logits = bn_transformer_forward(&model, next, pos);
+                pos++;
+                if (!logits) break;
+            }
+
+            // Feed EOT into KV cache to close the assistant turn
+            if (pos < cfg->seq_len - 1) {
+                bn_transformer_forward(&model, tokenizer.eot_id, pos);
+                pos++;
+            }
+
+            printf("\n");
+        }
+
+        free(tokens);
+    } else {
+        // --- Single-shot generation ---
+        // #30: Encode prompt -- upper bound is 1 token per byte + BOS + margin
+        int max_prompt_tokens = (int)strlen(args.prompt) + 3;
+        int *prompt_tokens = (int *)malloc(max_prompt_tokens * sizeof(int));
+        if (!prompt_tokens) {
+            SH_LOG_ERROR("Failed to allocate prompt token buffer");
+            bn_sampler_free(&sampler);
+            bn_tokenizer_free(&tokenizer);
+            bn_model_free(&model);
+            bn_gguf_free(gf);
+            bn_platform_unload_file(&mf);
+            return 1;
+        }
+        int n_prompt = bn_tokenizer_encode(&tokenizer, args.prompt, 1, prompt_tokens,
+                                        max_prompt_tokens);
+        {
+            char np[16]; snprintf(np, sizeof(np), "%d", n_prompt);
+            SH_LOG_INFO("Prompt encoded", "n_tokens", np);
+        }
+
+        // Generation loop
+        {
+            char nt[16]; snprintf(nt, sizeof(nt), "%d", args.n_tokens);
+            SH_LOG_INFO("Starting generation", "n_tokens", nt);
+        }
+        double gen_start = bn_platform_time_ms();
+        int token = prompt_tokens[0];
+        int pos = 0;
+        int n_generated = 0;
+
+        for (int i = 0; i < n_prompt + args.n_tokens; i++) {
+            float *logits = bn_transformer_forward(&model, token, pos);
+            if (!logits) {
+                SH_LOG_ERROR("Forward pass returned NULL");
+                break;
+            }
+
+            int next;
+            if (i < n_prompt - 1) {
+                // Still in prompt: force-feed next prompt token
+                next = prompt_tokens[i + 1];
+            } else {
+                // Generate
+                next = bn_sampler_sample(&sampler, logits);
+                n_generated++;
+
+                // Check for EOS/EOT
+                if (next == tokenizer.eos_id || next == tokenizer.eot_id) {
+                    break;
+                }
+            }
+
+            // Print token (skip BOS)
+            if (i >= n_prompt - 1) {
+                const char *piece = bn_tokenizer_decode(&tokenizer, next);
+                if (!piece) piece = "";
+                printf("%s", piece);
+                fflush(stdout);
+            }
+
+            token = next;
+            pos++;
+
+            if (pos >= cfg->seq_len) {
+                SH_LOG_WARN("Reached max sequence length");
                 break;
             }
         }
 
-        // Print token (skip BOS)
-        if (i >= n_prompt - 1) {
-            const char *piece = bn_tokenizer_decode(&tokenizer, next);
-            if (!piece) piece = "";
-            printf("%s", piece);
-            fflush(stdout);
+        double gen_end = bn_platform_time_ms();
+        double gen_time = gen_end - gen_start;
+        double total_time = gen_end - t0;
+
+        printf("\n");
+        {
+            char ng[16], speed[32], total[32];
+            snprintf(ng, sizeof(ng), "%d", n_generated);
+            if (n_generated > 0) {
+                snprintf(speed, sizeof(speed), "%.2f", n_generated / (gen_time / 1000.0));
+            } else {
+                snprintf(speed, sizeof(speed), "0");
+            }
+            snprintf(total, sizeof(total), "%.1f", total_time);
+            SH_LOG_INFO("Generation complete", "tokens", ng, "tok/s", speed, "total_ms", total);
         }
 
-        token = next;
-        pos++;
-
-        if (pos >= cfg->seq_len) {
-            SH_LOG_WARN("Reached max sequence length");
-            break;
-        }
-    }
-
-    double gen_end = bn_platform_time_ms();
-    double gen_time = gen_end - gen_start;
-    double total_time = gen_end - t0;
-
-    printf("\n");
-    {
-        char ng[16], speed[32], total[32];
-        snprintf(ng, sizeof(ng), "%d", n_generated);
-        if (n_generated > 0) {
-            snprintf(speed, sizeof(speed), "%.2f", n_generated / (gen_time / 1000.0));
-        } else {
-            snprintf(speed, sizeof(speed), "0");
-        }
-        snprintf(total, sizeof(total), "%.1f", total_time);
-        SH_LOG_INFO("Generation complete", "tokens", ng, "tok/s", speed, "total_ms", total);
+        free(prompt_tokens);
     }
 
     // Cleanup
-    free(prompt_tokens);
     bn_sampler_free(&sampler);
     bn_tokenizer_free(&tokenizer);
     bn_model_free(&model);

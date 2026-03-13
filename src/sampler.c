@@ -17,16 +17,39 @@ void bn_sampler_init(BnSampler *s, int vocab_size, float temp, float topp, uint6
     s->vocab_size = vocab_size;
     s->temperature = temp;
     s->topp = topp;
+    s->repeat_penalty = 1.0f;
     s->rng_state = seed ? seed : 42;
     s->candidates = (BnProbIndex *)malloc(vocab_size * sizeof(BnProbIndex));
     s->candidates_cap = s->candidates ? vocab_size : 0;
+    s->recent_tokens = NULL;
+    s->recent_cap = 0;
+    s->recent_len = 0;
+    s->recent_pos = 0;
 }
 
 void bn_sampler_free(BnSampler *s) {
     if (!s) return;
     free(s->candidates);
+    free(s->recent_tokens);
     s->candidates = NULL;
+    s->recent_tokens = NULL;
     s->candidates_cap = 0;
+}
+
+void bn_sampler_set_repeat_penalty(BnSampler *s, float penalty, int window) {
+    s->repeat_penalty = penalty;
+    free(s->recent_tokens);
+    s->recent_tokens = (int *)calloc(window, sizeof(int));
+    s->recent_cap = s->recent_tokens ? window : 0;
+    s->recent_len = 0;
+    s->recent_pos = 0;
+}
+
+void bn_sampler_accept(BnSampler *s, int token) {
+    if (!s->recent_tokens || s->recent_cap <= 0) return;
+    s->recent_tokens[s->recent_pos] = token;
+    s->recent_pos = (s->recent_pos + 1) % s->recent_cap;
+    if (s->recent_len < s->recent_cap) s->recent_len++;
 }
 
 // #28: Handle n <= 0
@@ -116,6 +139,19 @@ static int sample_topp(BnSampler *s, float *probs, int n, float topp) {
 }
 
 int bn_sampler_sample(BnSampler *s, float *logits) {
+    // Apply repetition penalty before temperature/argmax
+    if (s->repeat_penalty != 1.0f && s->recent_len > 0) {
+        for (int i = 0; i < s->recent_len; i++) {
+            int tok = s->recent_tokens[i];
+            if (tok >= 0 && tok < s->vocab_size) {
+                if (logits[tok] > 0)
+                    logits[tok] /= s->repeat_penalty;
+                else
+                    logits[tok] *= s->repeat_penalty;
+            }
+        }
+    }
+
     if (s->temperature == 0.0f) {
         return argmax(logits, s->vocab_size);
     }

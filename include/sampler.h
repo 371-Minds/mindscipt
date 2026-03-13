@@ -12,13 +12,21 @@ typedef struct {
     int      vocab_size;
     float    temperature;
     float    topp;
+    float    repeat_penalty;
     uint64_t rng_state;
     BnProbIndex *candidates;  // preallocated for top-p sampling
     int      candidates_cap;
+    // Recent token ring buffer for repetition penalty
+    int     *recent_tokens;
+    int      recent_cap;
+    int      recent_len;
+    int      recent_pos;
 } BnSampler;
 
 void bn_sampler_init(BnSampler *s, int vocab_size, float temp, float topp, uint64_t seed);
 void bn_sampler_free(BnSampler *s);
+void bn_sampler_set_repeat_penalty(BnSampler *s, float penalty, int window);
+void bn_sampler_accept(BnSampler *s, int token);
 int  bn_sampler_sample(BnSampler *s, float *logits);
 
 #endif // BN_SAMPLER_H

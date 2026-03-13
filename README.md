@@ -33,6 +33,9 @@ make
 # Run with sampling
 ./bitnet model.gguf -p "Once upon a time" -n 512 --temp 0.7 --topp 0.9
 
+# Interactive chat
+./bitnet model.gguf --chat
+
 # Run tests
 make test
 ```
@@ -47,7 +50,15 @@ Usage: ./bitnet <model.gguf> [options]
   --topp <float>  Top-p sampling (default: 0.9)
   --seed <int>    Random seed (default: 42)
   --maxseq <int>  Max sequence length (default: model max)
+  --chat          Interactive chat REPL mode
+  --repeat-penalty <float>  Repetition penalty (default: 1.0, chat: 1.1)
 ```
+
+### Chat Mode
+
+`--chat` enters an interactive REPL with multi-turn conversation support. KV cache is reused across turns so context accumulates naturally. Type `/quit` or Ctrl-D to exit.
+
+Chat mode defaults to `--temp 0.5 --topp 0.9 --repeat-penalty 1.1` for more natural conversation. Override with explicit flags.
 
 ## Getting a Model
 
@@ -244,6 +255,22 @@ T-MAC and bitnet.cpp use lookup tables to replace multiply-accumulate with table
 **Why not Zig?** Zig's `comptime`, explicit allocators, and native SIMD vectors are genuinely appealing. For a new project not needing Emscripten WASM support, it would be a strong choice. But Zig's WASM target doesn't support the Emscripten features this project relies on (`EXPORTED_FUNCTIONS`, `MODULARIZE`, `SINGLE_FILE`), and the ecosystem isn't there yet for production inference workloads.
 
 **Why not Python / Go / Java?** An inference engine's job is to read ~825 MB of weights from DRAM per token as fast as the memory bus allows, then do minimal arithmetic on the result. Managed runtimes add GC pauses, prevent manual memory layout, and can't express SIMD intrinsics. Python would need NumPy or ctypes back into C. Go can't do NEON. Java's `Vector` API is experimental and JNI overhead kills the inner loop. The right language for a DRAM-bandwidth-bound SIMD kernel is the one that compiles to the SIMD instructions.
+
+## Known Limitations
+
+### Multi-turn chat degrades after code-heavy responses
+
+The 2B 1.58-bit model (~400 MB of effective weights) struggles with multi-turn conversations when earlier turns contain code blocks. Backtick-heavy formatting in the KV cache attention context disrupts the model's output quality on subsequent turns, often producing single-digit garbage responses.
+
+**Works well:** short Q&A across multiple turns (e.g., "Hello" → "What is 2+2?" → "Capital of France?"), and non-code-to-code transitions (e.g., "What are primary colors?" → "Write hello world in Python").
+
+**Breaks down:** code-in-turn-1 followed by any turn 2 (e.g., "Write hello world in C" → "Now in Python"). This reproduces identically with single-pass prompt encoding, confirming it is a model limitation — not an inference engine bug.
+
+### Long responses degenerate into repetition
+
+The model cannot reliably sustain coherent generation beyond ~50-100 tokens. Open-ended prompts that trigger verbose responses (numbered lists, detailed explanations) often degenerate into repetitive n-gram loops. A built-in loop detector stops generation when this is detected, but the degenerate tokens already written to the KV cache can affect subsequent turns.
+
+Both limitations are inherent to the model's capacity (2B parameters at 1.58-bit quantization) and are not addressable at the inference engine level.
 
 ## Acknowledgments
 

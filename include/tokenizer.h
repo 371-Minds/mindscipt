@@ -21,5 +21,6 @@ void        bn_tokenizer_free(BnTokenizer *t);
 int         bn_tokenizer_encode(const BnTokenizer *t, const char *text, int add_bos,
                              int *tokens, int max_tokens);
 const char *bn_tokenizer_decode(const BnTokenizer *t, int token);
+int         bn_tokenizer_lookup(const BnTokenizer *t, const char *str);
 
 #endif // BN_TOKENIZER_H
