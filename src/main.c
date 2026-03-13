@@ -225,6 +225,7 @@ int main(int argc, char **argv) {
         }
 
         int pos = 0;
+        int turn_count = 0;
 
         // Feed BOS at pos=0
         bn_transformer_forward(&model, tokenizer.bos_id, pos);
@@ -243,6 +244,15 @@ int main(int argc, char **argv) {
 
             if (len == 0) continue;
             if (strcmp(line, "/quit") == 0) break;
+            if (strcmp(line, "/reset") == 0) {
+                pos = 0;
+                bn_transformer_forward(&model, tokenizer.bos_id, pos);
+                pos++;
+                bn_sampler_reset_recent(&sampler);
+                turn_count = 0;
+                printf("[conversation reset]\n");
+                continue;
+            }
 
             // Encode "User: {line}" + EOT + "Assistant: "
             // (matches tokenizer_config.json chat_template from HuggingFace;
@@ -304,7 +314,7 @@ int main(int argc, char **argv) {
                         int b = loop_buf[((loop_idx - 1 - k - LOOP_NGRAM) % LOOP_BUF_SIZE + LOOP_BUF_SIZE) % LOOP_BUF_SIZE];
                         if (a != b) { looping = 0; break; }
                     }
-                    if (looping) break;
+                    if (looping) { gen_count = -1; break; }
                 }
 
                 bn_sampler_accept(&sampler, next);
@@ -325,6 +335,17 @@ int main(int argc, char **argv) {
             pos++;
 
             printf("\n");
+
+            turn_count++;
+            int should_reset = (turn_count >= 2) || (gen_count == -1);
+            if (should_reset) {
+                printf("[auto-reset: starting fresh]\n");
+                pos = 0;
+                bn_transformer_forward(&model, tokenizer.bos_id, pos);
+                pos++;
+                bn_sampler_reset_recent(&sampler);
+                turn_count = 0;
+            }
         }
 
         free(tokens);

@@ -45,6 +45,11 @@ void bn_sampler_set_repeat_penalty(BnSampler *s, float penalty, int window) {
     s->recent_pos = 0;
 }
 
+void bn_sampler_reset_recent(BnSampler *s) {
+    s->recent_len = 0;
+    s->recent_pos = 0;
+}
+
 void bn_sampler_accept(BnSampler *s, int token) {
     if (!s->recent_tokens || s->recent_cap <= 0) return;
     s->recent_tokens[s->recent_pos] = token;

@@ -27,6 +27,7 @@ void bn_sampler_init(BnSampler *s, int vocab_size, float temp, float topp, uint6
 void bn_sampler_free(BnSampler *s);
 void bn_sampler_set_repeat_penalty(BnSampler *s, float penalty, int window);
 void bn_sampler_accept(BnSampler *s, int token);
+void bn_sampler_reset_recent(BnSampler *s);
 int  bn_sampler_sample(BnSampler *s, float *logits);
 
 #endif // BN_SAMPLER_H
