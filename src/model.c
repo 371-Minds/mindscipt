@@ -25,12 +25,23 @@ static int load_qweight(BnQWeight *w, BnGGUFFile *f, const char *weight_name, co
     w->rows = (int)info->dims[1];
     w->cols = (int)info->dims[0];
 
+    // Validate supported tensor types
+    if (w->type != BN_GGUF_TENSOR_I2_S && w->type != BN_GGUF_TENSOR_Q4_0 &&
+        w->type != BN_GGUF_TENSOR_Q8_0 && w->type != BN_GGUF_TENSOR_TQ1_0 &&
+        w->type != BN_GGUF_TENSOR_TQ2_0) {
+        SH_LOG_ERROR("Unsupported tensor type", "name", weight_name);
+        return -1;
+    }
+
     if (w->type == BN_GGUF_TENSOR_I2_S) {
         // I2_S: per-tensor scale stored at end of packed data (offset = nelements/4)
         size_t nelements = (size_t)w->rows * w->cols;
         const uint8_t *base = (const uint8_t *)w->data;
         const float *scale_ptr = (const float *)(base + nelements / 4);
         w->scale = *scale_ptr;
+    } else if (w->type == BN_GGUF_TENSOR_Q4_0 || w->type == BN_GGUF_TENSOR_Q8_0) {
+        // Q4_0/Q8_0: per-block scales embedded in each block's FP16 d field
+        w->scale = 1.0f;
     } else {
         // TQ1_0/TQ2_0: companion .scale tensor
         int si = bn_gguf_find_tensor(f, scale_name);
@@ -162,6 +173,34 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     w->emb_out_i8 = NULL;
     w->emb_out_scales = NULL;
 
+    // Untied output weight (if present)
+    memset(&w->output_weight, 0, sizeof(w->output_weight));
+    int out_idx = bn_gguf_find_tensor(f, "output.weight");
+    if (out_idx >= 0) {
+        BnGGUFTensorInfo *out_info = &f->tensors[out_idx];
+        int ot = out_info->type;
+        if (ot != BN_GGUF_TENSOR_Q4_0 && ot != BN_GGUF_TENSOR_Q8_0 &&
+            ot != BN_GGUF_TENSOR_Q6_K &&
+            ot != BN_GGUF_TENSOR_I2_S && ot != BN_GGUF_TENSOR_TQ1_0 &&
+            ot != BN_GGUF_TENSOR_TQ2_0 && ot != BN_GGUF_TENSOR_F16) {
+            SH_LOG_ERROR("Unsupported output.weight type (need F16/Q4_0/Q6_K/Q8_0/I2_S/TQ)");
+            return -1;
+        }
+        w->output_weight.data = bn_gguf_tensor_data(f, out_idx);
+        w->output_weight.type = ot;
+        w->output_weight.rows = (int)out_info->dims[1];
+        w->output_weight.cols = (int)out_info->dims[0];
+        if (ot == BN_GGUF_TENSOR_Q4_0 || ot == BN_GGUF_TENSOR_Q8_0) {
+            w->output_weight.scale = 1.0f;
+        } else if (ot == BN_GGUF_TENSOR_I2_S) {
+            size_t nel = (size_t)w->output_weight.rows * w->output_weight.cols;
+            const uint8_t *base = (const uint8_t *)w->output_weight.data;
+            w->output_weight.scale = *(const float *)(base + nel / 4);
+        } else {
+            w->output_weight.scale = 1.0f;
+        }
+    }
+
     // #24: Output norm — must exist
     w->output_norm = load_f32_tensor(f, "output_norm.weight");
     if (!w->output_norm) {
@@ -207,6 +246,14 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         snprintf(wname, sizeof(wname), "blk.%d.attn_output.weight", i);
         snprintf(sname, sizeof(sname), "blk.%d.attn_output.scale", i);
         if (load_qweight(&lw->wo, f, wname, sname) != 0) goto fail_layers;
+
+        // Attention biases (optional, used by Qwen2)
+        snprintf(wname, sizeof(wname), "blk.%d.attn_q.bias", i);
+        lw->q_bias = load_f32_tensor(f, wname);
+        snprintf(wname, sizeof(wname), "blk.%d.attn_k.bias", i);
+        lw->k_bias = load_f32_tensor(f, wname);
+        snprintf(wname, sizeof(wname), "blk.%d.attn_v.bias", i);
+        lw->v_bias = load_f32_tensor(f, wname);
 
         // #25: FFN norms — must exist
         snprintf(wname, sizeof(wname), "blk.%d.ffn_norm.weight", i);
@@ -259,7 +306,7 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     // INT8 embedding size (DOTPROD + F16 only)
     size_t emb_i8_bytes = 0;
     size_t emb_i8_scales_bytes = 0;
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__)
     int want_i8_emb = (w->emb_type == BN_GGUF_TENSOR_F16);
     if (want_i8_emb) {
         emb_i8_bytes = (size_t)c->vocab_size * c->dim;
@@ -313,7 +360,7 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     }
 
     // Quantize F16 embeddings to INT8 for fast SDOT logits kernel
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__)
     if (want_i8_emb) {
         w->emb_out_i8 = (int8_t *)sh_arena_alloc(m->arena, emb_i8_bytes);
         w->emb_out_scales = (float *)sh_arena_alloc(m->arena, emb_i8_scales_bytes);
@@ -366,6 +413,27 @@ void bn_model_embed_token(const BnModel *m, float *out, int token) {
         const uint16_t *row = emb + (size_t)token * dim;
         for (int i = 0; i < dim; i++) {
             out[i] = bn_fp16_to_fp32(row[i]);
+        }
+    } else if (m->weights.emb_type == BN_GGUF_TENSOR_Q4_0) {
+        const BnBlockQ4_0 *blocks = (const BnBlockQ4_0 *)m->weights.token_embedding;
+        int n_blocks_per_row = dim / 32;
+        const BnBlockQ4_0 *row = blocks + (size_t)token * n_blocks_per_row;
+        for (int b = 0; b < n_blocks_per_row; b++) {
+            bn_quant_dequant_q4_0(&row[b], out + b * 32);
+        }
+    } else if (m->weights.emb_type == BN_GGUF_TENSOR_Q8_0) {
+        const BnBlockQ8_0 *blocks = (const BnBlockQ8_0 *)m->weights.token_embedding;
+        int n_blocks_per_row = dim / 32;
+        const BnBlockQ8_0 *row = blocks + (size_t)token * n_blocks_per_row;
+        for (int b = 0; b < n_blocks_per_row; b++) {
+            bn_quant_dequant_q8_0(&row[b], out + b * 32);
+        }
+    } else if (m->weights.emb_type == BN_GGUF_TENSOR_Q6_K) {
+        const BnBlockQ6K *blocks = (const BnBlockQ6K *)m->weights.token_embedding;
+        int n_blocks_per_row = dim / BN_QK_K;
+        const BnBlockQ6K *row = blocks + (size_t)token * n_blocks_per_row;
+        for (int b = 0; b < n_blocks_per_row; b++) {
+            bn_quant_dequant_q6k(&row[b], out + b * BN_QK_K);
         }
     } else if (m->weights.emb_type == BN_GGUF_TENSOR_F32) {
         const float *emb = (const float *)m->weights.token_embedding;

@@ -1,4 +1,5 @@
 #include "transformer.h"
+#include "simd_helpers.h"
 #include "sh_log.h"
 #include <math.h>
 #include <string.h>
@@ -35,6 +36,40 @@ static void rmsnorm(float *out, const float *x, const float *w, int size, float 
         float32x4_t xv = vld1q_f32(x + i);
         float32x4_t wv = vld1q_f32(w + i);
         vst1q_f32(out + i, vmulq_f32(vmulq_f32(xv, ss_v), wv));
+    }
+    for (; i < size; i++) out[i] = x[i] * ss * w[i];
+#elif defined(__AVX2__)
+    __m256 sum_sq = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 7 < size; i += 8) {
+        __m256 xv = _mm256_loadu_ps(x + i);
+        sum_sq = _mm256_fmadd_ps(xv, xv, sum_sq);
+    }
+    float ss = bn_avx2_hsum_ps(sum_sq);
+    for (; i < size; i++) ss += x[i] * x[i];
+    ss = 1.0f / sqrtf(ss / size + eps);
+    __m256 ss_v = _mm256_set1_ps(ss);
+    for (i = 0; i + 7 < size; i += 8) {
+        __m256 xv = _mm256_loadu_ps(x + i);
+        __m256 wv = _mm256_loadu_ps(w + i);
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_mul_ps(xv, ss_v), wv));
+    }
+    for (; i < size; i++) out[i] = x[i] * ss * w[i];
+#elif defined(__wasm_simd128__)
+    v128_t sum_sq = wasm_f32x4_splat(0);
+    int i = 0;
+    for (; i + 3 < size; i += 4) {
+        v128_t xv = wasm_v128_load(x + i);
+        sum_sq = wasm_f32x4_add(sum_sq, wasm_f32x4_mul(xv, xv));
+    }
+    float ss = bn_wasm_hsum_f32x4(sum_sq);
+    for (; i < size; i++) ss += x[i] * x[i];
+    ss = 1.0f / sqrtf(ss / size + eps);
+    v128_t ss_v = wasm_f32x4_splat(ss);
+    for (i = 0; i + 3 < size; i += 4) {
+        v128_t xv = wasm_v128_load(x + i);
+        v128_t wv = wasm_v128_load(w + i);
+        wasm_v128_store(out + i, wasm_f32x4_mul(wasm_f32x4_mul(xv, ss_v), wv));
     }
     for (; i < size; i++) out[i] = x[i] * ss * w[i];
 #else
@@ -103,6 +138,9 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
                     float16x4_t hv = vreinterpret_f16_u16(vld1_u16(k_f16 + d));
                     vst1q_f32(k_buf + d, vcvt_f32_f16(hv));
                 }
+#elif defined(__AVX2__)
+                for (int d = 0; d < head_size; d += 8)
+                    _mm256_storeu_ps(k_buf + d, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(k_f16 + d))));
 #else
                 for (int d = 0; d < head_size; d++) k_buf[d] = bn_fp16_to_fp32(k_f16[d]);
 #endif
@@ -121,6 +159,20 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
             }
             float32x4_t sum = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
             att[i] = neon_hsum_f32(sum) * inv_sqrt_hs;
+#elif defined(__AVX2__)
+            __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+            for (int d = 0; d < head_size; d += 16) {
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(q_h + d),     _mm256_loadu_ps(k_t + d), a0);
+                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(q_h + d + 8), _mm256_loadu_ps(k_t + d + 8), a1);
+            }
+            att[i] = bn_avx2_hsum_ps(_mm256_add_ps(a0, a1)) * inv_sqrt_hs;
+#elif defined(__wasm_simd128__)
+            v128_t wa0 = wasm_f32x4_splat(0), wa1 = wasm_f32x4_splat(0);
+            for (int d = 0; d < head_size; d += 8) {
+                wa0 = wasm_f32x4_add(wa0, wasm_f32x4_mul(wasm_v128_load(q_h + d),     wasm_v128_load(k_t + d)));
+                wa1 = wasm_f32x4_add(wa1, wasm_f32x4_mul(wasm_v128_load(q_h + d + 4), wasm_v128_load(k_t + d + 4)));
+            }
+            att[i] = bn_wasm_hsum_f32x4(wasm_f32x4_add(wa0, wa1)) * inv_sqrt_hs;
 #else
             float score = 0.0f;
             for (int d = 0; d < head_size; d++) score += q_h[d] * k_t[d];
@@ -143,6 +195,9 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
                     float16x4_t hv = vreinterpret_f16_u16(vld1_u16(v_f16 + d));
                     vst1q_f32(v_buf + d, vcvt_f32_f16(hv));
                 }
+#elif defined(__AVX2__)
+                for (int d = 0; d < head_size; d += 8)
+                    _mm256_storeu_ps(v_buf + d, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(v_f16 + d))));
 #else
                 for (int d = 0; d < head_size; d++) v_buf[d] = bn_fp16_to_fp32(v_f16[d]);
 #endif
@@ -158,6 +213,18 @@ static void gqa_range(void *ctx, int h_start, int h_end) {
                 vst1q_f32(xb_h + d + 4,  vmlaq_f32(vld1q_f32(xb_h + d + 4),  a_v, vld1q_f32(v_t + d + 4)));
                 vst1q_f32(xb_h + d + 8,  vmlaq_f32(vld1q_f32(xb_h + d + 8),  a_v, vld1q_f32(v_t + d + 8)));
                 vst1q_f32(xb_h + d + 12, vmlaq_f32(vld1q_f32(xb_h + d + 12), a_v, vld1q_f32(v_t + d + 12)));
+            }
+#elif defined(__AVX2__)
+            __m256 av = _mm256_set1_ps(a);
+            for (int d = 0; d < head_size; d += 8) {
+                __m256 cur = _mm256_loadu_ps(xb_h + d);
+                _mm256_storeu_ps(xb_h + d, _mm256_fmadd_ps(av, _mm256_loadu_ps(v_t + d), cur));
+            }
+#elif defined(__wasm_simd128__)
+            v128_t wav = wasm_f32x4_splat(a);
+            for (int d = 0; d < head_size; d += 4) {
+                v128_t cur = wasm_v128_load(xb_h + d);
+                wasm_v128_store(xb_h + d, wasm_f32x4_add(cur, wasm_f32x4_mul(wav, wasm_v128_load(v_t + d))));
             }
 #else
             for (int d = 0; d < head_size; d++) xb_h[d] += a * v_t[d];
@@ -316,12 +383,70 @@ static void logits_i8_sdot_range(void *ctx, int v_start, int v_end) {
 }
 #endif // __ARM_NEON && __ARM_FEATURE_DOTPROD
 
+#if defined(__AVX2__) && !defined(__ARM_NEON)
+typedef struct {
+    float *logits;
+    const int8_t *emb_i8;
+    const float *emb_scales;
+    const int8_t *x_q;
+    float x_scale;
+    int dim;
+} LogitsI8Ctx;
+
+static void logits_i8_sdot_range(void *ctx, int v_start, int v_end) {
+    LogitsI8Ctx *lc = (LogitsI8Ctx *)ctx;
+    const int8_t *emb_i8 = lc->emb_i8;
+    const float *emb_scales = lc->emb_scales;
+    const int8_t *x_q = lc->x_q;
+    float x_scale = lc->x_scale;
+    int dim = lc->dim;
+
+    for (int v = v_start; v < v_end; v++) {
+        const int8_t *row = emb_i8 + (size_t)v * dim;
+        _mm_prefetch((const char *)(row + (size_t)dim), _MM_HINT_T0);
+        __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
+        __m256i acc2 = _mm256_setzero_si256(), acc3 = _mm256_setzero_si256();
+        for (int d = 0; d < dim; d += 128) {
+            _mm_prefetch((const char *)(row + d + 256), _MM_HINT_T0);
+            acc0 = bn_avx2_dpbusd(acc0, _mm256_loadu_si256((const __m256i *)(row+d)),    _mm256_loadu_si256((const __m256i *)(x_q+d)));
+            acc1 = bn_avx2_dpbusd(acc1, _mm256_loadu_si256((const __m256i *)(row+d+32)), _mm256_loadu_si256((const __m256i *)(x_q+d+32)));
+            acc2 = bn_avx2_dpbusd(acc2, _mm256_loadu_si256((const __m256i *)(row+d+64)), _mm256_loadu_si256((const __m256i *)(x_q+d+64)));
+            acc3 = bn_avx2_dpbusd(acc3, _mm256_loadu_si256((const __m256i *)(row+d+96)), _mm256_loadu_si256((const __m256i *)(x_q+d+96)));
+        }
+        __m256i sum4 = _mm256_add_epi32(_mm256_add_epi32(acc0, acc1), _mm256_add_epi32(acc2, acc3));
+        int32_t total = bn_avx2_hsum_epi32(sum4);
+        lc->logits[v] = (float)total * emb_scales[v] * x_scale;
+    }
+}
+#endif // __AVX2__ && !__ARM_NEON
+
 typedef struct {
     float *logits;
     const float *x;
     const void *emb;
     int dim;
 } LogitsCtx;
+
+#if defined(__AVX2__) && !defined(__ARM_NEON)
+static void logits_f16_avx2_range(void *ctx, int v_start, int v_end) {
+    LogitsCtx *lc = (LogitsCtx *)ctx;
+    const uint16_t *emb = (const uint16_t *)lc->emb;
+    const float *x = lc->x;
+    int dim = lc->dim;
+
+    for (int v = v_start; v < v_end; v++) {
+        const uint16_t *row = emb + (size_t)v * dim;
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+        for (int d = 0; d < dim; d += 16) {
+            __m256 f0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + d)));
+            __m256 f1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + d + 8)));
+            acc0 = _mm256_fmadd_ps(f0, _mm256_loadu_ps(x + d), acc0);
+            acc1 = _mm256_fmadd_ps(f1, _mm256_loadu_ps(x + d + 8), acc1);
+        }
+        lc->logits[v] = bn_avx2_hsum_ps(_mm256_add_ps(acc0, acc1));
+    }
+}
+#endif // __AVX2__ && !__ARM_NEON
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
 static void logits_f16_native_range(void *ctx, int v_start, int v_end) {
@@ -383,7 +508,30 @@ static void logits_f16_neon_range(void *ctx, int v_start, int v_end) {
 }
 #endif
 
-#if !defined(__ARM_NEON)
+#if defined(__wasm_simd128__)
+static void logits_f16_wasm_range(void *ctx, int v_start, int v_end) {
+    LogitsCtx *lc = (LogitsCtx *)ctx;
+    const uint16_t *emb = (const uint16_t *)lc->emb;
+    const float *x = lc->x;
+    int dim = lc->dim;
+
+    for (int v = v_start; v < v_end; v++) {
+        const uint16_t *row = emb + (size_t)v * dim;
+        v128_t acc0 = wasm_f32x4_splat(0), acc1 = wasm_f32x4_splat(0);
+        for (int d = 0; d < dim; d += 8) {
+            // Software F16→F32 conversion (no hardware F16C on WASM)
+            float f0[4], f1[4];
+            for (int k = 0; k < 4; k++) f0[k] = bn_fp16_to_fp32(row[d + k]);
+            for (int k = 0; k < 4; k++) f1[k] = bn_fp16_to_fp32(row[d + 4 + k]);
+            acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(wasm_v128_load(f0), wasm_v128_load(x + d)));
+            acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(wasm_v128_load(f1), wasm_v128_load(x + d + 4)));
+        }
+        lc->logits[v] = bn_wasm_hsum_f32x4(wasm_f32x4_add(acc0, acc1));
+    }
+}
+#endif // __wasm_simd128__
+
+#if !defined(__ARM_NEON) && !defined(__AVX2__) && !defined(__wasm_simd128__)
 static void logits_f16_scalar_range(void *ctx, int v_start, int v_end) {
     LogitsCtx *lc = (LogitsCtx *)ctx;
     const uint16_t *emb = (const uint16_t *)lc->emb;
@@ -399,7 +547,7 @@ static void logits_f16_scalar_range(void *ctx, int v_start, int v_end) {
         lc->logits[v] = sum;
     }
 }
-#endif // !__ARM_NEON
+#endif // !__ARM_NEON && !__AVX2__ && !__wasm_simd128__
 
 static void logits_f32_range(void *ctx, int v_start, int v_end) {
     LogitsCtx *lc = (LogitsCtx *)ctx;
@@ -484,6 +632,11 @@ static int forward_layers(BnModel *m, int token, int pos) {
             };
             bn_quant_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
 
+            // Add attention biases (Qwen2)
+            if (lw->q_bias) for (int i = 0; i < dim; i++) s->q[i] += lw->q_bias[i];
+            if (lw->k_bias) for (int i = 0; i < kv_dim; i++) k_tmp[i] += lw->k_bias[i];
+            if (lw->v_bias) for (int i = 0; i < kv_dim; i++) v_tmp[i] += lw->v_bias[i];
+
             // RoPE on Q
             for (int i = 0; i < dim; i += 2) {
                 int fi = (i / 2) % half_head;
@@ -512,6 +665,11 @@ static int forward_layers(BnModel *m, int token, int pos) {
                 float16x4_t vh4 = vcvt_f16_f32(vv4);
                 vst1_u16(vc + i, vreinterpret_u16_f16(vh4));
             }
+#elif defined(__AVX2__)
+            for (int i = 0; i < kv_dim; i += 8) {
+                _mm_storeu_si128((__m128i *)(kc + i), _mm256_cvtps_ph(_mm256_loadu_ps(k_tmp + i), _MM_FROUND_TO_NEAREST_INT));
+                _mm_storeu_si128((__m128i *)(vc + i), _mm256_cvtps_ph(_mm256_loadu_ps(v_tmp + i), _MM_FROUND_TO_NEAREST_INT));
+            }
 #else
             for (int i = 0; i < kv_dim; i++) {
                 kc[i] = bn_fp32_to_fp16(k_tmp[i]);
@@ -526,6 +684,11 @@ static int forward_layers(BnModel *m, int token, int pos) {
                 { value_cache_row, &lw->wv },
             };
             bn_quant_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
+
+            // Add attention biases (Qwen2)
+            if (lw->q_bias) for (int i = 0; i < dim; i++) s->q[i] += lw->q_bias[i];
+            if (lw->k_bias) for (int i = 0; i < kv_dim; i++) key_cache_row[i] += lw->k_bias[i];
+            if (lw->v_bias) for (int i = 0; i < kv_dim; i++) value_cache_row[i] += lw->v_bias[i];
 
             // RoPE using precomputed cos/sin (no trig calls here)
             for (int i = 0; i < dim; i += 2) {
@@ -542,7 +705,7 @@ static int forward_layers(BnModel *m, int token, int pos) {
             }
         }
 
-        // GQA attention
+        // GQA attention (flash attention only on NEON for now)
         {
             int n_kv = (pos + 1 < c->seq_len) ? pos + 1 : c->seq_len;
             GQACtx gctx = { c, s, loff, pos, n_kv, kv_mul, head_size, kv_dim, c->seq_len };
@@ -568,6 +731,12 @@ static int forward_layers(BnModel *m, int token, int pos) {
 #ifdef __ARM_NEON
         for (int i = 0; i < dim; i += 4)
             vst1q_f32(s->x + i, vaddq_f32(vld1q_f32(s->x + i), vld1q_f32(s->xb2 + i)));
+#elif defined(__AVX2__)
+        for (int i = 0; i < dim; i += 8)
+            _mm256_storeu_ps(s->x + i, _mm256_add_ps(_mm256_loadu_ps(s->x + i), _mm256_loadu_ps(s->xb2 + i)));
+#elif defined(__wasm_simd128__)
+        for (int i = 0; i < dim; i += 4)
+            wasm_v128_store(s->x + i, wasm_f32x4_add(wasm_v128_load(s->x + i), wasm_v128_load(s->xb2 + i)));
 #else
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
 #endif
@@ -593,6 +762,18 @@ static int forward_layers(BnModel *m, int token, int pos) {
                 for (int i = 0; i < hidden_dim; i += 4) {
                     float32x4_t g = vmaxq_f32(vld1q_f32(s->hb + i), zero);
                     vst1q_f32(s->hb + i, vmulq_f32(vmulq_f32(g, g), vld1q_f32(s->hb2 + i)));
+                }
+#elif defined(__AVX2__)
+                __m256 zero = _mm256_setzero_ps();
+                for (int i = 0; i < hidden_dim; i += 8) {
+                    __m256 g = _mm256_max_ps(_mm256_loadu_ps(s->hb + i), zero);
+                    _mm256_storeu_ps(s->hb + i, _mm256_mul_ps(_mm256_mul_ps(g, g), _mm256_loadu_ps(s->hb2 + i)));
+                }
+#elif defined(__wasm_simd128__)
+                v128_t zero = wasm_f32x4_splat(0);
+                for (int i = 0; i < hidden_dim; i += 4) {
+                    v128_t g = wasm_f32x4_max(wasm_v128_load(s->hb + i), zero);
+                    wasm_v128_store(s->hb + i, wasm_f32x4_mul(wasm_f32x4_mul(g, g), wasm_v128_load(s->hb2 + i)));
                 }
 #else
                 for (int i = 0; i < hidden_dim; i++) {
@@ -638,6 +819,12 @@ static int forward_layers(BnModel *m, int token, int pos) {
 #ifdef __ARM_NEON
         for (int i = 0; i < dim; i += 4)
             vst1q_f32(s->x + i, vaddq_f32(vld1q_f32(s->x + i), vld1q_f32(s->xb + i)));
+#elif defined(__AVX2__)
+        for (int i = 0; i < dim; i += 8)
+            _mm256_storeu_ps(s->x + i, _mm256_add_ps(_mm256_loadu_ps(s->x + i), _mm256_loadu_ps(s->xb + i)));
+#elif defined(__wasm_simd128__)
+        for (int i = 0; i < dim; i += 4)
+            wasm_v128_store(s->x + i, wasm_f32x4_add(wasm_v128_load(s->x + i), wasm_v128_load(s->xb + i)));
 #else
         for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
 #endif
@@ -650,6 +837,12 @@ static int forward_layers(BnModel *m, int token, int pos) {
             snprintf(v3, sizeof(v3), "%.6f", s->x[3]);
             SH_LOG_DEBUG("Layer 0 pos 0", "x0", v0, "x1", v1, "x2", v2, "x3", v3);
         }
+#ifdef DEBUG
+        if (pos == 0 && (l == 0 || l == c->n_layers - 1)) {
+            fprintf(stderr, "DBG layer=%d x[0..3]= %.6f %.6f %.6f %.6f\n",
+                    l, s->x[0], s->x[1], s->x[2], s->x[3]);
+        }
+#endif
     }
 
     return 0;
@@ -671,11 +864,59 @@ static float *forward_logits(BnModel *m) {
     // Final RMSNorm
     rmsnorm(s->x, s->x, w->output_norm, dim, c->norm_eps);
 
-    // Tied embeddings: logits = token_embedding^T @ x
-    if (m->weights.emb_type == BN_GGUF_TENSOR_F16) {
+    // Untied output weight: logits = output_weight @ x
+    if (w->output_weight.data && w->output_weight.type == BN_GGUF_TENSOR_F16) {
+        // F16 untied output weight — use the same F16 logits kernel as tied path
+        const uint16_t *emb = (const uint16_t *)w->output_weight.data;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        uint16_t x_f16[dim];
+        for (int d = 0; d < dim; d += 8) {
+            float16x4_t lo = vcvt_f16_f32(vld1q_f32(s->x + d));
+            float16x4_t hi = vcvt_f16_f32(vld1q_f32(s->x + d + 4));
+            vst1q_u16(x_f16 + d, vreinterpretq_u16_f16(vcombine_f16(lo, hi)));
+        }
+        LogitsCtx lctx = { s->logits, (const float *)(void *)x_f16, emb, dim };
+        BnTPTask logits_task = { logits_f16_native_range, &lctx, c->vocab_size };
+        bn_tp_dispatch(m->pool, &logits_task, 1);
+#elif defined(__ARM_NEON)
+        LogitsCtx lctx = { s->logits, s->x, emb, dim };
+        BnTPTask logits_task = { logits_f16_neon_range, &lctx, c->vocab_size };
+        bn_tp_dispatch(m->pool, &logits_task, 1);
+#elif defined(__AVX2__)
+        LogitsCtx lctx = { s->logits, s->x, emb, dim };
+        BnTPTask logits_task = { logits_f16_avx2_range, &lctx, c->vocab_size };
+        bn_tp_dispatch(m->pool, &logits_task, 1);
+#elif defined(__wasm_simd128__)
+        LogitsCtx lctx = { s->logits, s->x, emb, dim };
+        BnTPTask logits_task = { logits_f16_wasm_range, &lctx, c->vocab_size };
+        bn_tp_dispatch(m->pool, &logits_task, 1);
+#else
+        LogitsCtx lctx = { s->logits, s->x, emb, dim };
+        BnTPTask logits_task = { logits_f16_scalar_range, &lctx, c->vocab_size };
+        bn_tp_dispatch(m->pool, &logits_task, 1);
+#endif
+    }
+    else if (w->output_weight.data) {
+        bn_quant_matvec(s->logits, &w->output_weight, s->x, s->x_q, m->pool);
+    }
+    // Tied Q4_0/Q8_0/Q6_K embeddings: use quant matvec
+    else if (w->emb_type == BN_GGUF_TENSOR_Q4_0 || w->emb_type == BN_GGUF_TENSOR_Q8_0 ||
+             w->emb_type == BN_GGUF_TENSOR_Q6_K) {
+        BnQWeight tied = { w->token_embedding, w->emb_type, c->vocab_size, dim, 1.0f };
+        bn_quant_matvec(s->logits, &tied, s->x, s->x_q, m->pool);
+    }
+    // Tied F16 embeddings: logits = token_embedding^T @ x
+    else if (w->emb_type == BN_GGUF_TENSOR_F16) {
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
         if (w->emb_out_i8) {
-            // INT8 SDOT path: quantize x once, dot against pre-quantized embeddings
+            float x_scale = bn_quant_x_to_i8(s->x, s->x_q, dim);
+            LogitsI8Ctx lctx = { s->logits, w->emb_out_i8, w->emb_out_scales,
+                                 s->x_q, x_scale, dim };
+            BnTPTask logits_task = { logits_i8_sdot_range, &lctx, c->vocab_size };
+            bn_tp_dispatch(m->pool, &logits_task, 1);
+        } else
+#elif defined(__AVX2__)
+        if (w->emb_out_i8) {
             float x_scale = bn_quant_x_to_i8(s->x, s->x_q, dim);
             LogitsI8Ctx lctx = { s->logits, w->emb_out_i8, w->emb_out_scales,
                                  s->x_q, x_scale, dim };
@@ -686,7 +927,6 @@ static float *forward_logits(BnModel *m) {
         {
             const uint16_t *emb = (const uint16_t *)w->token_embedding;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-            // Convert x to F16 once for native F16 FMA
             uint16_t x_f16[dim];
             for (int d = 0; d < dim; d += 8) {
                 float16x4_t lo = vcvt_f16_f32(vld1q_f32(s->x + d));
@@ -699,6 +939,14 @@ static float *forward_logits(BnModel *m) {
 #elif defined(__ARM_NEON)
             LogitsCtx lctx = { s->logits, s->x, emb, dim };
             BnTPTask logits_task = { logits_f16_neon_range, &lctx, c->vocab_size };
+            bn_tp_dispatch(m->pool, &logits_task, 1);
+#elif defined(__AVX2__)
+            LogitsCtx lctx = { s->logits, s->x, emb, dim };
+            BnTPTask logits_task = { logits_f16_avx2_range, &lctx, c->vocab_size };
+            bn_tp_dispatch(m->pool, &logits_task, 1);
+#elif defined(__wasm_simd128__)
+            LogitsCtx lctx = { s->logits, s->x, emb, dim };
+            BnTPTask logits_task = { logits_f16_wasm_range, &lctx, c->vocab_size };
             bn_tp_dispatch(m->pool, &logits_task, 1);
 #else
             LogitsCtx lctx = { s->logits, s->x, emb, dim };

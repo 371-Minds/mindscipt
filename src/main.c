@@ -48,7 +48,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --maxseq <int>  Max sequence length (default: model max)\n");
     fprintf(stderr, "  --flash         Use flash attention (online softmax)\n");
     fprintf(stderr, "  --chat          Interactive chat REPL mode\n");
-    fprintf(stderr, "  --repeat-penalty <float>  Repetition penalty (default: 1.0, chat: 1.1)\n");
+    fprintf(stderr, "  --repeat-penalty <float>  Repetition penalty (default: 1.1)\n");
     fprintf(stderr, "  --kv16          Store KV cache in FP16 (halves attention DRAM bandwidth)\n");
     fprintf(stderr, "  --no-prefill    Disable batch prompt prefill (compute logits for every token)\n");
 }
@@ -79,6 +79,7 @@ static CLIArgs parse_args(int argc, char **argv) {
     args.n_tokens = 256;
     args.temperature = 0.0f;
     args.topp = 0.9f;
+    args.repeat_penalty = 1.1f;
     args.seed = 42;
     args.max_seq_len = 0;
 
@@ -145,7 +146,8 @@ static int generate_response(BnModel *model, BnTokenizer *tok, BnSampler *sample
     for (int i = 0; i < max_tokens; i++) {
         int next = bn_sampler_sample(sampler, logits);
 
-        if (next == tok->eot_id || next == tok->eos_id)
+        if (next == tok->eot_id || next == tok->eos_id ||
+            next == tok->im_end_id)
             break;
 
         // Ring buffer loop detection
@@ -286,10 +288,6 @@ int main(int argc, char **argv) {
         args.temperature = 0.5f;
         args.topp = 0.9f;
     }
-    if (args.chat && !args.repeat_set) {
-        args.repeat_penalty = 1.1f;
-    }
-
     // Initialize sampler
     BnSampler sampler;
     bn_sampler_init(&sampler, cfg->vocab_size, args.temperature, args.topp, args.seed);
@@ -310,11 +308,13 @@ int main(int argc, char **argv) {
         }
 
         int pos = 0;
-        int turn_count = 0;
+        int seq_len = cfg->seq_len;
 
-        // Feed BOS at pos=0
-        bn_transformer_forward(&model, tokenizer.bos_id, pos);
-        pos++;
+        // Feed BOS at pos=0 (skip if model says not to)
+        if (tokenizer.add_bos) {
+            bn_transformer_forward(&model, tokenizer.bos_id, pos);
+            pos++;
+        }
 
         char line[4096];
         while (1) {
@@ -331,29 +331,53 @@ int main(int argc, char **argv) {
             if (strcmp(line, "/quit") == 0) break;
             if (strcmp(line, "/reset") == 0) {
                 pos = 0;
-                bn_transformer_forward(&model, tokenizer.bos_id, pos);
-                pos++;
+                if (tokenizer.add_bos) {
+                    bn_transformer_forward(&model, tokenizer.bos_id, pos);
+                    pos++;
+                }
                 bn_sampler_reset_recent(&sampler);
-                turn_count = 0;
                 printf("[conversation reset]\n");
                 continue;
             }
 
-            // Encode "User: {line}" + EOT + "Assistant: "
-            // (matches tokenizer_config.json chat_template from HuggingFace;
-            //  the GGUF chat_template uses a different format but is incorrect)
-            char user_buf[4096 + 16];
-            snprintf(user_buf, sizeof(user_buf), "User: %s", line);
-            int n = bn_tokenizer_encode(&tokenizer, user_buf, 0, tokens, max_tokens);
-
-            // Append eot_id (HF eos_token = <|eot_id|>)
-            if (n < max_tokens)
-                tokens[n++] = tokenizer.eot_id;
-
-            // Encode "Assistant: "
-            int n2 = bn_tokenizer_encode(&tokenizer, "Assistant: ", 0,
+            int n = 0;
+            if (tokenizer.chatml) {
+                // ChatML: <|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n
+                if (n < max_tokens) tokens[n++] = tokenizer.im_start_id;
+                char user_buf[4096 + 16];
+                snprintf(user_buf, sizeof(user_buf), "user\n%s", line);
+                n += bn_tokenizer_encode(&tokenizer, user_buf, 0,
                                          tokens + n, max_tokens - n);
-            n += n2;
+                if (n < max_tokens) tokens[n++] = tokenizer.im_end_id;
+                int n2 = bn_tokenizer_encode(&tokenizer, "\n", 0,
+                                             tokens + n, max_tokens - n);
+                n += n2;
+                if (n < max_tokens) tokens[n++] = tokenizer.im_start_id;
+                n2 = bn_tokenizer_encode(&tokenizer, "assistant\n", 0,
+                                         tokens + n, max_tokens - n);
+                n += n2;
+            } else {
+                // LLaMA/BitNet: User: {msg}<|eot_id|>Assistant:
+                char user_buf[4096 + 16];
+                snprintf(user_buf, sizeof(user_buf), "User: %s", line);
+                n = bn_tokenizer_encode(&tokenizer, user_buf, 0, tokens, max_tokens);
+                if (n < max_tokens && tokenizer.eot_id >= 0)
+                    tokens[n++] = tokenizer.eot_id;
+                int n2 = bn_tokenizer_encode(&tokenizer, "Assistant: ", 0,
+                                             tokens + n, max_tokens - n);
+                n += n2;
+            }
+
+            // Context overflow: reset if prompt won't fit
+            if (pos + n > seq_len) {
+                printf("[context full — resetting]\n");
+                pos = 0;
+                if (tokenizer.add_bos) {
+                    bn_transformer_forward(&model, tokenizer.bos_id, pos);
+                    pos++;
+                }
+                bn_sampler_reset_recent(&sampler);
+            }
 
             // Feed prompt tokens through forward pass
             float *logits = NULL;
@@ -372,25 +396,32 @@ int main(int argc, char **argv) {
                 break;
             }
 
+            // Cap generation to remaining context
+            int max_gen = args.n_tokens;
+            int remaining = seq_len - pos - 1;
+            if (remaining < max_gen) max_gen = remaining;
+            if (max_gen < 1) max_gen = 1;
+
             int gen_count = generate_response(&model, &tokenizer, &sampler,
-                                               args.n_tokens, &pos,
+                                               max_gen, &pos,
                                                print_token, NULL);
 
-            // Feed EOT into KV cache to close the assistant turn
-            bn_transformer_forward(&model, tokenizer.eot_id, pos);
-            pos++;
+            // Feed end-of-turn token into KV cache to close the assistant turn
+            int turn_end_id = tokenizer.chatml ? tokenizer.im_end_id : tokenizer.eot_id;
+            if (turn_end_id >= 0 && pos < seq_len) {
+                bn_transformer_forward(&model, turn_end_id, pos);
+                pos++;
+            }
 
             printf("\n");
 
-            turn_count++;
-            int should_reset = (turn_count >= 2) || (gen_count < 0);
-            if (should_reset) {
-                printf("[auto-reset: starting fresh]\n");
-                pos = 0;
-                bn_transformer_forward(&model, tokenizer.bos_id, pos);
-                pos++;
-                bn_sampler_reset_recent(&sampler);
-                turn_count = 0;
+            if (gen_count < 0) {
+                printf("[loop detected]\n");
+            }
+
+            // Context usage indicator when >75% full
+            if (pos * 4 > seq_len * 3) {
+                printf("[%d/%d]\n", pos, seq_len);
             }
         }
 
@@ -408,12 +439,17 @@ int main(int argc, char **argv) {
             bn_gguf_free(gf);
             return 1;
         }
-        int n_prompt = bn_tokenizer_encode(&tokenizer, args.prompt, 1, prompt_tokens,
-                                        max_prompt_tokens);
+        int n_prompt = bn_tokenizer_encode(&tokenizer, args.prompt, tokenizer.add_bos,
+                                        prompt_tokens, max_prompt_tokens);
         {
             char np[16]; snprintf(np, sizeof(np), "%d", n_prompt);
             SH_LOG_INFO("Prompt encoded", "n_tokens", np);
         }
+#ifdef DEBUG
+        fprintf(stderr, "DBG tokens:");
+        for (int i = 0; i < n_prompt; i++) fprintf(stderr, " %d", prompt_tokens[i]);
+        fprintf(stderr, "\n");
+#endif
 
         // Generation loop
         {
@@ -440,6 +476,25 @@ int main(int argc, char **argv) {
         if (!logits) {
             SH_LOG_ERROR("Forward pass returned NULL during prompt");
         } else {
+#ifdef DEBUG
+            // Dump top-10 logits after prefill
+            {
+                int top[10];
+                for (int k = 0; k < 10; k++) top[k] = 0;
+                for (int v = 0; v < cfg->vocab_size; v++) {
+                    for (int k = 0; k < 10; k++) {
+                        if (logits[v] > logits[top[k]]) {
+                            for (int j = 9; j > k; j--) top[j] = top[j-1];
+                            top[k] = v;
+                            break;
+                        }
+                    }
+                }
+                fprintf(stderr, "DBG top10 after prefill:\n");
+                for (int k = 0; k < 10; k++)
+                    fprintf(stderr, "  token %6d: %.4f\n", top[k], logits[top[k]]);
+            }
+#endif
             // Generate tokens
             for (int i = 0; i < args.n_tokens; i++) {
                 int next = bn_sampler_sample(&sampler, logits);
@@ -449,6 +504,8 @@ int main(int argc, char **argv) {
                 if (next == tokenizer.eos_id || next == tokenizer.eot_id) {
                     break;
                 }
+
+                bn_sampler_accept(&sampler, next);
 
                 const char *piece = bn_tokenizer_decode(&tokenizer, next);
                 if (!piece) piece = "";
@@ -461,6 +518,24 @@ int main(int argc, char **argv) {
                     SH_LOG_ERROR("Forward pass returned NULL");
                     break;
                 }
+#ifdef DEBUG
+                {
+                    int top5[5] = {0};
+                    for (int v = 0; v < cfg->vocab_size; v++) {
+                        for (int k = 0; k < 5; k++) {
+                            if (logits[v] > logits[top5[k]]) {
+                                for (int j = 4; j > k; j--) top5[j] = top5[j-1];
+                                top5[k] = v;
+                                break;
+                            }
+                        }
+                    }
+                    fprintf(stderr, "DBG gen %d (token %d, pos %d) top5:", i, next, pos);
+                    for (int k = 0; k < 5; k++)
+                        fprintf(stderr, " %d(%.3f)", top5[k], logits[top5[k]]);
+                    fprintf(stderr, "\n");
+                }
+#endif
             }
         }
 

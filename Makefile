@@ -40,7 +40,7 @@ src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # --- Tests ---
-.PHONY: debug asan test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 pgo clean
+.PHONY: debug asan test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 pgo avx2-check clean
 
 test: test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena
 
@@ -99,6 +99,10 @@ pgo:
 	$(MAKE) bitnet CFLAGS="$(CFLAGS) -fprofile-instr-use=default.profdata"
 	@rm -f default.profraw default.profdata
 	@echo "=== PGO build complete ==="
+
+avx2-check:
+	$(CC) -target x86_64-apple-darwin -mavx2 -mfma -mf16c -O3 -Wall -Wextra -Wshadow \
+		-std=c11 -Iinclude -fsyntax-only $(filter-out src/main.c,$(SRCS))
 
 clean:
 	rm -f bitnet src/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_e2e test_prefill test_kv_f16 default.profraw default.profdata

@@ -1,26 +1,46 @@
 # bitnet.c
 
-A clean-room, pure C inference engine for [BitNet b1.58](https://arxiv.org/abs/2402.17764) transformer models.
+A minimal, embeddable LLM inference engine in pure C11.
 
-Inspired by Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) — a beautifully minimal LLaMA inference implementation in a single C file — **bitnet.c** takes the same philosophy and applies it to Microsoft's [BitNet](https://github.com/microsoft/BitNet) architecture with its 1.58-bit ternary weights.
+Started as a clean-room inference engine for Microsoft's [BitNet b1.58](https://arxiv.org/abs/2402.17764) ternary models, inspired by Karpathy's [llama2.c](https://github.com/karpathy/llama2.c). Now supports standard GGUF quantization formats (Q4_0, Q8_0) alongside ternary (I2_S, TQ1_0, TQ2_0) — covering most small language models on HuggingFace.
 
-Where Microsoft's official BitNet inference framework depends on a modified llama.cpp fork (~100K+ lines of C++), bitnet.c delivers a complete inference pipeline in ~4,500 lines of modular, readable C.
+Zero dependencies beyond libc and libm, four SIMD backends, compiles to WASM, and fits in ~4,500 lines of modular C.
 
 ## Features
 
 - **Pure C11** — no C++, no frameworks, no dependencies beyond libc and libm
-- **GGUF model loading** — compatible with existing BitNet GGUF files (e.g. `bitnet-b1.58-2B-4T`)
-- **I2_S, TQ1_0, & TQ2_0 formats** — native support for Microsoft's I2_S and GGML ternary quantization
+- **GGUF model loading** — loads any GGUF file with supported tensor types
+- **Quantization formats** — I2_S, TQ1_0, TQ2_0 (ternary), Q4_0 (4-bit), Q8_0 (8-bit)
 - **Full transformer forward pass** — RoPE, GQA, RMSNorm, sub-norms, tied embeddings
 - **Flash GQA attention** — online softmax with KV-head grouping, single-pass over KV cache
 - **Optional F16 KV cache** — `--kv16` halves attention DRAM bandwidth with minimal precision loss
-- **ARM NEON/SDOT optimizations** — SDOT int8 matvec, native FP16 logits, INT8 output embeddings
+- **4 SIMD backends** — ARM NEON/SDOT, AVX2, WASM SIMD128, scalar fallback (auto-selected at compile time)
 - **Pthread thread pool** — persistent workers with condvar dispatch (~2us), replaces OpenMP
 - **BPE tokenizer** — loaded directly from GGUF metadata
 - **Sampling** — greedy (argmax), multinomial, and nucleus (top-p)
 - **Native mmap** — zero-copy model loading on macOS/Linux
 - **WASM build** — runs in the browser via Emscripten with Web Worker streaming
 - **Modular architecture** — orthogonal, composable, separately unit-testable modules
+
+## SIMD Backends
+
+| Backend | Platform | Notes |
+|---------|----------|-------|
+| ARM NEON/SDOT | Apple Silicon, ARMv8 | SDOT int8 matvec, native FP16 logits |
+| AVX2 | x86-64 (Haswell+) | DPBUSD int8 matvec, F16C conversion |
+| WASM SIMD128 | Browser (Emscripten) | 128-bit vector ops |
+| Scalar | Any C11 compiler | Portable fallback |
+
+Auto-selected at compile time based on target architecture.
+
+## Tested Models
+
+| Model | Format | Status |
+|-------|--------|--------|
+| [bitnet-b1.58-2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf) | I2_S / TQ2_0 | Primary development target |
+| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) | Q4_0 + Q8_0 | Working (Q4_0 weights, Q8_0 output, attention biases) |
+
+Models must use only supported weight types (Q4_0, Q8_0, I2_S, TQ1_0, TQ2_0, F16). GGUF files with k-quant types (Q4_K, Q5_K, Q6_K, etc.) are not yet supported.
 
 ## Quick Start
 
@@ -97,7 +117,7 @@ bitnet.c/
 ├── include/
 │   ├── platform.h      # Platform abstraction (mmap, timing)
 │   ├── gguf.h          # GGUF v3 reader API
-│   ├── quant.h         # TQ1_0/TQ2_0/I2_S dequantization + ternary matmul
+│   ├── quant.h         # Quantization: I2_S/TQ/Q4_0/Q8_0 dequant + matvec
 │   ├── model.h         # Config, Weights, model loading
 │   ├── transformer.h   # Forward pass API
 │   ├── tokenizer.h     # BPE tokenizer API
@@ -108,7 +128,7 @@ bitnet.c/
 ├── src/
 │   ├── platform.c      # mmap/fread/timing abstraction
 │   ├── gguf.c          # GGUF binary format parser
-│   ├── quant.c         # FP16 conversion, TQ1/TQ2/I2_S dequant, ternary matvec
+│   ├── quant.c         # FP16 conversion, dequant + matvec for all quant formats
 │   ├── model.c         # GGUF → Config/Weights mapping
 │   ├── transformer.c   # Forward pass: flash attention, FFN, sub-norms
 │   ├── tokenizer.c     # BPE encode/decode from GGUF vocab
@@ -224,6 +244,8 @@ BitNet b1.58 is a transformer variant where all linear layer weights are constra
 | I2_S   | 2.0         | 2-bit interleaved (4 values/byte) + per-tensor scale | 128 |
 | TQ1_0  | 1.6875      | Base-3 (5 values/byte) + residual | 256 |
 | TQ2_0  | 2.0625      | 2-bit fields (4 values/byte) | 256 |
+| Q4_0   | 4.5         | 4-bit nibbles (2 values/byte) + FP16 per-block scale | 32 |
+| Q8_0   | 8.5         | 8-bit values + FP16 per-block scale | 32 |
 
 ### Memory Budget (bitnet-b1.58-2B-4T, 2048 context)
 
@@ -246,6 +268,23 @@ T-MAC and bitnet.cpp use lookup tables to replace multiply-accumulate with table
 **The bottleneck is DRAM bandwidth, not decode arithmetic.** At ~52 tok/s the runtime sustains ~43 GB/s reading ~825 MB of weight data per token. The ternary decode costs ~6 cycles per 128 elements; the SDOT instructions cost ~8 cycles; the memory stalls cost everything else. A LUT can't reduce the bytes read from DRAM. It can only consume L1 cache that's currently holding weight prefetch buffers and KV cache tiles.
 
 **Where LUTs would help (but don't apply here).** TQ1_0 base-3 encoding requires 3 multiplies + 1 shift + 1 narrow per 8 elements for trit extraction — genuinely expensive. A 256-entry byte→5-trit LUT (2 KB) would eliminate this. But the target model uses I2_S, not TQ1_0, so this optimization has zero impact on the actual workload.
+
+### Why not llama.cpp / Ollama?
+
+**llama.cpp is a general-purpose inference engine. bitnet.c is a ternary-specific one.**
+
+llama.cpp supports dozens of quantization formats, model architectures, GPU backends (CUDA, Metal, Vulkan, SYCL), and serving modes. That generality costs ~200K lines of C++ and a build system that pulls in platform-specific SDKs. Ollama wraps llama.cpp with a Go service layer, adding another ~50K lines and a Docker-style distribution model. Both are excellent tools for running arbitrary GGUF models.
+
+bitnet.c exists because BitNet's ternary weights ({-1, 0, +1}) make most of that machinery irrelevant:
+
+- **No GPU needed.** Ternary matvec is memory-bandwidth-bound, not compute-bound. A single M1 Max CPU core sustains ~52 tok/s — there's no FLOPs deficit to offload. GPU dispatch overhead and PCIe transfers would add latency for zero throughput gain.
+- **No quantization format zoo.** The model has one weight type (I2_S ternary). llama.cpp's `ggml_compute_forward` dispatches through dozens of quant format×operation combinations. bitnet.c has one kernel.
+- **No abstraction layers.** llama.cpp routes tensor operations through GGML's graph-based backend abstraction. bitnet.c calls the matvec kernel directly — the forward pass is a flat loop over layers with inline SIMD.
+- **Embeddable.** The entire engine is ~4,500 lines of C11 with zero dependencies. It compiles to WASM and runs in a browser. Try that with llama.cpp's Metal backend.
+
+Microsoft's own [BitNet inference framework](https://github.com/microsoft/BitNet) takes the opposite approach: it forks llama.cpp and patches in ternary kernel support. This inherits llama.cpp's full dependency tree (CMake, Python, conda) for a model that only needs addition and subtraction.
+
+**When to use llama.cpp/Ollama instead:** if you need GPU inference, non-BitNet models, OpenAI-compatible API serving, or multi-model management. They're the right tools for general LLM deployment. bitnet.c is for when you want a single ternary model running as fast as possible with nothing else in the way.
 
 ### Why C
 

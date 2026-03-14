@@ -22,16 +22,18 @@ typedef struct {
 
 typedef struct {
     float *attn_norm, *attn_sub_norm;       // RMSNorm weights [dim]
-    BnQWeight wq, wk, wv, wo;                 // ternary attention weights
+    BnQWeight wq, wk, wv, wo;                 // attention projection weights
+    float *q_bias, *k_bias, *v_bias;        // attention biases (NULL if not present)
     float *ffn_norm, *ffn_sub_norm;         // RMSNorm weights
     BnQWeight ffn_gate, ffn_up, ffn_down;     // ternary FFN weights
 } BnLayerWeights;
 
 typedef struct {
-    const void *token_embedding;  // raw F16 data (dequant on demand)
-    int emb_type;                 // tensor type (F16, Q6_K, etc.)
+    const void *token_embedding;  // raw embedding data (F16, Q4_0, Q8_0, etc.)
+    int emb_type;                 // tensor type (F16, Q4_0, Q8_0, etc.)
     int8_t *emb_out_i8;          // [vocab_size * dim] INT8 copy for logits (NULL if unused)
     float  *emb_out_scales;      // [vocab_size] per-row scales (NULL if unused)
+    BnQWeight output_weight;      // untied output projection (data=NULL if tied)
     float *output_norm;           // [dim]
     BnLayerWeights *layers;         // [n_layers]
 } BnWeights;

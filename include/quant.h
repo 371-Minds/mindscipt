@@ -36,12 +36,35 @@ typedef struct {
     uint16_t d;              // FP16 scale
 } BnBlockTQ2;
 
+// Q8_0: 8-bit quantization, 32 elements per block
+// FP16 per-block scale + 32 int8 quantized values = 34 bytes
+typedef struct {
+    uint16_t d;       // FP16 scale
+    int8_t   qs[32];  // quantized values
+} BnBlockQ8_0;
+
+// Q4_0: 4-bit quantization, 32 elements per block
+// FP16 per-block scale + 16 packed nibble bytes = 18 bytes
+typedef struct {
+    uint16_t d;       // FP16 scale
+    uint8_t  qs[16];  // packed nibbles (2 values per byte)
+} BnBlockQ4_0;
+
+// Q6_K: 6-bit k-quant, 256 elements per block
+// 128 bytes ql (lower 4 bits) + 64 bytes qh (upper 2 bits) + 16 int8 scales + FP16 d = 210 bytes
+typedef struct {
+    uint8_t ql[BN_QK_K / 2];    // 128 bytes: lower 4 bits of quants
+    uint8_t qh[BN_QK_K / 4];    //  64 bytes: upper 2 bits of quants
+    int8_t  scales[BN_QK_K / 16]; // 16 bytes: 8-bit sub-block scales
+    uint16_t d;                  //   2 bytes: FP16 super-block scale
+} BnBlockQ6K;                    // 210 bytes total
+
 // I2_S: Microsoft BitNet 2-bit ternary, no per-block scale
 // Interleaved byte layout: each byte packs 4 values from 4 sub-rows of 32
 // Single per-tensor scale stored at offset nelements/4 in the data
 // Encoding: 0=-1, 1=0, 2=+1
 
-// Ternary weight tensor descriptor (zero-copy into GGUF buffer)
+// Quantized weight tensor descriptor (zero-copy into GGUF buffer)
 typedef struct {
     const void *data;   // packed weight data
     int type;           // BN_GGUF_TENSOR_TQ1_0, TQ2_0, or I2_S
@@ -53,6 +76,9 @@ float    bn_fp16_to_fp32(uint16_t h);
 uint16_t bn_fp32_to_fp16(float f);
 void     bn_quant_dequant_tq1(const BnBlockTQ1 *block, float *out);
 void     bn_quant_dequant_tq2(const BnBlockTQ2 *block, float *out);
+void     bn_quant_dequant_q8_0(const BnBlockQ8_0 *block, float *out);
+void     bn_quant_dequant_q4_0(const BnBlockQ4_0 *block, float *out);
+void     bn_quant_dequant_q6k(const BnBlockQ6K *block, float *out);
 void     bn_quant_dequant_i2s(const uint8_t *data, float *out, int n, float scale);
 void     bn_quant_matvec(float *out, const BnQWeight *W, const float *x,
                          int8_t *x_q_buf, BnThreadPool *pool);
@@ -67,8 +93,11 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
                            const float *x, int8_t *x_q_buf, BnThreadPool *pool);
 
 // Quantize float vector to int8, returns scale = amax/127.
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__)
 float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n);
+
+// Quantize float vector to per-block Q8_0: 32-element blocks with per-block scales.
+void bn_quant_x_to_q8_blocks(const float *x, int8_t *x_q, float *x_scales, int n);
 
 // Quantize F16 rows to INT8 + per-row scales for INT8 logits kernel.
 void bn_quant_f16_rows_to_i8(const uint16_t *f16, int8_t *i8_out,

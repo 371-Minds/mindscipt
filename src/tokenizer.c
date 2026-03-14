@@ -120,6 +120,10 @@ int bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f) {
     idx = bn_gguf_find_key(f, "tokenizer.ggml.eot_token_id");
     t->eot_id = (idx >= 0) ? (int)bn_gguf_get_u32(f, "tokenizer.ggml.eot_token_id") : -1;
 
+    // add_bos_token: default true unless GGUF says otherwise
+    idx = bn_gguf_find_key(f, "tokenizer.ggml.add_bos_token");
+    t->add_bos = (idx >= 0) ? (int)f->kvs[idx].value.b : 1;
+
     // #16: Build sorted index for binary search
     if ((size_t)t->vocab_size > SIZE_MAX / sizeof(int)) {
         bn_tokenizer_free(t);
@@ -138,6 +142,11 @@ int bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f) {
     // Fallback: resolve eot_id from vocab if GGUF metadata didn't provide it
     if (t->eot_id < 0)
         t->eot_id = vocab_lookup(t, "<|eot_id|>");
+
+    // Detect ChatML template (Qwen, Yi, etc.)
+    t->im_start_id = vocab_lookup(t, "<|im_start|>");
+    t->im_end_id   = vocab_lookup(t, "<|im_end|>");
+    t->chatml = (t->im_start_id >= 0 && t->im_end_id >= 0) ? 1 : 0;
 
     return 0;
 }

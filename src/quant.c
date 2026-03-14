@@ -1,4 +1,5 @@
 #include "quant.h"
+#include "simd_helpers.h"
 #include "gguf.h"
 #include <math.h>
 #include <string.h>
@@ -167,6 +168,59 @@ void bn_quant_dequant_i2s(const uint8_t *data, float *out, int n, float scale) {
 
         data += 32;
         done += blk_e;
+    }
+}
+
+// --- Q8_0 dequantization ---
+// 32 int8 values per block, FP16 per-block scale
+
+void bn_quant_dequant_q8_0(const BnBlockQ8_0 *block, float *out) {
+    float d = bn_fp16_to_fp32(block->d);
+    for (int i = 0; i < 32; i++) {
+        out[i] = block->qs[i] * d;
+    }
+}
+
+// --- Q4_0 dequantization ---
+// 32 values packed as 16 nibble bytes, FP16 per-block scale
+// Low nibble = elements 0-15, high nibble = elements 16-31, centered at 8
+
+void bn_quant_dequant_q4_0(const BnBlockQ4_0 *block, float *out) {
+    float d = bn_fp16_to_fp32(block->d);
+    for (int i = 0; i < 16; i++) {
+        uint8_t b = block->qs[i];
+        out[i]      = ((int)(b & 0xF) - 8) * d;
+        out[i + 16] = ((int)(b >> 4)  - 8) * d;
+    }
+}
+
+// --- Q6_K dequantization ---
+// 256 values per block: 128 bytes ql (lower 4 bits), 64 bytes qh (upper 2 bits),
+// 16 int8 sub-block scales, FP16 super-block scale. 210 bytes total.
+// Layout matches ggml: ql/qh/sc pointers advance by 64/32/8 per 128-element chunk.
+
+void bn_quant_dequant_q6k(const BnBlockQ6K *block, float *out) {
+    float d = bn_fp16_to_fp32(block->d);
+    const uint8_t *ql = block->ql;
+    const uint8_t *qh = block->qh;
+    const int8_t  *sc = block->scales;
+
+    for (int n = 0; n < BN_QK_K; n += 128) {
+        for (int l = 0; l < 32; l++) {
+            int is = l / 16;
+            int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            int q3 = (int)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+            int q4 = (int)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+            out[l +  0] = d * sc[is + 0] * q1;
+            out[l + 32] = d * sc[is + 2] * q2;
+            out[l + 64] = d * sc[is + 4] * q3;
+            out[l + 96] = d * sc[is + 6] * q4;
+        }
+        out += 128;
+        ql  += 64;
+        qh  += 32;
+        sc  += 8;
     }
 }
 
@@ -351,7 +405,358 @@ static void i2s_sdot_range(void *ctx, int row_start, int row_end) {
     }
 }
 
+// Per-block Q8_0 quantization for Q4_0 integer dot product path.
+// Quantizes each 32-element block independently with its own scale.
+void bn_quant_x_to_q8_blocks(const float *x, int8_t *x_q, float *x_scales, int n) {
+    int n_blocks = n / 32;
+    for (int b = 0; b < n_blocks; b++) {
+        const float *xb = x + b * 32;
+        int8_t *qb = x_q + b * 32;
+
+        float32x4_t v0 = vabsq_f32(vld1q_f32(xb));
+        float32x4_t v1 = vabsq_f32(vld1q_f32(xb + 4));
+        float32x4_t v2 = vabsq_f32(vld1q_f32(xb + 8));
+        float32x4_t v3 = vabsq_f32(vld1q_f32(xb + 12));
+        float32x4_t v4 = vabsq_f32(vld1q_f32(xb + 16));
+        float32x4_t v5 = vabsq_f32(vld1q_f32(xb + 20));
+        float32x4_t v6 = vabsq_f32(vld1q_f32(xb + 24));
+        float32x4_t v7 = vabsq_f32(vld1q_f32(xb + 28));
+        float32x4_t vmax = vmaxq_f32(vmaxq_f32(vmaxq_f32(v0, v1), vmaxq_f32(v2, v3)),
+                                      vmaxq_f32(vmaxq_f32(v4, v5), vmaxq_f32(v6, v7)));
+        float amax = vmaxvq_f32(vmax);
+
+        if (amax == 0.0f) {
+            memset(qb, 0, 32);
+            x_scales[b] = 0.0f;
+            continue;
+        }
+
+        float inv_scale = 127.0f / amax;
+        x_scales[b] = amax / 127.0f;
+
+        float32x4_t vinv = vdupq_n_f32(inv_scale);
+        int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb),      vinv));
+        int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + 4),  vinv));
+        int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + 8),  vinv));
+        int32x4_t i3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + 12), vinv));
+        int32x4_t i4 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + 16), vinv));
+        int32x4_t i5 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + 20), vinv));
+        int32x4_t i6 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + 24), vinv));
+        int32x4_t i7 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xb + 28), vinv));
+
+        int8x8_t r0 = vqmovn_s16(vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1)));
+        int8x8_t r1 = vqmovn_s16(vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3)));
+        int8x8_t r2 = vqmovn_s16(vcombine_s16(vqmovn_s32(i4), vqmovn_s32(i5)));
+        int8x8_t r3 = vqmovn_s16(vcombine_s16(vqmovn_s32(i6), vqmovn_s32(i7)));
+        vst1_s8(qb,      r0);
+        vst1_s8(qb + 8,  r1);
+        vst1_s8(qb + 16, r2);
+        vst1_s8(qb + 24, r3);
+    }
+}
+
+// Q4_0 SDOT context: integer dot product with per-block scales
+typedef struct {
+    float *out;
+    const BnQWeight *W;
+    const int8_t *x_q;
+    const float *x_scales;
+} Q4SdotCtx;
+
+// Q4_0 SDOT matvec for a range of rows [row_start, row_end)
+static void q4_sdot_range(void *ctx, int row_start, int row_end) {
+    Q4SdotCtx *c = (Q4SdotCtx *)ctx;
+    const BnBlockQ4_0 *blocks = (const BnBlockQ4_0 *)c->W->data;
+    int n_blocks_per_row = c->W->cols / 32;
+    const int8_t *x_q = c->x_q;
+    const float *x_scales = c->x_scales;
+
+    const uint8x16_t mask_lo = vdupq_n_u8(0xF);
+    const int8x16_t eight = vdupq_n_s8(8);
+
+    for (int row = row_start; row < row_end; row++) {
+        float row_sum = 0.0f;
+        for (int b = 0; b < n_blocks_per_row; b++) {
+            const BnBlockQ4_0 *blk = &blocks[row * n_blocks_per_row + b];
+            __builtin_prefetch(blk + 2, 0, 0);
+            float d_q4 = bn_fp16_to_fp32(blk->d);
+            float d_q8 = x_scales[b];
+
+            uint8x16_t raw = vld1q_u8(blk->qs);
+            int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask_lo)), eight);
+            int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), eight);
+
+            const int8_t *xb = x_q + b * 32;
+            int32x4_t acc = vdotq_s32(vdupq_n_s32(0), lo, vld1q_s8(xb));
+            acc = vdotq_s32(acc, hi, vld1q_s8(xb + 16));
+
+            row_sum += d_q4 * d_q8 * (float)vaddvq_s32(acc);
+        }
+        c->out[row] = row_sum;
+    }
+}
+
 #endif // __ARM_NEON && __ARM_FEATURE_DOTPROD
+
+// --- AVX2 SDOT-equivalent for I2_S ---
+
+#if defined(__AVX2__) && !defined(__ARM_NEON)
+
+float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n) {
+    // Find absolute max via AVX2
+    __m256 vmax = _mm256_setzero_ps();
+    __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    int i = 0;
+    for (; i + 31 < n; i += 32) {
+        vmax = _mm256_max_ps(vmax, _mm256_and_ps(_mm256_loadu_ps(x + i), sign_mask));
+        vmax = _mm256_max_ps(vmax, _mm256_and_ps(_mm256_loadu_ps(x + i + 8), sign_mask));
+        vmax = _mm256_max_ps(vmax, _mm256_and_ps(_mm256_loadu_ps(x + i + 16), sign_mask));
+        vmax = _mm256_max_ps(vmax, _mm256_and_ps(_mm256_loadu_ps(x + i + 24), sign_mask));
+    }
+    for (; i + 7 < n; i += 8)
+        vmax = _mm256_max_ps(vmax, _mm256_and_ps(_mm256_loadu_ps(x + i), sign_mask));
+    float amax = bn_avx2_hmax_ps(vmax);
+    for (; i < n; i++) {
+        float a = fabsf(x[i]);
+        if (a > amax) amax = a;
+    }
+
+    if (amax == 0.0f) {
+        memset(x_q, 0, n);
+        return 0.0f;
+    }
+
+    float scale = amax / (float)BN_I8_MAX;
+    float inv_scale = (float)BN_I8_MAX / amax;
+    __m256 vinv = _mm256_set1_ps(inv_scale);
+
+    // Lane-crossing fixup permutation for packs: AVX2 packs operates within
+    // 128-bit lanes, so after two packs (32→16→8) the order is [0,4,1,5,2,6,3,7]
+    __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+    i = 0;
+    for (; i + 31 < n; i += 32) {
+        __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i), vinv));
+        __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 8), vinv));
+        __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 16), vinv));
+        __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 24), vinv));
+        __m256i s01 = _mm256_packs_epi32(i0, i1);   // 32→16, within lanes
+        __m256i s23 = _mm256_packs_epi32(i2, i3);
+        __m256i b = _mm256_packs_epi16(s01, s23);    // 16→8, within lanes
+        b = _mm256_permutevar8x32_epi32(b, perm);    // fix lane crossing
+        _mm256_storeu_si256((__m256i *)(x_q + i), b);
+    }
+    for (; i < n; i++) {
+        int v = (int)roundf(x[i] * inv_scale);
+        x_q[i] = (int8_t)(v < -BN_I8_MAX ? -BN_I8_MAX : (v > BN_I8_MAX ? BN_I8_MAX : v));
+    }
+    return scale;
+}
+
+void bn_quant_f16_rows_to_i8(const uint16_t *f16, int8_t *i8_out,
+                              float *scales_out, int n_rows, int dim) {
+    __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+    for (int r = 0; r < n_rows; r++) {
+        const uint16_t *row = f16 + (size_t)r * dim;
+        int8_t *out = i8_out + (size_t)r * dim;
+
+        // F16C: convert F16→F32 and find amax
+        __m256 vmax = _mm256_setzero_ps();
+        int d = 0;
+        for (; d + 7 < dim; d += 8) {
+            __m256 v = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + d)));
+            vmax = _mm256_max_ps(vmax, _mm256_and_ps(v, sign_mask));
+        }
+        float amax = bn_avx2_hmax_ps(vmax);
+        for (; d < dim; d++) {
+            float v = bn_fp16_to_fp32(row[d]);
+            float a = v < 0 ? -v : v;
+            if (a > amax) amax = a;
+        }
+
+        if (amax == 0.0f) {
+            memset(out, 0, dim);
+            scales_out[r] = 0.0f;
+            continue;
+        }
+
+        float scale = amax / (float)BN_I8_MAX;
+        float inv_scale = (float)BN_I8_MAX / amax;
+        __m256 vinv = _mm256_set1_ps(inv_scale);
+        scales_out[r] = scale;
+
+        d = 0;
+        for (; d + 31 < dim; d += 32) {
+            __m256 f0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + d)));
+            __m256 f1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + d + 8)));
+            __m256 f2 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + d + 16)));
+            __m256 f3 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + d + 24)));
+            __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(f0, vinv));
+            __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(f1, vinv));
+            __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(f2, vinv));
+            __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(f3, vinv));
+            __m256i s01 = _mm256_packs_epi32(i0, i1);
+            __m256i s23 = _mm256_packs_epi32(i2, i3);
+            __m256i b = _mm256_packs_epi16(s01, s23);
+            b = _mm256_permutevar8x32_epi32(b, perm);
+            _mm256_storeu_si256((__m256i *)(out + d), b);
+        }
+        for (; d < dim; d++) {
+            float v = bn_fp16_to_fp32(row[d]);
+            int q = (int)roundf(v * inv_scale);
+            out[d] = (int8_t)(q < -BN_I8_MAX ? -BN_I8_MAX : (q > BN_I8_MAX ? BN_I8_MAX : q));
+        }
+    }
+}
+
+// Context for I2_S AVX2 range function (same layout as NEON SDOT I2SCtx)
+// (I2SCtx is defined inside the NEON DOTPROD guard, so we redefine for AVX2)
+typedef struct {
+    float *out;
+    const BnQWeight *W;
+    const int8_t *x_q;
+    float combined_scale;
+} I2SCtx;
+
+// I2_S AVX2 matvec for a range of rows [row_start, row_end)
+static void i2s_avx2_range(void *ctx, int row_start, int row_end) {
+    I2SCtx *c = (I2SCtx *)ctx;
+    int row_bytes = c->W->cols / 4;
+    const uint8_t *base = (const uint8_t *)c->W->data;
+    float combined_scale = c->combined_scale;
+    int cols = c->W->cols;
+    const int8_t *x_q = c->x_q;
+
+    // I2_S interleaved: each byte has 4 sub-rows × 2 bits
+    // Bits 7-6 = sub-row 0, 5-4 = sub-row 1, 3-2 = sub-row 2, 1-0 = sub-row 3
+    // Encoding: 0=-1, 1=0, 2=+1 → subtract 1 to get ternary
+    const __m256i mask3 = _mm256_set1_epi8(3);
+    const __m256i one = _mm256_set1_epi8(1);
+
+    for (int row = row_start; row < row_end; row++) {
+        const uint8_t *rd = base + (size_t)row * row_bytes;
+        int done = 0;
+
+        __m256i iaccA = _mm256_setzero_si256();
+        __m256i iaccB = _mm256_setzero_si256();
+        __m256i iaccC = _mm256_setzero_si256();
+        __m256i iaccD = _mm256_setzero_si256();
+
+        while (done < cols) {
+            _mm_prefetch((const char *)(rd + 64), _MM_HINT_T0);
+            // Load 32 packed bytes = 128 ternary values
+            __m256i raw = _mm256_loadu_si256((const __m256i *)rd);
+
+            // Extract 4 sub-rows: shift right, mask to 2 bits, subtract 1
+            // Note: _mm256_srli_epi16 shifts 16-bit lanes; AND with 0x03
+            // cleans any cross-byte contamination from the 16-bit shift.
+            __m256i t0 = _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(raw, 6), mask3), one);
+            __m256i t1 = _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(raw, 4), mask3), one);
+            __m256i t2 = _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(raw, 2), mask3), one);
+            __m256i t3 = _mm256_sub_epi8(_mm256_and_si256(raw, mask3), one);
+
+            // Load 4×32 int8 x_q values and accumulate dot products
+            const int8_t *xp = x_q + done;
+            iaccA = bn_avx2_dpbusd(iaccA, t0, _mm256_loadu_si256((const __m256i *)xp));
+            iaccB = bn_avx2_dpbusd(iaccB, t1, _mm256_loadu_si256((const __m256i *)(xp + 32)));
+            iaccC = bn_avx2_dpbusd(iaccC, t2, _mm256_loadu_si256((const __m256i *)(xp + 64)));
+            iaccD = bn_avx2_dpbusd(iaccD, t3, _mm256_loadu_si256((const __m256i *)(xp + 96)));
+
+            rd += 32;
+            done += 128;
+        }
+
+        // Reduce int32 accumulators to scalar
+        __m256i sum4 = _mm256_add_epi32(_mm256_add_epi32(iaccA, iaccB),
+                                         _mm256_add_epi32(iaccC, iaccD));
+        int32_t total = bn_avx2_hsum_epi32(sum4);
+        c->out[row] = (float)total * combined_scale;
+    }
+}
+
+// Per-block Q8_0 quantization (AVX2 version)
+void bn_quant_x_to_q8_blocks(const float *x, int8_t *x_q, float *x_scales, int n) {
+    __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    int n_blocks = n / 32;
+
+    for (int b = 0; b < n_blocks; b++) {
+        const float *xb = x + b * 32;
+        int8_t *qb = x_q + b * 32;
+
+        __m256 v0 = _mm256_and_ps(_mm256_loadu_ps(xb), sign_mask);
+        __m256 v1 = _mm256_and_ps(_mm256_loadu_ps(xb + 8), sign_mask);
+        __m256 v2 = _mm256_and_ps(_mm256_loadu_ps(xb + 16), sign_mask);
+        __m256 v3 = _mm256_and_ps(_mm256_loadu_ps(xb + 24), sign_mask);
+        __m256 vmax = _mm256_max_ps(_mm256_max_ps(v0, v1), _mm256_max_ps(v2, v3));
+        float amax = bn_avx2_hmax_ps(vmax);
+
+        if (amax == 0.0f) {
+            _mm256_storeu_si256((__m256i *)qb, _mm256_setzero_si256());
+            x_scales[b] = 0.0f;
+            continue;
+        }
+
+        float inv_scale = 127.0f / amax;
+        x_scales[b] = amax / 127.0f;
+
+        __m256 vinv = _mm256_set1_ps(inv_scale);
+        __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb), vinv));
+        __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + 8), vinv));
+        __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + 16), vinv));
+        __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + 24), vinv));
+        __m256i s01 = _mm256_packs_epi32(i0, i1);
+        __m256i s23 = _mm256_packs_epi32(i2, i3);
+        __m256i packed = _mm256_packs_epi16(s01, s23);
+        packed = _mm256_permutevar8x32_epi32(packed, perm);
+        _mm256_storeu_si256((__m256i *)qb, packed);
+    }
+}
+
+// Q4_0 AVX2 DPBUSD context (same layout as NEON Q4SdotCtx)
+typedef struct {
+    float *out;
+    const BnQWeight *W;
+    const int8_t *x_q;
+    const float *x_scales;
+} Q4SdotCtx;
+
+// Q4_0 AVX2 matvec for a range of rows [row_start, row_end)
+static void q4_sdot_avx2_range(void *ctx, int row_start, int row_end) {
+    Q4SdotCtx *c = (Q4SdotCtx *)ctx;
+    const BnBlockQ4_0 *blocks = (const BnBlockQ4_0 *)c->W->data;
+    int n_blocks_per_row = c->W->cols / 32;
+    const int8_t *x_q = c->x_q;
+    const float *x_scales = c->x_scales;
+
+    const __m128i mask_lo = _mm_set1_epi8(0xF);
+    const __m128i bias = _mm_set1_epi8(8);
+
+    for (int row = row_start; row < row_end; row++) {
+        float row_sum = 0.0f;
+        for (int b = 0; b < n_blocks_per_row; b++) {
+            const BnBlockQ4_0 *blk = &blocks[row * n_blocks_per_row + b];
+            _mm_prefetch((const char *)(blk + 2), _MM_HINT_T0);
+            float d_q4 = bn_fp16_to_fp32(blk->d);
+            float d_q8 = x_scales[b];
+
+            __m128i raw = _mm_loadu_si128((const __m128i *)blk->qs);
+            __m128i lo_128 = _mm_sub_epi8(_mm_and_si128(raw, mask_lo), bias);
+            __m128i hi_128 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(raw, 4), mask_lo), bias);
+
+            __m256i w256 = _mm256_set_m128i(hi_128, lo_128);
+            __m256i xq256 = _mm256_loadu_si256((const __m256i *)(x_q + b * 32));
+
+            __m256i acc = bn_avx2_dpbusd(_mm256_setzero_si256(), w256, xq256);
+            row_sum += d_q4 * d_q8 * (float)bn_avx2_hsum_epi32(acc);
+        }
+        c->out[row] = row_sum;
+    }
+}
+
+#endif // __AVX2__ && !__ARM_NEON
 
 // --- Range function contexts for non-SDOT paths ---
 
@@ -404,8 +809,71 @@ static void i2s_neon_range(void *ctx, int row_start, int row_end) {
 }
 #endif // __ARM_NEON && !__ARM_FEATURE_DOTPROD
 
+// I2_S WASM SIMD128 range (float accumulation, 128-bit vectors)
+#if defined(__wasm_simd128__)
+static void i2s_wasm_range(void *ctx, int row_start, int row_end) {
+    I2SFloatCtx *c = (I2SFloatCtx *)ctx;
+    int cols = c->W->cols;
+    int row_bytes = cols / 4;
+    const uint8_t *base = (const uint8_t *)c->W->data;
+    float scale = c->W->scale;
+    const float *x = c->x;
+
+    const v128_t mask3 = wasm_i8x16_splat(3);
+    const v128_t one = wasm_i8x16_splat(1);
+
+    for (int row = row_start; row < row_end; row++) {
+        const uint8_t *rd = base + (size_t)row * row_bytes;
+        int done = 0;
+
+        v128_t acc0 = wasm_f32x4_splat(0), acc1 = wasm_f32x4_splat(0);
+        v128_t acc2 = wasm_f32x4_splat(0), acc3 = wasm_f32x4_splat(0);
+
+        while (done < cols) {
+            // Process 16 packed bytes = 64 ternary values at a time
+            for (int h = 0; h < 2; h++) {
+                v128_t raw = wasm_v128_load(rd + h * 16);
+
+                // Extract 4 sub-rows using byte-granularity shift (no cross-byte issues)
+                v128_t t0 = wasm_i8x16_sub(wasm_v128_and(wasm_u8x16_shr(raw, 6), mask3), one);
+                v128_t t1 = wasm_i8x16_sub(wasm_v128_and(wasm_u8x16_shr(raw, 4), mask3), one);
+                v128_t t2 = wasm_i8x16_sub(wasm_v128_and(wasm_u8x16_shr(raw, 2), mask3), one);
+                v128_t t3 = wasm_i8x16_sub(wasm_v128_and(raw, mask3), one);
+
+                // For each sub-row: widen i8→i16→i32→f32, multiply with x, accumulate
+                // Process sub-row 0 (16 elements)
+                const float *xp = x + done + h * 16;
+                #define WASM_ACC_I8x16(ternary, xbase, facc0, facc1, facc2, facc3) do { \
+                    v128_t lo16 = wasm_i16x8_extend_low_i8x16(ternary);  \
+                    v128_t hi16 = wasm_i16x8_extend_high_i8x16(ternary); \
+                    v128_t i0 = wasm_i32x4_extend_low_i16x8(lo16);      \
+                    v128_t i1 = wasm_i32x4_extend_high_i16x8(lo16);     \
+                    v128_t i2 = wasm_i32x4_extend_low_i16x8(hi16);      \
+                    v128_t i3 = wasm_i32x4_extend_high_i16x8(hi16);     \
+                    facc0 = wasm_f32x4_add(facc0, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(i0), wasm_v128_load(xbase)));     \
+                    facc1 = wasm_f32x4_add(facc1, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(i1), wasm_v128_load(xbase + 4))); \
+                    facc2 = wasm_f32x4_add(facc2, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(i2), wasm_v128_load(xbase + 8))); \
+                    facc3 = wasm_f32x4_add(facc3, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(i3), wasm_v128_load(xbase + 12))); \
+                } while(0)
+
+                WASM_ACC_I8x16(t0, xp + 0*32,  acc0, acc1, acc2, acc3);
+                WASM_ACC_I8x16(t1, xp + 1*32,  acc0, acc1, acc2, acc3);
+                WASM_ACC_I8x16(t2, xp + 2*32,  acc0, acc1, acc2, acc3);
+                WASM_ACC_I8x16(t3, xp + 3*32,  acc0, acc1, acc2, acc3);
+                #undef WASM_ACC_I8x16
+            }
+            rd += 32;
+            done += 128;
+        }
+
+        v128_t sum = wasm_f32x4_add(wasm_f32x4_add(acc0, acc1), wasm_f32x4_add(acc2, acc3));
+        c->out[row] = bn_wasm_hsum_f32x4(sum) * scale;
+    }
+}
+#endif // __wasm_simd128__
+
 // I2_S scalar range
-#if !defined(__ARM_NEON)
+#if !defined(__ARM_NEON) && !defined(__AVX2__) && !defined(__wasm_simd128__)
 static void i2s_scalar_range(void *ctx, int row_start, int row_end) {
     I2SFloatCtx *c = (I2SFloatCtx *)ctx;
     int cols = c->W->cols;
@@ -433,7 +901,7 @@ static void i2s_scalar_range(void *ctx, int row_start, int row_end) {
         c->out[row] = sum * scale;
     }
 }
-#endif // !__ARM_NEON
+#endif // !__ARM_NEON && !__AVX2__ && !__wasm_simd128__
 
 // TQ2_0 range context
 typedef struct {
@@ -611,7 +1079,207 @@ static void tq1_range(void *ctx, int row_start, int row_end) {
     }
 }
 
-// --- Ternary matrix-vector multiply ---
+// --- Q8_0 matrix-vector multiply ---
+
+typedef struct {
+    float *out;
+    const BnQWeight *W;
+    const float *x;
+} Q8Ctx;
+
+static void q8_range(void *ctx, int row_start, int row_end) {
+    Q8Ctx *c = (Q8Ctx *)ctx;
+    const BnBlockQ8_0 *blocks = (const BnBlockQ8_0 *)c->W->data;
+    int n_blocks_per_row = c->W->cols / 32;
+    const float *x = c->x;
+
+    for (int row = row_start; row < row_end; row++) {
+        float row_sum = 0.0f;
+        for (int b = 0; b < n_blocks_per_row; b++) {
+            const BnBlockQ8_0 *blk = &blocks[row * n_blocks_per_row + b];
+            __builtin_prefetch(blk + 2, 0, 0);
+            float d = bn_fp16_to_fp32(blk->d);
+            const float *xb = x + b * 32;
+#ifdef __ARM_NEON
+            float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+            float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+            for (int i = 0; i < 2; i++) {
+                int8x16_t w = vld1q_s8(blk->qs + i * 16);
+                neon_acc_i8x16_f32(w, xb + i * 16, &acc0, &acc1, &acc2, &acc3);
+            }
+            row_sum += neon_reduce4(acc0, acc1, acc2, acc3) * d;
+#elif defined(__AVX2__)
+            __m256i w_raw = _mm256_loadu_si256((const __m256i *)blk->qs);
+            __m128i w_lo = _mm256_castsi256_si128(w_raw);
+            __m128i w_hi = _mm256_extracti128_si256(w_raw, 1);
+            __m256 acc = _mm256_setzero_ps();
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w_lo)), _mm256_loadu_ps(xb)));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(w_lo, 8))), _mm256_loadu_ps(xb + 8)));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w_hi)), _mm256_loadu_ps(xb + 16)));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(w_hi, 8))), _mm256_loadu_ps(xb + 24)));
+            row_sum += bn_avx2_hsum_ps(acc) * d;
+#elif defined(__wasm_simd128__)
+            v128_t acc0 = wasm_f32x4_splat(0), acc1 = wasm_f32x4_splat(0);
+            v128_t acc2 = wasm_f32x4_splat(0), acc3 = wasm_f32x4_splat(0);
+            for (int i = 0; i < 2; i++) {
+                v128_t w = wasm_v128_load(blk->qs + i * 16);
+                v128_t lo16 = wasm_i16x8_extend_low_i8x16(w);
+                v128_t hi16 = wasm_i16x8_extend_high_i8x16(w);
+                const float *xp = xb + i * 16;
+                acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(lo16)), wasm_v128_load(xp)));
+                acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(lo16)), wasm_v128_load(xp + 4)));
+                acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)), wasm_v128_load(xp + 8)));
+                acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), wasm_v128_load(xp + 12)));
+            }
+            v128_t sum = wasm_f32x4_add(wasm_f32x4_add(acc0, acc1), wasm_f32x4_add(acc2, acc3));
+            row_sum += bn_wasm_hsum_f32x4(sum) * d;
+#else
+            float block_sum = 0.0f;
+            for (int i = 0; i < 32; i++) {
+                block_sum += blk->qs[i] * xb[i];
+            }
+            row_sum += block_sum * d;
+#endif
+        }
+        c->out[row] = row_sum;
+    }
+}
+
+// --- Q4_0 matrix-vector multiply (float fallback for WASM/scalar/NEON without dotprod) ---
+
+#if !(defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) && !defined(__AVX2__)
+
+typedef struct {
+    float *out;
+    const BnQWeight *W;
+    const float *x;
+} Q4Ctx;
+
+static void q4_range(void *ctx, int row_start, int row_end) {
+    Q4Ctx *c = (Q4Ctx *)ctx;
+    const BnBlockQ4_0 *blocks = (const BnBlockQ4_0 *)c->W->data;
+    int n_blocks_per_row = c->W->cols / 32;
+    const float *x = c->x;
+
+    for (int row = row_start; row < row_end; row++) {
+        float row_sum = 0.0f;
+        for (int b = 0; b < n_blocks_per_row; b++) {
+            const BnBlockQ4_0 *blk = &blocks[row * n_blocks_per_row + b];
+            __builtin_prefetch(blk + 2, 0, 0);
+            float d = bn_fp16_to_fp32(blk->d);
+            const float *xb = x + b * 32;
+#ifdef __ARM_NEON
+            uint8x16_t raw = vld1q_u8(blk->qs);
+            int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, vdupq_n_u8(0xF))), vdupq_n_s8(8));
+            int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), vdupq_n_s8(8));
+            float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+            float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+            neon_acc_i8x16_f32(lo, xb, &acc0, &acc1, &acc2, &acc3);
+            neon_acc_i8x16_f32(hi, xb + 16, &acc0, &acc1, &acc2, &acc3);
+            row_sum += neon_reduce4(acc0, acc1, acc2, acc3) * d;
+#elif defined(__AVX2__)
+            __m128i raw = _mm_loadu_si128((const __m128i *)blk->qs);
+            __m128i lo_128 = _mm_and_si128(raw, _mm_set1_epi8(0xF));
+            __m128i hi_128 = _mm_and_si128(_mm_srli_epi16(raw, 4), _mm_set1_epi8(0xF));
+            __m128i bias = _mm_set1_epi8(8);
+            lo_128 = _mm_sub_epi8(lo_128, bias);
+            hi_128 = _mm_sub_epi8(hi_128, bias);
+            __m256 acc = _mm256_setzero_ps();
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_128)), _mm256_loadu_ps(xb)));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo_128, 8))), _mm256_loadu_ps(xb + 8)));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_128)), _mm256_loadu_ps(xb + 16)));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi_128, 8))), _mm256_loadu_ps(xb + 24)));
+            row_sum += bn_avx2_hsum_ps(acc) * d;
+#elif defined(__wasm_simd128__)
+            v128_t raw = wasm_v128_load(blk->qs);
+            v128_t lo = wasm_i8x16_sub(wasm_v128_and(raw, wasm_i8x16_splat(0xF)), wasm_i8x16_splat(8));
+            v128_t hi = wasm_i8x16_sub(wasm_u8x16_shr(raw, 4), wasm_i8x16_splat(8));
+            v128_t acc0 = wasm_f32x4_splat(0), acc1 = wasm_f32x4_splat(0);
+            v128_t acc2 = wasm_f32x4_splat(0), acc3 = wasm_f32x4_splat(0);
+            // Low nibbles (elements 0-15)
+            {
+                v128_t lo16 = wasm_i16x8_extend_low_i8x16(lo);
+                v128_t hi16 = wasm_i16x8_extend_high_i8x16(lo);
+                acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(lo16)), wasm_v128_load(xb)));
+                acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(lo16)), wasm_v128_load(xb + 4)));
+                acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)), wasm_v128_load(xb + 8)));
+                acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), wasm_v128_load(xb + 12)));
+            }
+            // High nibbles (elements 16-31)
+            {
+                v128_t lo16 = wasm_i16x8_extend_low_i8x16(hi);
+                v128_t hi16 = wasm_i16x8_extend_high_i8x16(hi);
+                acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(lo16)), wasm_v128_load(xb + 16)));
+                acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(lo16)), wasm_v128_load(xb + 20)));
+                acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)), wasm_v128_load(xb + 24)));
+                acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), wasm_v128_load(xb + 28)));
+            }
+            v128_t sum = wasm_f32x4_add(wasm_f32x4_add(acc0, acc1), wasm_f32x4_add(acc2, acc3));
+            row_sum += bn_wasm_hsum_f32x4(sum) * d;
+#else
+            float block_sum = 0.0f;
+            for (int i = 0; i < 16; i++) {
+                uint8_t byte = blk->qs[i];
+                block_sum += ((int)(byte & 0xF) - 8) * xb[i];
+                block_sum += ((int)(byte >> 4) - 8) * xb[i + 16];
+            }
+            row_sum += block_sum * d;
+#endif
+        }
+        c->out[row] = row_sum;
+    }
+}
+
+#endif // !(NEON+DOTPROD) && !AVX2 — Q4_0 float fallback
+
+// --- Q6_K matrix-vector multiply ---
+
+typedef struct {
+    float *out;
+    const BnQWeight *W;
+    const float *x;
+} Q6KCtx;
+
+static void q6k_range(void *ctx, int row_start, int row_end) {
+    Q6KCtx *c = (Q6KCtx *)ctx;
+    int cols = c->W->cols;
+    int n_blocks_per_row = cols / BN_QK_K;
+    const BnBlockQ6K *blocks = (const BnBlockQ6K *)c->W->data;
+    const float *x = c->x;
+
+    for (int row = row_start; row < row_end; row++) {
+        float row_sum = 0.0f;
+        for (int b = 0; b < n_blocks_per_row; b++) {
+            const BnBlockQ6K *blk = &blocks[row * n_blocks_per_row + b];
+            float d = bn_fp16_to_fp32(blk->d);
+            const uint8_t *ql = blk->ql;
+            const uint8_t *qh = blk->qh;
+            const int8_t  *sc = blk->scales;
+            const float *xb = x + b * BN_QK_K;
+
+            for (int n = 0; n < BN_QK_K; n += 128) {
+                for (int l = 0; l < 32; l++) {
+                    int is = l / 16;
+                    int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    int q3 = (int)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    int q4 = (int)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+                    row_sum += d * sc[is + 0] * q1 * xb[l +  0];
+                    row_sum += d * sc[is + 2] * q2 * xb[l + 32];
+                    row_sum += d * sc[is + 4] * q3 * xb[l + 64];
+                    row_sum += d * sc[is + 6] * q4 * xb[l + 96];
+                }
+                xb += 128;
+                ql += 64;
+                qh += 32;
+                sc += 8;
+            }
+        }
+        c->out[row] = row_sum;
+    }
+}
+
+// --- Quantized matrix-vector multiply ---
 // out[rows] = W[rows x cols] @ x[cols]
 
 void bn_quant_matvec(float *out, const BnQWeight *W, const float *x,
@@ -629,12 +1297,62 @@ void bn_quant_matvec(float *out, const BnQWeight *W, const float *x,
         I2SFloatCtx ctx = { out, W, x };
         BnTPTask task = { i2s_neon_range, &ctx, W->rows };
         bn_tp_dispatch(pool, &task, 1);
+#elif defined(__AVX2__)
+        float x_scale = bn_quant_x_to_i8(x, x_q_buf, W->cols);
+        I2SCtx ctx = { out, W, x_q_buf, W->scale * x_scale };
+        BnTPTask task = { i2s_avx2_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
+#elif defined(__wasm_simd128__)
+        (void)x_q_buf;
+        I2SFloatCtx ctx = { out, W, x };
+        BnTPTask task = { i2s_wasm_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
 #else
         (void)x_q_buf;
         I2SFloatCtx ctx = { out, W, x };
         BnTPTask task = { i2s_scalar_range, &ctx, W->rows };
         bn_tp_dispatch(pool, &task, 1);
 #endif
+        return;
+    }
+
+    if (W->type == BN_GGUF_TENSOR_Q8_0) {
+        (void)x_q_buf;
+        Q8Ctx ctx = { out, W, x };
+        BnTPTask task = { q8_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
+        return;
+    }
+
+    if (W->type == BN_GGUF_TENSOR_Q4_0) {
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+        int n_blocks = W->cols / 32;
+        float x_scales[n_blocks];
+        bn_quant_x_to_q8_blocks(x, x_q_buf, x_scales, W->cols);
+        Q4SdotCtx ctx = { out, W, x_q_buf, x_scales };
+        BnTPTask task = { q4_sdot_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
+#elif defined(__AVX2__)
+        int n_blocks = W->cols / 32;
+        float x_scales[n_blocks];
+        bn_quant_x_to_q8_blocks(x, x_q_buf, x_scales, W->cols);
+        Q4SdotCtx ctx = { out, W, x_q_buf, x_scales };
+        BnTPTask task = { q4_sdot_avx2_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
+#else
+        (void)x_q_buf;
+        Q4Ctx ctx = { out, W, x };
+        BnTPTask task = { q4_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
+#endif
+        return;
+    }
+
+    if (W->type == BN_GGUF_TENSOR_Q6_K) {
+        (void)x_q_buf;
+        Q6KCtx ctx = { out, W, x };
+        BnTPTask task = { q6k_range, &ctx, W->rows };
+        bn_tp_dispatch(pool, &task, 1);
         return;
     }
 
@@ -665,23 +1383,22 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
     int cols = tasks[0].W->cols;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    int all_i2s = 1;
+    int all_i2s = 1, all_q4 = 1;
     for (int t = 0; t < n_tasks; t++) {
-        if (tasks[t].W->type != BN_GGUF_TENSOR_I2_S) { all_i2s = 0; break; }
+        if (tasks[t].W->type != BN_GGUF_TENSOR_I2_S) all_i2s = 0;
+        if (tasks[t].W->type != BN_GGUF_TENSOR_Q4_0) all_q4 = 0;
+        if (!all_i2s && !all_q4) break;
     }
 
     if (all_i2s) {
-        // Fall back to individual matvecs if too many tasks for stack arrays
         if (n_tasks > 4) {
             for (int t = 0; t < n_tasks; t++)
                 bn_quant_matvec(tasks[t].out, tasks[t].W, x, x_q_buf, pool);
             return;
         }
 
-        // Quantize x to int8 once, shared across all tasks
         float x_scale = bn_quant_x_to_i8(x, x_q_buf, cols);
 
-        // Build one BnTPTask per matvec task
         I2SCtx ctxs[4];
         BnTPTask tp_tasks[4];
 
@@ -689,6 +1406,69 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
             ctxs[t] = (I2SCtx){ tasks[t].out, tasks[t].W, x_q_buf,
                                 tasks[t].W->scale * x_scale };
             tp_tasks[t] = (BnTPTask){ i2s_sdot_range, &ctxs[t], tasks[t].W->rows };
+        }
+
+        bn_tp_dispatch(pool, tp_tasks, n_tasks);
+        return;
+    }
+
+    if (all_q4 && n_tasks <= 4) {
+        int n_blocks = cols / 32;
+        float x_scales[n_blocks];
+        bn_quant_x_to_q8_blocks(x, x_q_buf, x_scales, cols);
+
+        Q4SdotCtx ctxs[4];
+        BnTPTask tp_tasks[4];
+
+        for (int t = 0; t < n_tasks; t++) {
+            ctxs[t] = (Q4SdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, x_scales };
+            tp_tasks[t] = (BnTPTask){ q4_sdot_range, &ctxs[t], tasks[t].W->rows };
+        }
+
+        bn_tp_dispatch(pool, tp_tasks, n_tasks);
+        return;
+    }
+#elif defined(__AVX2__)
+    int all_i2s = 1, all_q4 = 1;
+    for (int t = 0; t < n_tasks; t++) {
+        if (tasks[t].W->type != BN_GGUF_TENSOR_I2_S) all_i2s = 0;
+        if (tasks[t].W->type != BN_GGUF_TENSOR_Q4_0) all_q4 = 0;
+        if (!all_i2s && !all_q4) break;
+    }
+
+    if (all_i2s) {
+        if (n_tasks > 4) {
+            for (int t = 0; t < n_tasks; t++)
+                bn_quant_matvec(tasks[t].out, tasks[t].W, x, x_q_buf, pool);
+            return;
+        }
+
+        float x_scale = bn_quant_x_to_i8(x, x_q_buf, cols);
+
+        I2SCtx ctxs[4];
+        BnTPTask tp_tasks[4];
+
+        for (int t = 0; t < n_tasks; t++) {
+            ctxs[t] = (I2SCtx){ tasks[t].out, tasks[t].W, x_q_buf,
+                                tasks[t].W->scale * x_scale };
+            tp_tasks[t] = (BnTPTask){ i2s_avx2_range, &ctxs[t], tasks[t].W->rows };
+        }
+
+        bn_tp_dispatch(pool, tp_tasks, n_tasks);
+        return;
+    }
+
+    if (all_q4 && n_tasks <= 4) {
+        int n_blocks = cols / 32;
+        float x_scales[n_blocks];
+        bn_quant_x_to_q8_blocks(x, x_q_buf, x_scales, cols);
+
+        Q4SdotCtx ctxs[4];
+        BnTPTask tp_tasks[4];
+
+        for (int t = 0; t < n_tasks; t++) {
+            ctxs[t] = (Q4SdotCtx){ tasks[t].out, tasks[t].W, x_q_buf, x_scales };
+            tp_tasks[t] = (BnTPTask){ q4_sdot_avx2_range, &ctxs[t], tasks[t].W->rows };
         }
 
         bn_tp_dispatch(pool, tp_tasks, n_tasks);

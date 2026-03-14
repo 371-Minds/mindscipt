@@ -20,7 +20,7 @@ emcc \
     "$PROJECT_DIR/wasm/api.c" \
     -I"$PROJECT_DIR/include" \
     -std=c11 -Wall -Wextra \
-    -O2 \
+    -O2 -msimd128 \
     -sWASM=1 \
     -sALLOW_MEMORY_GROWTH=1 \
     -sMAXIMUM_MEMORY=2147483648 \

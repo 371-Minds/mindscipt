@@ -355,12 +355,18 @@ static size_t tensor_type_size(uint32_t type, uint64_t nelements) {
     switch (type) {
         case BN_GGUF_TENSOR_F32:   return (size_t)nelements * 4;
         case BN_GGUF_TENSOR_F16:   return (size_t)nelements * 2;
+        // Q4_0: 18 bytes per 32-element block (2-byte FP16 scale + 16 nibble bytes)
+        case BN_GGUF_TENSOR_Q4_0:  return (size_t)(nelements / 32) * 18;
+        // Q8_0: 34 bytes per 32-element block (2-byte FP16 scale + 32 int8 bytes)
+        case BN_GGUF_TENSOR_Q8_0:  return (size_t)(nelements / 32) * 34;
         // I2_S: 2 bits per element + 4-byte per-tensor scale
         case BN_GGUF_TENSOR_I2_S:  return (size_t)(nelements / 4) + 4;
         // TQ1_0: 54 bytes per 256-element block
         case BN_GGUF_TENSOR_TQ1_0: return (size_t)(nelements / 256) * 54;
         // TQ2_0: 66 bytes per 256-element block
         case BN_GGUF_TENSOR_TQ2_0: return (size_t)(nelements / 256) * 66;
+        // Q6_K: 210 bytes per 256-element block
+        case BN_GGUF_TENSOR_Q6_K:  return (size_t)(nelements / 256) * 210;
         default: return 0;
     }
 }

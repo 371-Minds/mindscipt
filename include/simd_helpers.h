@@ -1,0 +1,82 @@
+#ifndef BN_SIMD_HELPERS_H
+#define BN_SIMD_HELPERS_H
+
+// Shared SIMD helper functions for AVX2 and WASM SIMD128.
+// Used by quant.c and transformer.c.
+
+#ifdef __AVX2__
+#include <immintrin.h>
+
+// Horizontal sum of 8 int32 lanes → scalar int32.
+static inline int32_t bn_avx2_hsum_epi32(__m256i v) {
+    __m128i lo = _mm256_castsi256_si128(v);
+    __m128i hi = _mm256_extracti128_si256(v, 1);
+    __m128i sum128 = _mm_add_epi32(lo, hi);
+    __m128i shuf = _mm_shuffle_epi32(sum128, _MM_SHUFFLE(1, 0, 3, 2));
+    sum128 = _mm_add_epi32(sum128, shuf);
+    shuf = _mm_shuffle_epi32(sum128, _MM_SHUFFLE(0, 1, 0, 1));
+    sum128 = _mm_add_epi32(sum128, shuf);
+    return _mm_cvtsi128_si32(sum128);
+}
+
+// Horizontal sum of 8 floats → scalar float.
+static inline float bn_avx2_hsum_ps(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 sum128 = _mm_add_ps(lo, hi);
+    __m128 shuf = _mm_movehdup_ps(sum128);        // [1,1,3,3]
+    sum128 = _mm_add_ps(sum128, shuf);
+    shuf = _mm_movehl_ps(shuf, sum128);            // [2,3,...]
+    sum128 = _mm_add_ss(sum128, shuf);
+    return _mm_cvtss_f32(sum128);
+}
+
+// Horizontal max of 8 floats → scalar float.
+static inline float bn_avx2_hmax_ps(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 max128 = _mm_max_ps(lo, hi);
+    __m128 shuf = _mm_movehdup_ps(max128);
+    max128 = _mm_max_ps(max128, shuf);
+    shuf = _mm_movehl_ps(shuf, max128);
+    max128 = _mm_max_ss(max128, shuf);
+    return _mm_cvtss_f32(max128);
+}
+
+// Signed×signed byte dot product accumulate (no VNNI needed).
+// Uses the sign trick: maddubs requires unsigned×signed, so we
+// compute abs(a)×sign(a,b) where sign(a,b) flips b's sign where a<0.
+// Then _mm256_maddubs_epi16 (u8×s8→s16 pairs) + _mm256_madd_epi16 (→s32).
+static inline __m256i bn_avx2_dpbusd(__m256i acc, __m256i a, __m256i b) {
+    __m256i sign_a = _mm256_sign_epi8(a, a);       // abs(a) — treats 0x80 as negative
+    __m256i sign_b = _mm256_sign_epi8(b, a);       // b with sign of a applied
+    __m256i prod16 = _mm256_maddubs_epi16(sign_a, sign_b);  // u8×s8 → s16 pairs
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(prod16, _mm256_set1_epi16(1)));
+}
+
+#endif // __AVX2__
+
+#ifdef __wasm_simd128__
+#include <wasm_simd128.h>
+
+// Horizontal sum of 4 floats → scalar float.
+static inline float bn_wasm_hsum_f32x4(v128_t v) {
+    v128_t shuf = wasm_i32x4_shuffle(v, v, 2, 3, 0, 1);
+    v128_t sum = wasm_f32x4_add(v, shuf);
+    shuf = wasm_i32x4_shuffle(sum, sum, 1, 0, 3, 2);
+    sum = wasm_f32x4_add(sum, shuf);
+    return wasm_f32x4_extract_lane(sum, 0);
+}
+
+// Horizontal max of 4 floats → scalar float.
+static inline float bn_wasm_hmax_f32x4(v128_t v) {
+    v128_t shuf = wasm_i32x4_shuffle(v, v, 2, 3, 0, 1);
+    v128_t mx = wasm_f32x4_max(v, shuf);
+    shuf = wasm_i32x4_shuffle(mx, mx, 1, 0, 3, 2);
+    mx = wasm_f32x4_max(mx, shuf);
+    return wasm_f32x4_extract_lane(mx, 0);
+}
+
+#endif // __wasm_simd128__
+
+#endif // BN_SIMD_HELPERS_H
