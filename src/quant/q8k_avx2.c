@@ -20,8 +20,8 @@ void bn_quant_q8k_avx2_range(void *ctx, int row_start, int row_end) {
             __m256 acc = _mm256_setzero_ps();
             for (int i = 0; i < BN_QK_K; i += 16) {
                 __m128i w = _mm_loadu_si128((const __m128i *)(blk->qs + i));
-                acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w)), _mm256_loadu_ps(xb + i)));
-                acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(w, 8))), _mm256_loadu_ps(xb + i + 8)));
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w)), _mm256_loadu_ps(xb + i), acc);
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(w, 8))), _mm256_loadu_ps(xb + i + 8), acc);
             }
             row_sum += bn_avx2_hsum_ps(acc) * d;
         }

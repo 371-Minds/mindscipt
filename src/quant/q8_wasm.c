@@ -21,14 +21,26 @@ void bn_quant_q8_wasm_range(void *ctx, int row_start, int row_end) {
                 v128_t lo16 = wasm_i16x8_extend_low_i8x16(w);
                 v128_t hi16 = wasm_i16x8_extend_high_i8x16(w);
                 const float *xp = xb + i * 16;
+#ifdef __wasm_relaxed_simd__
+                acc0 = wasm_f32x4_relaxed_madd(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(lo16)),  wasm_v128_load(xp),      acc0);
+                acc1 = wasm_f32x4_relaxed_madd(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(lo16)), wasm_v128_load(xp + 4),  acc1);
+                acc2 = wasm_f32x4_relaxed_madd(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)),  wasm_v128_load(xp + 8),  acc2);
+                acc3 = wasm_f32x4_relaxed_madd(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), wasm_v128_load(xp + 12), acc3);
+#else
                 acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(lo16)), wasm_v128_load(xp)));
                 acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(lo16)), wasm_v128_load(xp + 4)));
                 acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)), wasm_v128_load(xp + 8)));
                 acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), wasm_v128_load(xp + 12)));
+#endif
             }
             v128_t sum = wasm_f32x4_add(wasm_f32x4_add(acc0, acc1), wasm_f32x4_add(acc2, acc3));
             row_sum += bn_wasm_hsum_f32x4(sum) * d;
         }
         c->out[row] = row_sum;
     }
+}
+
+// Stub for WASM SDOT (declared but Q8 doesn't use separate SDOT dispatch)
+void bn_quant_q8_wasm_sdot_range(void *ctx, int row_start, int row_end) {
+    (void)ctx; (void)row_start; (void)row_end;
 }

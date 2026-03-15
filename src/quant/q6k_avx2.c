@@ -47,8 +47,8 @@ void bn_quant_q6k_avx2_range(void *ctx, int row_start, int row_end) {
                     __m256 vds = _mm256_set1_ps(d * (float)(scale_val)); \
                     __m256 w_lo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w128)), vds); \
                     __m256 w_hi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(w128, 8))), vds); \
-                    acc = _mm256_add_ps(acc, _mm256_mul_ps(w_lo, _mm256_loadu_ps(xp))); \
-                    acc = _mm256_add_ps(acc, _mm256_mul_ps(w_hi, _mm256_loadu_ps(xp + 8))); \
+                    acc = _mm256_fmadd_ps(w_lo, _mm256_loadu_ps(xp), acc); \
+                    acc = _mm256_fmadd_ps(w_hi, _mm256_loadu_ps(xp + 8), acc); \
                 } while(0)
 
                 Q6K_AVX2_ACC_16(w0a, xb +   0, sc[0]);

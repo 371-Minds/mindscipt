@@ -44,7 +44,7 @@ void bn_quant_iq3s_avx2_range(void *ctx, int row_start, int row_end) {
                 for (int g = 0; g < 32; g += 8) {
                     __m256 wf = _mm256_loadu_ps(tmp + g);
                     __m256 xf = _mm256_loadu_ps(xb + g);
-                    acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_mul_ps(wf, vdl), xf));
+                    acc = _mm256_fmadd_ps(_mm256_mul_ps(wf, vdl), xf, acc);
                 }
                 xb += 32;
             }

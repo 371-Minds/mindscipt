@@ -25,8 +25,8 @@ void bn_quant_bf16_avx2_range(void *ctx, int row_start, int row_end) {
             __m256 wf_lo = _mm256_castsi256_ps(w32_lo);
             __m256 wf_hi = _mm256_castsi256_ps(w32_hi);
 
-            acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(wf_lo, _mm256_loadu_ps(x + col)));
-            acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(wf_hi, _mm256_loadu_ps(x + col + 8)));
+            acc0 = _mm256_fmadd_ps(wf_lo, _mm256_loadu_ps(x + col), acc0);
+            acc1 = _mm256_fmadd_ps(wf_hi, _mm256_loadu_ps(x + col + 8), acc1);
         }
 
         float row_sum = bn_avx2_hsum_ps(_mm256_add_ps(acc0, acc1));

@@ -28,6 +28,20 @@ void bn_quant_q5k_wasm_range(void *ctx, int row_start, int row_end) {
                 uint8_t sc, m;
                 int sub = j / 32;
 
+                #ifdef __wasm_relaxed_simd__
+                #define Q5K_WASM_ACC_16(w_vec, xp, vds, vdm) do { \
+                    v128_t lo16 = wasm_i16x8_extend_low_i8x16(w_vec); \
+                    v128_t hi16 = wasm_i16x8_extend_high_i8x16(w_vec); \
+                    v128_t w0f = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(lo16)), vds), vdm); \
+                    v128_t w1f = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(lo16)), vds), vdm); \
+                    v128_t w2f = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)), vds), vdm); \
+                    v128_t w3f = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), vds), vdm); \
+                    acc0 = wasm_f32x4_relaxed_madd(w0f, wasm_v128_load(xp), acc0); \
+                    acc1 = wasm_f32x4_relaxed_madd(w1f, wasm_v128_load(xp + 4), acc1); \
+                    acc2 = wasm_f32x4_relaxed_madd(w2f, wasm_v128_load(xp + 8), acc2); \
+                    acc3 = wasm_f32x4_relaxed_madd(w3f, wasm_v128_load(xp + 12), acc3); \
+                } while(0)
+                #else
                 #define Q5K_WASM_ACC_16(w_vec, xp, vds, vdm) do { \
                     v128_t lo16 = wasm_i16x8_extend_low_i8x16(w_vec); \
                     v128_t hi16 = wasm_i16x8_extend_high_i8x16(w_vec); \
@@ -40,6 +54,7 @@ void bn_quant_q5k_wasm_range(void *ctx, int row_start, int row_end) {
                     acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(w2f, wasm_v128_load(xp + 8))); \
                     acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(w3f, wasm_v128_load(xp + 12))); \
                 } while(0)
+                #endif
 
                 uint8_t lo0[16], lo1[16], hi0[16], hi1[16];
                 for (int l = 0; l < 16; l++) {

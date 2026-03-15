@@ -40,19 +40,33 @@ void bn_quant_iq4xs_wasm_range(void *ctx, int row_start, int row_end) {
                     v128_t w = wasm_v128_load(tmp);
                     v128_t lo16 = wasm_i16x8_extend_low_i8x16(w);
                     v128_t hi16 = wasm_i16x8_extend_high_i8x16(w);
+#ifdef __wasm_relaxed_simd__
+                    acc0 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(lo16)), vdl), wasm_v128_load(xb), acc0);
+                    acc1 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(lo16)), vdl), wasm_v128_load(xb + 4), acc1);
+                    acc2 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)), vdl), wasm_v128_load(xb + 8), acc2);
+                    acc3 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), vdl), wasm_v128_load(xb + 12), acc3);
+#else
                     acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(lo16)), vdl), wasm_v128_load(xb)));
                     acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(lo16)), vdl), wasm_v128_load(xb + 4)));
                     acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)), vdl), wasm_v128_load(xb + 8)));
                     acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), vdl), wasm_v128_load(xb + 12)));
+#endif
                 }
                 {
                     v128_t w = wasm_v128_load(tmp + 16);
                     v128_t lo16 = wasm_i16x8_extend_low_i8x16(w);
                     v128_t hi16 = wasm_i16x8_extend_high_i8x16(w);
+#ifdef __wasm_relaxed_simd__
+                    acc0 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(lo16)), vdl), wasm_v128_load(xb + 16), acc0);
+                    acc1 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(lo16)), vdl), wasm_v128_load(xb + 20), acc1);
+                    acc2 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)), vdl), wasm_v128_load(xb + 24), acc2);
+                    acc3 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), vdl), wasm_v128_load(xb + 28), acc3);
+#else
                     acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(lo16)), vdl), wasm_v128_load(xb + 16)));
                     acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(lo16)), vdl), wasm_v128_load(xb + 20)));
                     acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)), vdl), wasm_v128_load(xb + 24)));
                     acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), vdl), wasm_v128_load(xb + 28)));
+#endif
                 }
 
                 qs += 16;

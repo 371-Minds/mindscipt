@@ -18,21 +18,22 @@ void bn_quant_q2k_neon_range(void *ctx, int row_start, int row_end) {
             const uint8_t *q = blk->qs;
             const float *xb = x + b * BN_QK_K;
 
+            const uint8x16_t mask2 = vdupq_n_u8(3);
             float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
             float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
 
             int is = 0, out_idx = 0;
             for (int n = 0; n < BN_QK_K; n += 128) {
+                uint8x16_t q0_vec = vld1q_u8(q);
+                uint8x16_t q1_vec = vld1q_u8(q + 16);
                 int shift = 0;
                 for (int j = 0; j < 4; j++) {
+                    int8x16_t neg_shift = vdupq_n_s8(-(int8_t)shift);
                     {
                         uint8_t sc = blk->scales[is++];
                         float32x4_t vds = vdupq_n_f32(d * (sc & 0xF));
                         float32x4_t vdm = vdupq_n_f32(dmin * (sc >> 4));
-                        int8_t tmp[16];
-                        for (int l = 0; l < 16; l++)
-                            tmp[l] = (int8_t)((q[l] >> shift) & 3);
-                        int8x16_t w = vld1q_s8(tmp);
+                        int8x16_t w = vreinterpretq_s8_u8(vandq_u8(vshlq_u8(q0_vec, neg_shift), mask2));
                         int16x8_t lo16 = vmovl_s8(vget_low_s8(w));
                         int16x8_t hi16 = vmovl_s8(vget_high_s8(w));
                         const float *xp = xb + out_idx;
@@ -46,10 +47,7 @@ void bn_quant_q2k_neon_range(void *ctx, int row_start, int row_end) {
                         uint8_t sc = blk->scales[is++];
                         float32x4_t vds = vdupq_n_f32(d * (sc & 0xF));
                         float32x4_t vdm = vdupq_n_f32(dmin * (sc >> 4));
-                        int8_t tmp[16];
-                        for (int l = 0; l < 16; l++)
-                            tmp[l] = (int8_t)((q[l + 16] >> shift) & 3);
-                        int8x16_t w = vld1q_s8(tmp);
+                        int8x16_t w = vreinterpretq_s8_u8(vandq_u8(vshlq_u8(q1_vec, neg_shift), mask2));
                         int16x8_t lo16 = vmovl_s8(vget_low_s8(w));
                         int16x8_t hi16 = vmovl_s8(vget_high_s8(w));
                         const float *xp = xb + out_idx;

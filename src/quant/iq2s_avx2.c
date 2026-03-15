@@ -21,7 +21,7 @@ void bn_quant_iq2s_avx2_range(void *ctx, int row_start, int row_end) {
             for (int i = 0; i < BN_QK_K; i += 8) {
                 __m256 w = _mm256_loadu_ps(tmp + i);
                 __m256 xv = _mm256_loadu_ps(xb + i);
-                acc = _mm256_add_ps(acc, _mm256_mul_ps(w, xv));
+                acc = _mm256_fmadd_ps(w, xv, acc);
             }
             row_sum += bn_avx2_hsum_ps(acc);
         }

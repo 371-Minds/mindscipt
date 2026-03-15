@@ -1,0 +1,369 @@
+// bench_kernels.c — per-kernel matvec benchmark for bitnet.c
+// Compilable for native (NEON/AVX2) and WASM (emcc + Node.js).
+// Usage: ./bench model.gguf [--iters N] [--threads T]
+
+#include "platform.h"
+#include "gguf.h"
+#include "model.h"
+#include "quant.h"
+#include "transformer.h"
+#include "sampler.h"
+#include "threadpool.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+static const char *type_name(int type) {
+    switch (type) {
+        case BN_GGUF_TENSOR_F32:     return "F32";
+        case BN_GGUF_TENSOR_F16:     return "F16";
+        case BN_GGUF_TENSOR_Q4_0:    return "Q4_0";
+        case BN_GGUF_TENSOR_Q4_1:    return "Q4_1";
+        case BN_GGUF_TENSOR_Q8_0:    return "Q8_0";
+        case BN_GGUF_TENSOR_Q2_K:    return "Q2_K";
+        case BN_GGUF_TENSOR_Q3_K:    return "Q3_K";
+        case BN_GGUF_TENSOR_Q4_K:    return "Q4_K";
+        case BN_GGUF_TENSOR_Q5_K:    return "Q5_K";
+        case BN_GGUF_TENSOR_Q6_K:    return "Q6_K";
+        case BN_GGUF_TENSOR_Q8_K:    return "Q8_K";
+        case BN_GGUF_TENSOR_IQ2_XXS: return "IQ2_XXS";
+        case BN_GGUF_TENSOR_IQ2_XS:  return "IQ2_XS";
+        case BN_GGUF_TENSOR_IQ2_S:   return "IQ2_S";
+        case BN_GGUF_TENSOR_IQ3_XXS: return "IQ3_XXS";
+        case BN_GGUF_TENSOR_IQ3_S:   return "IQ3_S";
+        case BN_GGUF_TENSOR_IQ4_NL:  return "IQ4_NL";
+        case BN_GGUF_TENSOR_IQ4_XS:  return "IQ4_XS";
+        case BN_GGUF_TENSOR_BF16:    return "BF16";
+        case BN_GGUF_TENSOR_TQ1_0:   return "TQ1_0";
+        case BN_GGUF_TENSOR_TQ2_0:   return "TQ2_0";
+        case BN_GGUF_TENSOR_I2_S:    return "I2_S";
+        default:                     return "???";
+    }
+}
+
+static const char *backend_name(void) {
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    return "ARM NEON + SDOT";
+#elif defined(__ARM_NEON)
+    return "ARM NEON";
+#elif defined(__AVX2__)
+    return "AVX2";
+#elif defined(__wasm_simd128__)
+  #ifdef __wasm_relaxed_simd__
+    return "WASM Relaxed SIMD";
+  #else
+    return "WASM SIMD128";
+  #endif
+#else
+    return "Scalar";
+#endif
+}
+
+// Simple LCG for deterministic random fill
+static uint32_t bench_rng_state = 42;
+static float bench_randf(void) {
+    bench_rng_state = bench_rng_state * 1664525u + 1013904223u;
+    return (float)(bench_rng_state >> 16) / 65536.0f - 0.5f;
+}
+
+typedef struct {
+    const char *name;
+    const BnQWeight *W;
+} BenchTarget;
+
+static void bench_matvec(const char *name, const BnQWeight *W,
+                          const float *x, int8_t *x_q, BnThreadPool *pool,
+                          int n_iters) {
+    float *out = calloc((size_t)W->rows, sizeof(float));
+    if (!out) return;
+
+    // Warmup
+    for (int i = 0; i < 5; i++)
+        bn_quant_matvec(out, W, x, x_q, pool);
+
+    // Timed iterations
+    double t0 = bn_platform_time_ms();
+    for (int i = 0; i < n_iters; i++)
+        bn_quant_matvec(out, W, x, x_q, pool);
+    double elapsed = bn_platform_time_ms() - t0;
+
+    double us_per_call = (elapsed * 1000.0) / n_iters;
+
+    // Compute weight data size for bandwidth
+    // For block-quantized formats, compute actual bytes from block sizes
+    size_t weight_bytes = 0;
+    int cols = W->cols, rows = W->rows;
+    switch (W->type) {
+        case BN_GGUF_TENSOR_I2_S:     weight_bytes = (size_t)rows * cols / 4; break;
+        case BN_GGUF_TENSOR_TQ1_0:    weight_bytes = (size_t)rows * (cols / 256) * 54; break;
+        case BN_GGUF_TENSOR_TQ2_0:    weight_bytes = (size_t)rows * (cols / 256) * 66; break;
+        case BN_GGUF_TENSOR_Q4_0:     weight_bytes = (size_t)rows * (cols / 32) * 18; break;
+        case BN_GGUF_TENSOR_Q4_1:     weight_bytes = (size_t)rows * (cols / 32) * 20; break;
+        case BN_GGUF_TENSOR_Q8_0:     weight_bytes = (size_t)rows * (cols / 32) * 34; break;
+        case BN_GGUF_TENSOR_Q2_K:     weight_bytes = (size_t)rows * (cols / 256) * 84; break;
+        case BN_GGUF_TENSOR_Q3_K:     weight_bytes = (size_t)rows * (cols / 256) * 110; break;
+        case BN_GGUF_TENSOR_Q4_K:     weight_bytes = (size_t)rows * (cols / 256) * 144; break;
+        case BN_GGUF_TENSOR_Q5_K:     weight_bytes = (size_t)rows * (cols / 256) * 176; break;
+        case BN_GGUF_TENSOR_Q6_K:     weight_bytes = (size_t)rows * (cols / 256) * 210; break;
+        case BN_GGUF_TENSOR_Q8_K:     weight_bytes = (size_t)rows * (cols / 256) * 292; break;
+        case BN_GGUF_TENSOR_BF16:     weight_bytes = (size_t)rows * cols * 2; break;
+        case BN_GGUF_TENSOR_F16:      weight_bytes = (size_t)rows * cols * 2; break;
+        case BN_GGUF_TENSOR_F32:      weight_bytes = (size_t)rows * cols * 4; break;
+        case BN_GGUF_TENSOR_IQ4_NL:   weight_bytes = (size_t)rows * (cols / 32) * 18; break;
+        case BN_GGUF_TENSOR_IQ4_XS:   weight_bytes = (size_t)rows * (cols / 256) * 136; break;
+        case BN_GGUF_TENSOR_IQ3_XXS:  weight_bytes = (size_t)rows * (cols / 256) * 98; break;
+        case BN_GGUF_TENSOR_IQ3_S:    weight_bytes = (size_t)rows * (cols / 256) * 114; break;
+        case BN_GGUF_TENSOR_IQ2_XXS:  weight_bytes = (size_t)rows * (cols / 256) * 66; break;
+        case BN_GGUF_TENSOR_IQ2_XS:   weight_bytes = (size_t)rows * (cols / 256) * 74; break;
+        case BN_GGUF_TENSOR_IQ2_S:    weight_bytes = (size_t)rows * (cols / 256) * 82; break;
+        default:                      weight_bytes = (size_t)rows * cols; break;
+    }
+    // Add activation vector read
+    size_t total_bytes = weight_bytes + (size_t)cols * sizeof(float);
+    double gb_per_s = (total_bytes / 1e9) / (us_per_call / 1e6);
+
+    printf("%-8s | %-7s | %5d x %-5d | %8.1f | %5.2f\n",
+           name, type_name(W->type), W->rows, W->cols, us_per_call, gb_per_s);
+
+    free(out);
+}
+
+static void bench_logits_f16(const BnModel *m, const float *x, int n_iters) {
+    int vocab = m->config.vocab_size;
+    int dim = m->config.dim;
+    float *logits = calloc((size_t)vocab, sizeof(float));
+    if (!logits) return;
+
+    const uint16_t *emb = (const uint16_t *)m->weights.token_embedding;
+
+    // Use the model's matvec through output_weight if it exists,
+    // otherwise benchmark the logits embedding path directly.
+    // For F16 embeddings, we do a manual dot product benchmark.
+
+    // Warmup
+    for (int i = 0; i < 5; i++) {
+        for (int v = 0; v < vocab; v++) {
+            const uint16_t *row = emb + (size_t)v * dim;
+            float sum = 0.0f;
+            for (int d = 0; d < dim; d++)
+                sum += bn_fp16_to_fp32(row[d]) * x[d];
+            logits[v] = sum;
+        }
+    }
+
+    double t0 = bn_platform_time_ms();
+    for (int iter = 0; iter < n_iters; iter++) {
+        for (int v = 0; v < vocab; v++) {
+            const uint16_t *row = emb + (size_t)v * dim;
+            float sum = 0.0f;
+            for (int d = 0; d < dim; d++)
+                sum += bn_fp16_to_fp32(row[d]) * x[d];
+            logits[v] = sum;
+        }
+    }
+    double elapsed = bn_platform_time_ms() - t0;
+    double us_per_call = (elapsed * 1000.0) / n_iters;
+    size_t total_bytes = (size_t)vocab * dim * 2 + (size_t)dim * sizeof(float);
+    double gb_per_s = (total_bytes / 1e9) / (us_per_call / 1e6);
+
+    printf("%-8s | %-7s | %5d x %-5d | %8.1f | %5.2f\n",
+           "logits", "F16", vocab, dim, us_per_call, gb_per_s);
+
+    free(logits);
+}
+
+static void bench_logits_real(const BnModel *m, int n_iters, BnThreadPool *pool) {
+    // Use the actual transformer logits path via a forward pass on token 0
+    int dim = m->config.dim;
+    int vocab = m->config.vocab_size;
+
+    // Build a fake x vector
+    float *x = calloc((size_t)dim, sizeof(float));
+    float *logits = calloc((size_t)vocab, sizeof(float));
+    int8_t *x_q = calloc((size_t)dim, sizeof(int8_t));
+    if (!x || !logits || !x_q) { free(x); free(logits); free(x_q); return; }
+
+    for (int i = 0; i < dim; i++) x[i] = bench_randf();
+
+    // If model has output_weight (untied embeddings), benchmark that
+    if (m->weights.output_weight.data) {
+        const BnQWeight *W = &m->weights.output_weight;
+
+        // Warmup
+        for (int i = 0; i < 5; i++)
+            bn_quant_matvec(logits, W, x, x_q, pool);
+
+        double t0 = bn_platform_time_ms();
+        for (int i = 0; i < n_iters; i++)
+            bn_quant_matvec(logits, W, x, x_q, pool);
+        double elapsed = bn_platform_time_ms() - t0;
+        double us_per_call = (elapsed * 1000.0) / n_iters;
+
+        // Rough bandwidth
+        size_t total_bytes = (size_t)vocab * dim / 2; // approximate
+        double gb_per_s = (total_bytes / 1e9) / (us_per_call / 1e6);
+
+        printf("%-8s | %-7s | %5d x %-5d | %8.1f | %5.2f\n",
+               "logits", type_name(W->type), W->rows, W->cols, us_per_call, gb_per_s);
+    }
+
+    free(x);
+    free(logits);
+    free(x_q);
+}
+
+static void bench_toks(BnModel *m, int n_gen) {
+    // Generate tokens and measure throughput
+    int warmup = 4;
+    int total = warmup + n_gen;
+
+    BnSampler sampler;
+    bn_sampler_init(&sampler, m->config.vocab_size, 0.0f, 0.9f, 42);
+
+    // Feed BOS token at pos 0
+    float *logits = bn_transformer_forward(m, 1, 0);  // token 1 = BOS for most models
+    if (!logits) {
+        fprintf(stderr, "Forward pass failed\n");
+        bn_sampler_free(&sampler);
+        return;
+    }
+    int next = bn_sampler_sample(&sampler, logits);
+
+    // Warmup + timed generation
+    double t_start = 0;
+    for (int i = 0; i < total; i++) {
+        if (i == warmup) t_start = bn_platform_time_ms();
+        logits = bn_transformer_forward(m, next, i + 1);
+        if (!logits) break;
+        next = bn_sampler_sample(&sampler, logits);
+    }
+    double elapsed = bn_platform_time_ms() - t_start;
+    double toks_per_sec = (double)n_gen / (elapsed / 1000.0);
+
+    printf("\nThroughput: %.1f tok/s  (%d tokens in %.0f ms, %d warmup)\n",
+           toks_per_sec, n_gen, elapsed, warmup);
+
+    bn_sampler_free(&sampler);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s model.gguf [--iters N] [--threads T] [--toks N]\n", argv[0]);
+        return 1;
+    }
+
+    const char *model_path = argv[1];
+    int n_iters = 100;
+    int n_threads = 1;
+    int n_toks = 32;
+
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc)
+            n_iters = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc)
+            n_threads = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--toks") == 0 && i + 1 < argc)
+            n_toks = atoi(argv[++i]);
+    }
+
+    // Load model
+    BnMappedFile mf = bn_platform_load_file(model_path);
+    if (!mf.data) {
+        fprintf(stderr, "Failed to load %s\n", model_path);
+        return 1;
+    }
+
+    BnGGUFFile *gf = bn_gguf_open(mf.data, mf.size);
+    if (!gf) {
+        fprintf(stderr, "Failed to parse GGUF\n");
+        bn_platform_unload_file(&mf);
+        return 1;
+    }
+
+    BnModel model = {0};
+    model.file = mf;
+    if (bn_model_load(&model, gf, 32, 0) != 0) {
+        fprintf(stderr, "Failed to load model\n");
+        bn_gguf_free(gf);
+        bn_platform_unload_file(&mf);
+        return 1;
+    }
+
+    // Extract model name from path
+    const char *fname = strrchr(model_path, '/');
+    fname = fname ? fname + 1 : model_path;
+
+    // Create thread pool if requested
+    BnThreadPool *pool = NULL;
+    if (n_threads > 1)
+        pool = bn_tp_create(n_threads - 1);
+
+    // Allocate input buffers
+    int dim = model.config.dim;
+    int hidden_dim = model.config.hidden_dim;
+    int buf_size = dim > hidden_dim ? dim : hidden_dim;
+
+    float *x = calloc((size_t)buf_size, sizeof(float));
+    int8_t *x_q = calloc((size_t)buf_size, sizeof(int8_t));
+    if (!x || !x_q) {
+        fprintf(stderr, "Failed to allocate buffers\n");
+        bn_model_free(&model);
+        bn_gguf_free(gf);
+        return 1;
+    }
+
+    // Fill with random data
+    for (int i = 0; i < buf_size; i++) x[i] = bench_randf();
+
+    // Print header
+    printf("Backend: %-20s | Model: %-30s | Iters: %d | Threads: %d\n",
+           backend_name(), fname, n_iters, pool ? bn_tp_num_threads(pool) : 1);
+    printf("%-8s | %-7s | %-13s | %8s | %s\n",
+           "Matrix", "Format", "Dims", "us/call", "GB/s");
+    printf("---------|---------|---------------|----------|------\n");
+
+    // Benchmark layer 0 weight matrices
+    BnLayerWeights *L = &model.weights.layers[0];
+
+    BenchTarget targets[] = {
+        { "wq",   &L->wq },
+        { "wk",   &L->wk },
+        { "wv",   &L->wv },
+        { "wo",   &L->wo },
+        { "up",   &L->ffn_up },
+        { "down",  &L->ffn_down },
+    };
+    int n_targets = sizeof(targets) / sizeof(targets[0]);
+
+    // Add gate if present
+    BenchTarget gate_target = { "gate", &L->ffn_gate };
+
+    for (int i = 0; i < n_targets; i++) {
+        if (targets[i].W->data)
+            bench_matvec(targets[i].name, targets[i].W, x, x_q, pool, n_iters);
+    }
+    if (model.config.has_ffn_gate && gate_target.W->data)
+        bench_matvec(gate_target.name, gate_target.W, x, x_q, pool, n_iters);
+
+    // Benchmark logits
+    if (model.weights.output_weight.data) {
+        bench_logits_real(&model, n_iters, pool);
+    } else if (model.weights.emb_type == BN_GGUF_TENSOR_F16) {
+        bench_logits_f16(&model, x, n_iters);
+    }
+
+    // Tok/s benchmark (forward pass)
+    model.pool = pool;
+    bench_toks(&model, n_toks);
+    model.pool = NULL;  // don't double-free
+
+    // Cleanup
+    free(x);
+    free(x_q);
+    if (pool) bn_tp_free(pool);
+    bn_model_free(&model);
+    bn_gguf_free(gf);
+
+    return 0;
+}

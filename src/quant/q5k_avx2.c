@@ -2,6 +2,24 @@
 #include "simd_helpers.h"
 #include <immintrin.h>
 
+// Extract 16 high bits from qh bitfield starting at bit_offset (must be multiple of 16).
+// Returns 16 bytes, each 0x00 or 0x10 (the 5th bit in position 4).
+static inline __m128i q5k_extract_hb(__m256i qh256, int bit_offset) {
+    uint8_t qh_bytes[32];
+    _mm256_storeu_si256((__m256i *)qh_bytes, qh256);
+    uint16_t bits16;
+    memcpy(&bits16, qh_bytes + bit_offset / 8, sizeof(uint16_t));
+
+    // Broadcast 16-bit value as [lo,hi,lo,hi,...], test each bit with per-byte masks
+    __m128i bcast = _mm_set1_epi16((int16_t)bits16);
+    const __m128i bit_masks = _mm_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, (char)128,
+        1, 2, 4, 8, 16, 32, 64, (char)128);
+    __m128i tested = _mm_and_si128(bcast, bit_masks);
+    __m128i is_zero = _mm_cmpeq_epi8(tested, _mm_setzero_si128());
+    return _mm_andnot_si128(is_zero, _mm_set1_epi8(0x10));
+}
+
 void bn_quant_q5k_avx2_range(void *ctx, int row_start, int row_end) {
     BnQ5KCtx *c = (BnQ5KCtx *)ctx;
     int cols = c->W->cols;
@@ -19,9 +37,9 @@ void bn_quant_q5k_avx2_range(void *ctx, int row_start, int row_end) {
             float d    = bn_fp16_to_fp32(blk->d);
             float dmin = bn_fp16_to_fp32(blk->dmin);
             const uint8_t *qs = blk->qs;
-            const uint8_t *qh = blk->qh;
             const float *xb = x + b * BN_QK_K;
 
+            __m256i qh256 = _mm256_loadu_si256((const __m256i *)blk->qh);
             __m256 acc = _mm256_setzero_ps();
 
             for (int j = 0; j < BN_QK_K; j += 64) {
@@ -30,25 +48,22 @@ void bn_quant_q5k_avx2_range(void *ctx, int row_start, int row_end) {
                 __m128i raw0 = _mm_loadu_si128((const __m128i *)qs);
                 __m128i raw1 = _mm_loadu_si128((const __m128i *)(qs + 16));
 
-                uint8_t lo_hb[16], lo_hb2[16], hi_hb[16], hi_hb2[16];
-                for (int l = 0; l < 16; l++) {
-                    lo_hb[l]  = ((qh[(j + l) / 8]      >> ((j + l) % 8))      & 1) << 4;
-                    lo_hb2[l] = ((qh[(j + 16 + l) / 8]  >> ((j + 16 + l) % 8))  & 1) << 4;
-                    hi_hb[l]  = ((qh[(j + 32 + l) / 8]  >> ((j + 32 + l) % 8))  & 1) << 4;
-                    hi_hb2[l] = ((qh[(j + 48 + l) / 8]  >> ((j + 48 + l) % 8))  & 1) << 4;
-                }
+                __m128i hb0 = q5k_extract_hb(qh256, j);
+                __m128i hb1 = q5k_extract_hb(qh256, j + 16);
+                __m128i hb2 = q5k_extract_hb(qh256, j + 32);
+                __m128i hb3 = q5k_extract_hb(qh256, j + 48);
 
                 bn_q4k_get_scale_min(sub, blk->scales, &sc, &m);
                 __m256 vds = _mm256_set1_ps(d * sc);
                 __m256 vdm = _mm256_set1_ps(dmin * m);
-                __m128i w0 = _mm_or_si128(_mm_and_si128(raw0, mask_lo), _mm_loadu_si128((const __m128i *)lo_hb));
-                __m128i w1 = _mm_or_si128(_mm_and_si128(raw1, mask_lo), _mm_loadu_si128((const __m128i *)lo_hb2));
+                __m128i w0 = _mm_or_si128(_mm_and_si128(raw0, mask_lo), hb0);
+                __m128i w1 = _mm_or_si128(_mm_and_si128(raw1, mask_lo), hb1);
 
                 #define Q5K_AVX2_ACC_16(w128, xp) do { \
-                    __m256 wf_lo = _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w128)), vds), vdm); \
-                    __m256 wf_hi = _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(w128, 8))), vds), vdm); \
-                    acc = _mm256_add_ps(acc, _mm256_mul_ps(wf_lo, _mm256_loadu_ps(xp))); \
-                    acc = _mm256_add_ps(acc, _mm256_mul_ps(wf_hi, _mm256_loadu_ps(xp + 8))); \
+                    __m256 wf_lo = _mm256_fmsub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w128)), vds, vdm); \
+                    __m256 wf_hi = _mm256_fmsub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(w128, 8))), vds, vdm); \
+                    acc = _mm256_fmadd_ps(wf_lo, _mm256_loadu_ps(xp), acc); \
+                    acc = _mm256_fmadd_ps(wf_hi, _mm256_loadu_ps(xp + 8), acc); \
                 } while(0)
 
                 Q5K_AVX2_ACC_16(w0, xb + j);
@@ -57,8 +72,8 @@ void bn_quant_q5k_avx2_range(void *ctx, int row_start, int row_end) {
                 bn_q4k_get_scale_min(sub + 1, blk->scales, &sc, &m);
                 vds = _mm256_set1_ps(d * sc);
                 vdm = _mm256_set1_ps(dmin * m);
-                w0 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(raw0, 4), mask_lo), _mm_loadu_si128((const __m128i *)hi_hb));
-                w1 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(raw1, 4), mask_lo), _mm_loadu_si128((const __m128i *)hi_hb2));
+                w0 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(raw0, 4), mask_lo), hb2);
+                w1 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(raw1, 4), mask_lo), hb3);
                 Q5K_AVX2_ACC_16(w0, xb + j + 32);
                 Q5K_AVX2_ACC_16(w1, xb + j + 48);
 

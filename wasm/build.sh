@@ -11,6 +11,7 @@ emcc \
     "$PROJECT_DIR/src/quant/fp16.c" \
     "$PROJECT_DIR/src/quant/dequant.c" \
     "$PROJECT_DIR/src/quant/dispatch.c" \
+    "$PROJECT_DIR/src/quant/x_quant_wasm.c" \
     "$PROJECT_DIR/src/quant/i2s_wasm.c" \
     "$PROJECT_DIR/src/quant/i2s_scalar.c" \
     "$PROJECT_DIR/src/quant/tq2_scalar.c" \
@@ -66,10 +67,10 @@ emcc \
     "$PROJECT_DIR/wasm/api.c" \
     -I"$PROJECT_DIR/include" \
     -std=c11 -Wall -Wextra \
-    -O2 -msimd128 \
+    -O3 -flto -msimd128 -mrelaxed-simd \
     -sWASM=1 \
     -sALLOW_MEMORY_GROWTH=1 \
-    -sMAXIMUM_MEMORY=2147483648 \
+    -sMAXIMUM_MEMORY=4294967296 \
     -sFILESYSTEM=0 \
     -sMODULARIZE=1 \
     -sEXPORT_NAME=BitNet \

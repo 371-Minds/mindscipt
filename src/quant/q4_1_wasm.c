@@ -29,7 +29,11 @@ void bn_quant_q4_1_wasm_range(void *ctx, int row_start, int row_end) {
             for (int i = 0; i < 32; i += 4) {
                 v128_t w = wasm_v128_load(tmp + i);
                 v128_t xv = wasm_v128_load(xb + i);
+#ifdef __wasm_relaxed_simd__
+                acc = wasm_f32x4_relaxed_madd(w, xv, acc);
+#else
                 acc = wasm_f32x4_add(acc, wasm_f32x4_mul(w, xv));
+#endif
                 xacc = wasm_f32x4_add(xacc, xv);
             }
 

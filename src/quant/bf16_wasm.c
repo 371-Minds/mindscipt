@@ -23,10 +23,17 @@ void bn_quant_bf16_wasm_range(void *ctx, int row_start, int row_end) {
                 uint32_t bits = (uint32_t)w[col + i] << 16;
                 memcpy(&tmp[i], &bits, 4);
             }
+#ifdef __wasm_relaxed_simd__
+            acc0 = wasm_f32x4_relaxed_madd(wasm_v128_load(&tmp[0]),  wasm_v128_load(x + col),      acc0);
+            acc1 = wasm_f32x4_relaxed_madd(wasm_v128_load(&tmp[4]),  wasm_v128_load(x + col + 4),  acc1);
+            acc2 = wasm_f32x4_relaxed_madd(wasm_v128_load(&tmp[8]),  wasm_v128_load(x + col + 8),  acc2);
+            acc3 = wasm_f32x4_relaxed_madd(wasm_v128_load(&tmp[12]), wasm_v128_load(x + col + 12), acc3);
+#else
             acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(wasm_v128_load(&tmp[0]),  wasm_v128_load(x + col)));
             acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(wasm_v128_load(&tmp[4]),  wasm_v128_load(x + col + 4)));
             acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(wasm_v128_load(&tmp[8]),  wasm_v128_load(x + col + 8)));
             acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(wasm_v128_load(&tmp[12]), wasm_v128_load(x + col + 12)));
+#endif
         }
 
         v128_t sum = wasm_f32x4_add(wasm_f32x4_add(acc0, acc1), wasm_f32x4_add(acc2, acc3));

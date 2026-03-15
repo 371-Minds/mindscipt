@@ -50,10 +50,17 @@ void bn_quant_iq3xxs_wasm_range(void *ctx, int row_start, int row_end) {
                     v128_t w1 = wasm_f32x4_mul(wasm_v128_load(tmp + g + 4), vdb);
                     v128_t w2 = wasm_f32x4_mul(wasm_v128_load(tmp + g + 8), vdb);
                     v128_t w3 = wasm_f32x4_mul(wasm_v128_load(tmp + g + 12), vdb);
+#ifdef __wasm_relaxed_simd__
+                    acc0 = wasm_f32x4_relaxed_madd(w0, wasm_v128_load(xb + g + 0), acc0);
+                    acc1 = wasm_f32x4_relaxed_madd(w1, wasm_v128_load(xb + g + 4), acc1);
+                    acc2 = wasm_f32x4_relaxed_madd(w2, wasm_v128_load(xb + g + 8), acc2);
+                    acc3 = wasm_f32x4_relaxed_madd(w3, wasm_v128_load(xb + g + 12), acc3);
+#else
                     acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(w0, wasm_v128_load(xb + g + 0)));
                     acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(w1, wasm_v128_load(xb + g + 4)));
                     acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(w2, wasm_v128_load(xb + g + 8)));
                     acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(w3, wasm_v128_load(xb + g + 12)));
+#endif
                 }
 
                 qs += 8;

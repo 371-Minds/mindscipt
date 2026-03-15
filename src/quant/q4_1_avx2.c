@@ -27,16 +27,16 @@ void bn_quant_q4_1_avx2_range(void *ctx, int row_start, int row_end) {
             // Lo nibbles (elements 0-15): unsigned quants
             __m256i i32_0 = _mm256_cvtepu8_epi32(lo);
             __m256i i32_1 = _mm256_cvtepu8_epi32(_mm_bsrli_si128(lo, 8));
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(i32_0), _mm256_loadu_ps(xb)));
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(i32_1), _mm256_loadu_ps(xb + 8)));
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i32_0), _mm256_loadu_ps(xb), acc);
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i32_1), _mm256_loadu_ps(xb + 8), acc);
             xacc = _mm256_add_ps(xacc, _mm256_loadu_ps(xb));
             xacc = _mm256_add_ps(xacc, _mm256_loadu_ps(xb + 8));
 
             // Hi nibbles (elements 16-31)
             __m256i i32_2 = _mm256_cvtepu8_epi32(hi);
             __m256i i32_3 = _mm256_cvtepu8_epi32(_mm_bsrli_si128(hi, 8));
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(i32_2), _mm256_loadu_ps(xb + 16)));
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(i32_3), _mm256_loadu_ps(xb + 24)));
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i32_2), _mm256_loadu_ps(xb + 16), acc);
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i32_3), _mm256_loadu_ps(xb + 24), acc);
             xacc = _mm256_add_ps(xacc, _mm256_loadu_ps(xb + 16));
             xacc = _mm256_add_ps(xacc, _mm256_loadu_ps(xb + 24));
 

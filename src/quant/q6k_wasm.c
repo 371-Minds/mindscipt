@@ -43,6 +43,17 @@ void bn_quant_q6k_wasm_range(void *ctx, int row_start, int row_end) {
                 v128_t acc0 = wasm_f32x4_splat(0), acc1 = wasm_f32x4_splat(0);
                 v128_t acc2 = wasm_f32x4_splat(0), acc3 = wasm_f32x4_splat(0);
 
+                #ifdef __wasm_relaxed_simd__
+                #define Q6K_WASM_ACC_16(w_vec, xp, scale_val) do { \
+                    v128_t vds = wasm_f32x4_splat(d * (float)(scale_val)); \
+                    v128_t lo16 = wasm_i16x8_extend_low_i8x16(w_vec); \
+                    v128_t hi16 = wasm_i16x8_extend_high_i8x16(w_vec); \
+                    acc0 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(lo16)), vds), wasm_v128_load(xp), acc0); \
+                    acc1 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(lo16)), vds), wasm_v128_load(xp + 4), acc1); \
+                    acc2 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)), vds), wasm_v128_load(xp + 8), acc2); \
+                    acc3 = wasm_f32x4_relaxed_madd(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), vds), wasm_v128_load(xp + 12), acc3); \
+                } while(0)
+                #else
                 #define Q6K_WASM_ACC_16(w_vec, xp, scale_val) do { \
                     v128_t vds = wasm_f32x4_splat(d * (float)(scale_val)); \
                     v128_t lo16 = wasm_i16x8_extend_low_i8x16(w_vec); \
@@ -52,6 +63,7 @@ void bn_quant_q6k_wasm_range(void *ctx, int row_start, int row_end) {
                     acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_low_i16x8(hi16)), vds), wasm_v128_load(xp + 8))); \
                     acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_extend_high_i16x8(hi16)), vds), wasm_v128_load(xp + 12))); \
                 } while(0)
+                #endif
 
                 Q6K_WASM_ACC_16(w0a, xb +   0, sc[0]);
                 Q6K_WASM_ACC_16(w0b, xb +  16, sc[1]);

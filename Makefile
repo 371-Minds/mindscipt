@@ -24,9 +24,9 @@ ifneq ($(filter arm% aarch%,$(UNAME_M)),)
   # ARM: NEON + NEON SDOT + scalar
   QUANT_BACKEND = src/quant/x_quant_neon.c \
     src/quant/i2s_neon_sdot.c src/quant/i2s_neon.c src/quant/i2s_scalar.c \
-    src/quant/tq2_neon.c src/quant/tq2_scalar.c \
+    src/quant/tq2_neon_sdot.c src/quant/tq2_neon.c src/quant/tq2_scalar.c \
     src/quant/tq1_neon_sdot.c src/quant/tq1_neon.c src/quant/tq1_scalar.c \
-    src/quant/q8_neon.c src/quant/q8_scalar.c \
+    src/quant/q8_neon_sdot.c src/quant/q8_neon.c src/quant/q8_scalar.c \
     src/quant/q4_neon_sdot.c src/quant/q4_neon.c src/quant/q4_scalar.c \
     src/quant/q4_1_neon.c src/quant/q4_1_scalar.c \
     src/quant/bf16_neon.c src/quant/bf16_scalar.c \
@@ -51,7 +51,8 @@ else
   # x86: AVX2 + scalar
   QUANT_BACKEND = src/quant/x_quant_avx2.c \
     src/quant/i2s_avx2.c src/quant/i2s_scalar.c \
-    src/quant/tq2_scalar.c src/quant/tq1_scalar.c \
+    src/quant/tq2_avx2.c src/quant/tq2_scalar.c \
+    src/quant/tq1_avx2.c src/quant/tq1_scalar.c \
     src/quant/q8_avx2.c src/quant/q8_scalar.c \
     src/quant/q4_avx2.c src/quant/q4_scalar.c \
     src/quant/q4_1_avx2.c src/quant/q4_1_scalar.c \
@@ -107,7 +108,15 @@ src/transformer/%.o: src/transformer/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # --- Tests ---
-.PHONY: debug asan test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 test_q2k pgo avx2-check clean
+# --- Benchmark ---
+BENCH_SRCS = bench/bench_kernels.c $(filter-out src/main.c, $(SRCS))
+
+bench_kernels: $(BENCH_SRCS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+.PHONY: debug asan bench test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 test_q2k pgo avx2-check clean
+
+bench: bench_kernels
 
 test: test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena
 
@@ -165,7 +174,7 @@ pgo:
 	@echo "=== PGO Step 3: Merge profile ==="
 	xcrun llvm-profdata merge -output=default.profdata default.profraw
 	@echo "=== PGO Step 4: Optimized rebuild ==="
-	$(MAKE) clean
+	rm -f bitnet src/*.o src/quant/*.o src/transformer/*.o
 	$(MAKE) bitnet CFLAGS="$(CFLAGS) -fprofile-instr-use=default.profdata"
 	@rm -f default.profraw default.profdata
 	@echo "=== PGO build complete ==="
@@ -173,7 +182,8 @@ pgo:
 AVX2_QUANT_SRCS = $(QUANT_COMMON) \
     src/quant/x_quant_avx2.c \
     src/quant/i2s_avx2.c src/quant/i2s_scalar.c \
-    src/quant/tq2_scalar.c src/quant/tq1_scalar.c \
+    src/quant/tq2_avx2.c src/quant/tq2_scalar.c \
+    src/quant/tq1_avx2.c src/quant/tq1_scalar.c \
     src/quant/q8_avx2.c src/quant/q8_scalar.c \
     src/quant/q4_avx2.c src/quant/q4_scalar.c \
     src/quant/q4_1_avx2.c src/quant/q4_1_scalar.c \
@@ -205,4 +215,4 @@ avx2-check:
 		-std=c11 -Iinclude -fsyntax-only $(AVX2_SRCS)
 
 clean:
-	rm -f bitnet src/*.o src/quant/*.o src/transformer/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_q2k test_e2e test_prefill test_kv_f16 default.profraw default.profdata
+	rm -f bitnet bench_kernels src/*.o src/quant/*.o src/transformer/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_q2k test_e2e test_prefill test_kv_f16 default.profraw default.profdata

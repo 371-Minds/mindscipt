@@ -32,10 +32,10 @@ void bn_quant_q2k_avx2_range(void *ctx, int row_start, int row_end) {
                     }
 
                     #define Q2K_AVX2_ACC_16(w128, xp, vds, vdm) do { \
-                        __m256 wf_lo = _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w128)), vds), vdm); \
-                        __m256 wf_hi = _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(w128, 8))), vds), vdm); \
-                        acc = _mm256_add_ps(acc, _mm256_mul_ps(wf_lo, _mm256_loadu_ps(xp))); \
-                        acc = _mm256_add_ps(acc, _mm256_mul_ps(wf_hi, _mm256_loadu_ps(xp + 8))); \
+                        __m256 wf_lo = _mm256_fmsub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w128)), vds, vdm); \
+                        __m256 wf_hi = _mm256_fmsub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(w128, 8))), vds, vdm); \
+                        acc = _mm256_fmadd_ps(wf_lo, _mm256_loadu_ps(xp), acc); \
+                        acc = _mm256_fmadd_ps(wf_hi, _mm256_loadu_ps(xp + 8), acc); \
                     } while(0)
 
                     {

@@ -31,7 +31,7 @@ void bn_quant_iq4nl_avx2_range(void *ctx, int row_start, int row_end) {
                 __m256 wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
                     _mm_loadl_epi64((const __m128i *)(tmp + g))));
                 __m256 xf = _mm256_loadu_ps(xb + g);
-                acc = _mm256_add_ps(acc, _mm256_mul_ps(wf, xf));
+                acc = _mm256_fmadd_ps(wf, xf, acc);
             }
             row_sum += bn_avx2_hsum_ps(acc) * d;
         }

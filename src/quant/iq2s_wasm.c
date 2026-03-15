@@ -18,10 +18,17 @@ void bn_quant_iq2s_wasm_range(void *ctx, int row_start, int row_end) {
             v128_t acc0 = wasm_f32x4_splat(0), acc1 = wasm_f32x4_splat(0);
             v128_t acc2 = wasm_f32x4_splat(0), acc3 = wasm_f32x4_splat(0);
             for (int i = 0; i < BN_QK_K; i += 16) {
+#ifdef __wasm_relaxed_simd__
+                acc0 = wasm_f32x4_relaxed_madd(wasm_v128_load(tmp + i),      wasm_v128_load(xb + i), acc0);
+                acc1 = wasm_f32x4_relaxed_madd(wasm_v128_load(tmp + i + 4),  wasm_v128_load(xb + i + 4), acc1);
+                acc2 = wasm_f32x4_relaxed_madd(wasm_v128_load(tmp + i + 8),  wasm_v128_load(xb + i + 8), acc2);
+                acc3 = wasm_f32x4_relaxed_madd(wasm_v128_load(tmp + i + 12), wasm_v128_load(xb + i + 12), acc3);
+#else
                 acc0 = wasm_f32x4_add(acc0, wasm_f32x4_mul(wasm_v128_load(tmp + i),      wasm_v128_load(xb + i)));
                 acc1 = wasm_f32x4_add(acc1, wasm_f32x4_mul(wasm_v128_load(tmp + i + 4),  wasm_v128_load(xb + i + 4)));
                 acc2 = wasm_f32x4_add(acc2, wasm_f32x4_mul(wasm_v128_load(tmp + i + 8),  wasm_v128_load(xb + i + 8)));
                 acc3 = wasm_f32x4_add(acc3, wasm_f32x4_mul(wasm_v128_load(tmp + i + 12), wasm_v128_load(xb + i + 12)));
+#endif
             }
             v128_t sum = wasm_f32x4_add(wasm_f32x4_add(acc0, acc1), wasm_f32x4_add(acc2, acc3));
             row_sum += bn_wasm_hsum_f32x4(sum);

@@ -34,8 +34,13 @@ void bn_transformer_gqa_wasm_range(void *ctx, int h_start, int h_end) {
             }
             v128_t wa0 = wasm_f32x4_splat(0), wa1 = wasm_f32x4_splat(0);
             for (int d = 0; d < head_size; d += 8) {
+#ifdef __wasm_relaxed_simd__
+                wa0 = wasm_f32x4_relaxed_madd(wasm_v128_load(q_h + d),     wasm_v128_load(k_t + d),     wa0);
+                wa1 = wasm_f32x4_relaxed_madd(wasm_v128_load(q_h + d + 4), wasm_v128_load(k_t + d + 4), wa1);
+#else
                 wa0 = wasm_f32x4_add(wa0, wasm_f32x4_mul(wasm_v128_load(q_h + d),     wasm_v128_load(k_t + d)));
                 wa1 = wasm_f32x4_add(wa1, wasm_f32x4_mul(wasm_v128_load(q_h + d + 4), wasm_v128_load(k_t + d + 4)));
+#endif
             }
             att[i] = bn_wasm_hsum_f32x4(wasm_f32x4_add(wa0, wa1)) * inv_sqrt_hs;
         }
@@ -59,7 +64,11 @@ void bn_transformer_gqa_wasm_range(void *ctx, int h_start, int h_end) {
             v128_t wav = wasm_f32x4_splat(a);
             for (int d = 0; d < head_size; d += 4) {
                 v128_t cur = wasm_v128_load(xb_h + d);
+#ifdef __wasm_relaxed_simd__
+                wasm_v128_store(xb_h + d, wasm_f32x4_relaxed_madd(wav, wasm_v128_load(v_t + d), cur));
+#else
                 wasm_v128_store(xb_h + d, wasm_f32x4_add(cur, wasm_f32x4_mul(wav, wasm_v128_load(v_t + d))));
+#endif
             }
         }
     }
