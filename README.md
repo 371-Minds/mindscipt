@@ -224,14 +224,15 @@ Requires [Emscripten](https://emscripten.org/):
 
 ## Performance
 
-Measured on Apple M1 Max (8 P-cores, 32 GB), greedy decoding (`--temp 0`), 8 threads.
+Measured on Apple M1 Max (8 P-cores, 32 GB), PGO build, greedy decoding, 8 threads. llama.cpp b8320 via Homebrew.
 
 | Model | Size | Quant | bitnet.c | llama.cpp CPU | llama.cpp Metal |
 |-------|------|-------|----------|---------------|-----------------|
 | bitnet-b1.58-2B-4T | 620 MB | I2_S (ternary) | **52 tok/s** | — | — |
-| Qwen2.5-3B-Instruct | 1.7 GB | Q4_0 + Q6_K | **14 tok/s** | 25 tok/s | 112 tok/s |
+| Qwen2.5-3B-Instruct | 1.7 GB | Q4_0 | **25.4 tok/s** | 40 tok/s | 84 tok/s |
+| Llama3-8B-1.58 | 3.4 GB | TQ1_0 (ternary) | **14.5 tok/s** | 19 tok/s | — |
 
-bitnet.c is a pure CPU engine with no GPU backend. On bandwidth-bound models (ternary, small quants) it's competitive with anything. On standard quant models, llama.cpp's CPU path is ~1.8x faster due to weight repacking and more aggressive integer dot product kernels; its Metal path is ~8x faster via GPU offload.
+bitnet.c is a pure CPU engine with no GPU backend. On ternary models (TQ1_0) it reaches **76% of llama.cpp CPU** — close to parity. On standard quants (Q4_0) it reaches **63% of llama.cpp CPU**, with the remaining gap due to llama.cpp's Accelerate BLAS for attention matmuls. llama.cpp does not support TQ1_0 on Metal.
 
 ## Design Decisions
 
