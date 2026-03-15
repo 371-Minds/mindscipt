@@ -25,7 +25,7 @@ Measured with `llama-bench`, same hardware (M1 Max, 8 threads). Both use `-p 0 -
 | Qwen2.5 3B Instruct | Q4_0 | 25.4 | 40.2 | 84.4 | 63% |
 | Llama3 8B 1.58 | TQ1_0 | 14.5 | 19.3 | N/A | 76% |
 
-llama.cpp CPU uses Apple Accelerate (BLAS) for attention matmuls. Both engines now use weight-repacked NEON kernels for Q4_0 matvec. Metal is GPU offload (`-ngl 99`). TQ1_0 Metal is not implemented in llama.cpp b8320.
+llama.cpp's remaining CPU advantage comes from multi-row interleaved kernels (`block_q4_0x4` packing 4 rows together, using `vdotq_laneq_s32` to compute 4 output rows per pass and amortize activation loads). Both engines use weight-repacked NEON kernels for Q4_0 matvec. Metal is GPU offload (`-ngl 99`). TQ1_0 Metal is not implemented in llama.cpp b8320.
 
 ## Per-Kernel Bandwidth (GB/s)
 

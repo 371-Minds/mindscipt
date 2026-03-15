@@ -232,7 +232,7 @@ Measured on Apple M1 Max (8 P-cores, 32 GB), PGO build, greedy decoding, 8 threa
 | Qwen2.5-3B-Instruct | 1.7 GB | Q4_0 | **25.4 tok/s** | 40 tok/s | 84 tok/s |
 | Llama3-8B-1.58 | 3.4 GB | TQ1_0 (ternary) | **14.5 tok/s** | 19 tok/s | — |
 
-bitnet.c is a pure CPU engine with no GPU backend. On ternary models (TQ1_0) it reaches **76% of llama.cpp CPU** — close to parity. On standard quants (Q4_0) it reaches **63% of llama.cpp CPU**, with the remaining gap due to llama.cpp's Accelerate BLAS for attention matmuls. llama.cpp does not support TQ1_0 on Metal.
+bitnet.c is a pure CPU engine with no GPU backend. On ternary models (TQ1_0) it reaches **76% of llama.cpp CPU** — close to parity. On standard quants (Q4_0) it reaches **63% of llama.cpp CPU**, with the remaining gap due to llama.cpp's multi-row interleaved kernels (4 output rows per pass via `vdotq_laneq_s32`, amortizing activation loads). llama.cpp does not support TQ1_0 on Metal.
 
 ## Design Decisions
 
