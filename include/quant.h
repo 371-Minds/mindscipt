@@ -174,6 +174,8 @@ typedef struct {
     int type;           // BN_GGUF_TENSOR_TQ1_0, TQ2_0, or I2_S
     int rows, cols;
     float scale;        // per-tensor scale (from .scale tensor or embedded in data)
+    float *rp_scales;   // repacked: pre-converted FP32 per-block scales (NULL if not repacked)
+    uint8_t *rp_qs;     // repacked: contiguous quant data (NULL if not repacked)
 } BnQWeight;
 
 float    bn_fp16_to_fp32(uint16_t h);
@@ -211,15 +213,17 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
                            const float *x, int8_t *x_q_buf, BnThreadPool *pool);
 
 // Quantize float vector to int8, returns scale = amax/127.
-#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__)
+#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__) || defined(__wasm_relaxed_simd__)
 float bn_quant_x_to_i8(const float *x, int8_t *x_q, int n);
 
 // Quantize float vector to per-block Q8_0: 32-element blocks with per-block scales.
 void bn_quant_x_to_q8_blocks(const float *x, int8_t *x_q, float *x_scales, int n);
 
+#if !defined(__wasm_relaxed_simd__)
 // Quantize F16 rows to INT8 + per-row scales for INT8 logits kernel.
 void bn_quant_f16_rows_to_i8(const uint16_t *f16, int8_t *i8_out,
                               float *scales_out, int n_rows, int dim);
+#endif
 #endif
 
 #endif // BN_QUANT_H

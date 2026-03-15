@@ -377,7 +377,7 @@ static float *forward_logits(BnModel *m) {
     // Tied Q4_0/Q8_0/Q6_K embeddings: use quant matvec
     else if (w->emb_type == BN_GGUF_TENSOR_Q4_0 || w->emb_type == BN_GGUF_TENSOR_Q8_0 ||
              w->emb_type == BN_GGUF_TENSOR_Q6_K) {
-        BnQWeight tied = { w->token_embedding, w->emb_type, c->vocab_size, dim, 1.0f };
+        BnQWeight tied = { w->token_embedding, w->emb_type, c->vocab_size, dim, 1.0f, NULL, NULL };
         bn_quant_matvec(s->logits, &tied, s->x, s->x_q, m->pool);
     }
     // Tied F16 embeddings: logits = token_embedding^T @ x

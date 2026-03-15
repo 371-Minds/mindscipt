@@ -29,6 +29,14 @@ typedef struct {
     const float *x;
 } BnTQ2Ctx;
 
+// TQ2_0 DPBUSD context (AVX2)
+typedef struct {
+    float *out;
+    const BnQWeight *W;
+    const int8_t *x_q;
+    float combined_scale;
+} BnTQ2SdotCtx;
+
 // TQ1_0 float context
 typedef struct {
     float *out;
@@ -50,6 +58,14 @@ typedef struct {
     const BnQWeight *W;
     const float *x;
 } BnQ8Ctx;
+
+// Q8_0 DPBUSD context (AVX2)
+typedef struct {
+    float *out;
+    const BnQWeight *W;
+    const int8_t *x_q;
+    const float *x_scales;
+} BnQ8SdotCtx;
 
 // Q4_0 float context
 typedef struct {
@@ -178,28 +194,36 @@ void bn_quant_i2s_neon_sdot_range(void *ctx, int start, int end);
 void bn_quant_i2s_neon_range(void *ctx, int start, int end);
 void bn_quant_i2s_avx2_range(void *ctx, int start, int end);
 void bn_quant_i2s_wasm_range(void *ctx, int start, int end);
+void bn_quant_i2s_wasm_sdot_range(void *ctx, int start, int end);
 void bn_quant_i2s_scalar_range(void *ctx, int start, int end);
 
 // TQ2_0 kernels
+void bn_quant_tq2_neon_sdot_range(void *ctx, int start, int end);
 void bn_quant_tq2_neon_range(void *ctx, int start, int end);
+void bn_quant_tq2_avx2_range(void *ctx, int start, int end);
 void bn_quant_tq2_scalar_range(void *ctx, int start, int end);
 
 // TQ1_0 kernels
 void bn_quant_tq1_neon_sdot_range(void *ctx, int start, int end);
 void bn_quant_tq1_neon_range(void *ctx, int start, int end);
+void bn_quant_tq1_avx2_range(void *ctx, int start, int end);
 void bn_quant_tq1_scalar_range(void *ctx, int start, int end);
 
 // Q8_0 kernels
+void bn_quant_q8_neon_sdot_range(void *ctx, int start, int end);
 void bn_quant_q8_neon_range(void *ctx, int start, int end);
 void bn_quant_q8_avx2_range(void *ctx, int start, int end);
 void bn_quant_q8_wasm_range(void *ctx, int start, int end);
+void bn_quant_q8_wasm_sdot_range(void *ctx, int start, int end);
 void bn_quant_q8_scalar_range(void *ctx, int start, int end);
 
 // Q4_0 kernels
 void bn_quant_q4_neon_sdot_range(void *ctx, int start, int end);
+void bn_quant_q4_repacked_neon_sdot_range(void *ctx, int start, int end);
 void bn_quant_q4_neon_range(void *ctx, int start, int end);
 void bn_quant_q4_avx2_range(void *ctx, int start, int end);
 void bn_quant_q4_wasm_range(void *ctx, int start, int end);
+void bn_quant_q4_wasm_sdot_range(void *ctx, int start, int end);
 void bn_quant_q4_scalar_range(void *ctx, int start, int end);
 
 // Q6_K kernels

@@ -76,6 +76,36 @@ static int load_qweight(BnQWeight *w, BnGGUFFile *f, const char *weight_name, co
     return 0;
 }
 
+// --- Q4_0 weight repacking helpers ---
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static size_t q4_repack_bytes(const BnQWeight *w) {
+    if (w->type != BN_GGUF_TENSOR_Q4_0 || !w->data) return 0;
+    size_t n_blocks = (size_t)w->rows * (w->cols / 32);
+    return n_blocks * sizeof(float) + n_blocks * 16 + 2 * SH_ARENA_ALIGN;
+}
+
+static void q4_repack(BnQWeight *w, SHArena *arena) {
+    if (w->type != BN_GGUF_TENSOR_Q4_0 || !w->data) return;
+    int n_blocks_per_row = w->cols / 32;
+    size_t n_blocks = (size_t)w->rows * n_blocks_per_row;
+
+    w->rp_scales = (float *)sh_arena_alloc(arena, n_blocks * sizeof(float));
+    w->rp_qs = (uint8_t *)sh_arena_alloc(arena, n_blocks * 16);
+    if (!w->rp_scales || !w->rp_qs) {
+        w->rp_scales = NULL;
+        w->rp_qs = NULL;
+        return;
+    }
+
+    const BnBlockQ4_0 *blocks = (const BnBlockQ4_0 *)w->data;
+    for (size_t i = 0; i < n_blocks; i++) {
+        w->rp_scales[i] = bn_fp16_to_fp32(blocks[i].d);
+        memcpy(w->rp_qs + i * 16, blocks[i].qs, 16);
+    }
+}
+#endif
+
 // --- Helper: load F32 norm weights from GGUF ---
 
 static float *load_f32_tensor(BnGGUFFile *f, const char *name) {
@@ -360,7 +390,23 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     }
 #endif
 
-    // Compute total arena capacity (all RunState buffers + INT8 embeddings)
+    // Q4_0 weight repacking size (NEON SDOT only)
+    size_t q4_repack_total = 0;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    for (int i = 0; i < c->n_layers; i++) {
+        BnLayerWeights *lw = &w->layers[i];
+        q4_repack_total += q4_repack_bytes(&lw->wq);
+        q4_repack_total += q4_repack_bytes(&lw->wk);
+        q4_repack_total += q4_repack_bytes(&lw->wv);
+        q4_repack_total += q4_repack_bytes(&lw->wo);
+        q4_repack_total += q4_repack_bytes(&lw->ffn_gate);
+        q4_repack_total += q4_repack_bytes(&lw->ffn_up);
+        q4_repack_total += q4_repack_bytes(&lw->ffn_down);
+    }
+    q4_repack_total += q4_repack_bytes(&w->output_weight);
+#endif
+
+    // Compute total arena capacity (all RunState buffers + INT8 embeddings + Q4 repacking)
     size_t arena_size = 0;
     arena_size += 4 * (size_t)c->dim * sizeof(float);         // x, xb, xb2, q
     arena_size += 2 * (size_t)c->hidden_dim * sizeof(float);  // hb, hb2
@@ -371,6 +417,7 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     arena_size += (size_t)x_q_size * sizeof(int8_t);           // x_q
     arena_size += (size_t)half_head * sizeof(float);           // rope_freq
     arena_size += emb_i8_bytes + emb_i8_scales_bytes;          // INT8 embeddings
+    arena_size += q4_repack_total;                              // Q4_0 repacked weights
     arena_size += 14 * SH_ARENA_ALIGN;                         // alignment padding
 
     m->arena = sh_arena_create(arena_size);
@@ -423,6 +470,25 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
             w->emb_out_scales = NULL;
             SH_LOG_DEBUG("INT8 embedding arena alloc failed, using F16 fallback");
         }
+    }
+#endif
+
+    // Repack Q4_0 weights into split scales/qs layout for NEON SDOT
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    if (q4_repack_total > 0) {
+        for (int i = 0; i < c->n_layers; i++) {
+            BnLayerWeights *lw = &w->layers[i];
+            q4_repack(&lw->wq, m->arena);
+            q4_repack(&lw->wk, m->arena);
+            q4_repack(&lw->wv, m->arena);
+            q4_repack(&lw->wo, m->arena);
+            q4_repack(&lw->ffn_gate, m->arena);
+            q4_repack(&lw->ffn_up, m->arena);
+            q4_repack(&lw->ffn_down, m->arena);
+        }
+        q4_repack(&w->output_weight, m->arena);
+        char rp_mb[16]; snprintf(rp_mb, sizeof(rp_mb), "%.0f", (double)q4_repack_total / (1024*1024));
+        SH_LOG_INFO("Q4_0 weights repacked", "MB", rp_mb);
     }
 #endif
 
