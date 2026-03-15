@@ -33,6 +33,10 @@ ifneq ($(filter arm% aarch%,$(UNAME_M)),)
     src/quant/q4k_neon.c src/quant/q4k_scalar.c \
     src/quant/q5k_neon.c src/quant/q5k_scalar.c \
     src/quant/q3k_neon.c src/quant/q3k_scalar.c
+
+  TRANSFORMER_BACKEND = src/transformer/rmsnorm_neon.c src/transformer/rmsnorm_scalar.c \
+    src/transformer/gqa_neon.c src/transformer/gqa_scalar.c \
+    src/transformer/logits_neon.c src/transformer/logits_scalar.c
 else
   # x86: AVX2 + scalar
   QUANT_BACKEND = src/quant/x_quant_avx2.c \
@@ -45,12 +49,17 @@ else
     src/quant/q4k_avx2.c src/quant/q4k_scalar.c \
     src/quant/q5k_avx2.c src/quant/q5k_scalar.c \
     src/quant/q3k_avx2.c src/quant/q3k_scalar.c
+
+  TRANSFORMER_BACKEND = src/transformer/rmsnorm_avx2.c src/transformer/rmsnorm_scalar.c \
+    src/transformer/gqa_avx2.c src/transformer/gqa_scalar.c \
+    src/transformer/logits_avx2.c src/transformer/logits_scalar.c
 endif
 
 QUANT_SRCS = $(QUANT_COMMON) $(QUANT_BACKEND)
+TRANSFORMER_SRCS = src/transformer.c $(TRANSFORMER_BACKEND)
 
 SRCS = src/platform.c src/gguf.c $(QUANT_SRCS) src/model.c \
-       src/transformer.c src/tokenizer.c src/sampler.c \
+       $(TRANSFORMER_SRCS) src/tokenizer.c src/sampler.c \
        src/threadpool.c src/sh_arena.c src/sh_log.c src/main.c
 OBJS = $(SRCS:.c=.o)
 
@@ -74,6 +83,9 @@ src/%.o: src/%.c
 src/quant/%.o: src/quant/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+src/transformer/%.o: src/transformer/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 # --- Tests ---
 .PHONY: debug asan test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 pgo avx2-check clean
 
@@ -88,7 +100,7 @@ test_quant: test/test_quant.c $(QUANT_SRCS) src/threadpool.c
 test_tokenizer: test/test_tokenizer.c src/tokenizer.c src/gguf.c src/platform.c src/sh_log.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
 
-test_transformer: test/test_transformer.c src/transformer.c src/model.c \
+test_transformer: test/test_transformer.c src/transformer.c $(TRANSFORMER_BACKEND) src/model.c \
                   src/gguf.c $(QUANT_SRCS) src/platform.c src/tokenizer.c src/threadpool.c \
                   src/sh_arena.c src/sh_log.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
@@ -97,7 +109,7 @@ test_threadpool: test/test_threadpool.c src/threadpool.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
 
 test_safety: test/test_safety.c src/platform.c src/gguf.c $(QUANT_SRCS) src/model.c \
-             src/transformer.c src/tokenizer.c src/sampler.c src/threadpool.c \
+             src/transformer.c $(TRANSFORMER_BACKEND) src/tokenizer.c src/sampler.c src/threadpool.c \
              src/sh_arena.c src/sh_log.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
 
@@ -105,17 +117,17 @@ test_arena: test/test_arena.c src/sh_arena.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
 
 test_e2e: test/test_e2e.c src/platform.c src/gguf.c $(QUANT_SRCS) src/model.c \
-          src/transformer.c src/tokenizer.c src/sampler.c src/threadpool.c \
+          src/transformer.c $(TRANSFORMER_BACKEND) src/tokenizer.c src/sampler.c src/threadpool.c \
           src/sh_arena.c src/sh_log.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
 
 test_prefill: test/test_prefill.c src/platform.c src/gguf.c $(QUANT_SRCS) src/model.c \
-              src/transformer.c src/tokenizer.c src/threadpool.c \
+              src/transformer.c $(TRANSFORMER_BACKEND) src/tokenizer.c src/threadpool.c \
               src/sh_arena.c src/sh_log.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 test_kv_f16: test/test_kv_f16.c src/platform.c src/gguf.c $(QUANT_SRCS) src/model.c \
-             src/transformer.c src/tokenizer.c src/sampler.c src/threadpool.c \
+             src/transformer.c $(TRANSFORMER_BACKEND) src/tokenizer.c src/sampler.c src/threadpool.c \
              src/sh_arena.c src/sh_log.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -147,8 +159,12 @@ AVX2_QUANT_SRCS = $(QUANT_COMMON) \
     src/quant/q5k_avx2.c src/quant/q5k_scalar.c \
     src/quant/q3k_avx2.c src/quant/q3k_scalar.c
 
+AVX2_TRANSFORMER_BACKEND = src/transformer/rmsnorm_avx2.c src/transformer/rmsnorm_scalar.c \
+    src/transformer/gqa_avx2.c src/transformer/gqa_scalar.c \
+    src/transformer/logits_avx2.c src/transformer/logits_scalar.c
+
 AVX2_SRCS = src/platform.c src/gguf.c $(AVX2_QUANT_SRCS) src/model.c \
-            src/transformer.c src/tokenizer.c src/sampler.c \
+            src/transformer.c $(AVX2_TRANSFORMER_BACKEND) src/tokenizer.c src/sampler.c \
             src/threadpool.c src/sh_arena.c src/sh_log.c
 
 avx2-check:
@@ -156,4 +172,4 @@ avx2-check:
 		-std=c11 -Iinclude -fsyntax-only $(AVX2_SRCS)
 
 clean:
-	rm -f bitnet src/*.o src/quant/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_e2e test_prefill test_kv_f16 default.profraw default.profdata
+	rm -f bitnet src/*.o src/quant/*.o src/transformer/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_e2e test_prefill test_kv_f16 default.profraw default.profdata
