@@ -116,13 +116,18 @@ void bn_quant_q4_repacked_neon_sdot_range(void *ctx, int row_start, int row_end)
         int offset = row & 3;
         float row_sum = 0.0f;
         for (int b = 0; b < n_blocks_per_row; b++) {
-            size_t idx = (size_t)group * n_blocks_per_row * 4 + b * 4 + offset;
-            float d = rp_scales[idx];
+            size_t gb = (size_t)group * n_blocks_per_row + b;
+            float d = rp_scales[gb * 4 + offset];
             float dx = x_scales[b];
-            const uint8_t *qs = rp_qs + idx * 16;
             const int8_t *xb = x_q + b * 32;
 
-            uint8x16_t raw = vld1q_u8(qs);
+            // Extract this row's bytes from nibble-transposed layout
+            const uint8_t *base = rp_qs + gb * 64;
+            uint8_t row_qs[16];
+            for (int ng = 0; ng < 4; ng++)
+                memcpy(row_qs + ng * 4, base + ng * 16 + offset * 4, 4);
+
+            uint8x16_t raw = vld1q_u8(row_qs);
             int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask_lo)), eight);
             int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), eight);
             int32x4_t acc = vdotq_s32(zero, lo, vld1q_s8(xb));
@@ -132,60 +137,58 @@ void bn_quant_q4_repacked_neon_sdot_range(void *ctx, int row_start, int row_end)
         c->out[row] = row_sum;
     }
 
-    // Main loop: 4 rows at a time (interleaved layout)
+    // Main loop: 4 rows at a time (nibble-transposed layout + vdotq_laneq_s32)
     for (; row + 3 < row_end; row += 4) {
         int group = row >> 2;
-        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        float32x4_t row_sums = vdupq_n_f32(0.0f);
 
         for (int b = 0; b < n_blocks_per_row; b++) {
             // Load activation ONCE per block
-            const int8_t *xb = x_q + b * 32;
-            int8x16_t xlo = vld1q_s8(xb);
-            int8x16_t xhi = vld1q_s8(xb + 16);
+            int8x16_t a0 = vld1q_s8(x_q + b * 32);
+            int8x16_t a1 = vld1q_s8(x_q + b * 32 + 16);
             float dx = x_scales[b];
 
-            // Base offset into interleaved arrays
-            size_t ibase = (size_t)group * n_blocks_per_row * 4 + b * 4;
+            size_t gb = (size_t)group * n_blocks_per_row + b;
+            const uint8_t *qbase = rp_qs + gb * 64;
 
-            // Row 0
-            uint8x16_t raw0 = vld1q_u8(rp_qs + (ibase + 0) * 16);
+            // Load 4 × 16 nibble-transposed packed bytes
+            uint8x16_t raw0 = vld1q_u8(qbase);
+            uint8x16_t raw1 = vld1q_u8(qbase + 16);
+            uint8x16_t raw2 = vld1q_u8(qbase + 32);
+            uint8x16_t raw3 = vld1q_u8(qbase + 48);
+
+            // Unpack low nibbles (elements 0-15)
             int8x16_t lo0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw0, mask_lo)), eight);
-            int8x16_t hi0 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw0, 4)), eight);
-            int32x4_t a0 = vdotq_s32(zero, lo0, xlo);
-            a0 = vdotq_s32(a0, hi0, xhi);
-
-            // Row 1
-            uint8x16_t raw1 = vld1q_u8(rp_qs + (ibase + 1) * 16);
             int8x16_t lo1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw1, mask_lo)), eight);
-            int8x16_t hi1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw1, 4)), eight);
-            int32x4_t a1 = vdotq_s32(zero, lo1, xlo);
-            a1 = vdotq_s32(a1, hi1, xhi);
-
-            // Row 2
-            uint8x16_t raw2 = vld1q_u8(rp_qs + (ibase + 2) * 16);
             int8x16_t lo2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw2, mask_lo)), eight);
-            int8x16_t hi2 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw2, 4)), eight);
-            int32x4_t a2 = vdotq_s32(zero, lo2, xlo);
-            a2 = vdotq_s32(a2, hi2, xhi);
-
-            // Row 3
-            uint8x16_t raw3 = vld1q_u8(rp_qs + (ibase + 3) * 16);
             int8x16_t lo3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw3, mask_lo)), eight);
-            int8x16_t hi3 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw3, 4)), eight);
-            int32x4_t a3 = vdotq_s32(zero, lo3, xlo);
-            a3 = vdotq_s32(a3, hi3, xhi);
 
-            // 4 independent reductions
-            s0 += rp_scales[ibase + 0] * dx * (float)vaddvq_s32(a0);
-            s1 += rp_scales[ibase + 1] * dx * (float)vaddvq_s32(a1);
-            s2 += rp_scales[ibase + 2] * dx * (float)vaddvq_s32(a2);
-            s3 += rp_scales[ibase + 3] * dx * (float)vaddvq_s32(a3);
+            // Unpack high nibbles (elements 16-31)
+            int8x16_t hi0 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw0, 4)), eight);
+            int8x16_t hi1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw1, 4)), eight);
+            int8x16_t hi2 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw2, 4)), eight);
+            int8x16_t hi3 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw3, 4)), eight);
+
+            // 8 SDOT with lane selection — 4 independent accumulators to avoid
+            // serial dependency chain (each pair is 2-deep, all 4 run in parallel)
+            int32x4_t acc02 = vdotq_laneq_s32(zero, lo0, a0, 0);
+            int32x4_t acc13 = vdotq_laneq_s32(zero, lo1, a0, 1);
+            acc02 = vdotq_laneq_s32(acc02, lo2, a0, 2);
+            acc13 = vdotq_laneq_s32(acc13, lo3, a0, 3);
+            int32x4_t acc46 = vdotq_laneq_s32(zero, hi0, a1, 0);
+            int32x4_t acc57 = vdotq_laneq_s32(zero, hi1, a1, 1);
+            acc46 = vdotq_laneq_s32(acc46, hi2, a1, 2);
+            acc57 = vdotq_laneq_s32(acc57, hi3, a1, 3);
+            int32x4_t acc = vaddq_s32(vaddq_s32(acc02, acc13),
+                                      vaddq_s32(acc46, acc57));
+
+            // Vector scale multiply + accumulate (no per-row reduction!)
+            float32x4_t f = vcvtq_f32_s32(acc);
+            float32x4_t d4 = vld1q_f32(rp_scales + gb * 4);
+            row_sums = vfmaq_f32(row_sums, f, vmulq_n_f32(d4, dx));
         }
 
-        c->out[row + 0] = s0;
-        c->out[row + 1] = s1;
-        c->out[row + 2] = s2;
-        c->out[row + 3] = s3;
+        vst1q_f32(&c->out[row], row_sums);
     }
 
     // Post-tail: remaining 0-3 rows
@@ -194,13 +197,18 @@ void bn_quant_q4_repacked_neon_sdot_range(void *ctx, int row_start, int row_end)
         int offset = row & 3;
         float row_sum = 0.0f;
         for (int b = 0; b < n_blocks_per_row; b++) {
-            size_t idx = (size_t)group * n_blocks_per_row * 4 + b * 4 + offset;
-            float d = rp_scales[idx];
+            size_t gb = (size_t)group * n_blocks_per_row + b;
+            float d = rp_scales[gb * 4 + offset];
             float dx = x_scales[b];
-            const uint8_t *qs = rp_qs + idx * 16;
             const int8_t *xb = x_q + b * 32;
 
-            uint8x16_t raw = vld1q_u8(qs);
+            // Extract this row's bytes from nibble-transposed layout
+            const uint8_t *base = rp_qs + gb * 64;
+            uint8_t row_qs[16];
+            for (int ng = 0; ng < 4; ng++)
+                memcpy(row_qs + ng * 4, base + ng * 16 + offset * 4, 4);
+
+            uint8x16_t raw = vld1q_u8(row_qs);
             int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, mask_lo)), eight);
             int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), eight);
             int32x4_t acc = vdotq_s32(zero, lo, vld1q_s8(xb));

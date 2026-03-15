@@ -100,17 +100,31 @@ static void q4_repack(BnQWeight *w, SHArena *arena) {
         return;
     }
 
-    // 4-row interleaved layout: group g (rows 4g..4g+3), block b, row offset r
-    // dst index = g * n_blocks_per_row * 4 + b * 4 + r
+    // Nibble-transposed 4-row interleaved layout for vdotq_laneq_s32:
+    // Scales: group g, block b → rp_scales[(g * n_blocks_per_row + b) * 4 + r]
+    // Quants: group g, block b → rp_qs[(g * n_blocks_per_row + b) * 64 + ...]
+    //   Within each 64-byte chunk, bytes are ordered for lane-select SDOT:
+    //   [r0_b0..b3, r1_b0..b3, r2_b0..b3, r3_b0..b3,   <- register 0 (16 bytes)
+    //    r0_b4..b7, r1_b4..b7, r2_b4..b7, r3_b4..b7,   <- register 1
+    //    r0_b8..b11, r1_b8..b11, r2_b8..b11, r3_b8..b11, <- register 2
+    //    r0_b12..b15, r1_b12..b15, r2_b12..b15, r3_b12..b15] <- register 3
     const BnBlockQ4_0 *blocks = (const BnBlockQ4_0 *)w->data;
     int n_groups = w->rows / 4;
     for (int g = 0; g < n_groups; g++) {
         for (int b = 0; b < n_blocks_per_row; b++) {
+            size_t gb = (size_t)g * n_blocks_per_row + b;
+            // Scales: same flat interleaved layout
             for (int r = 0; r < 4; r++) {
                 size_t src = (size_t)(g * 4 + r) * n_blocks_per_row + b;
-                size_t dst = (size_t)g * n_blocks_per_row * 4 + b * 4 + r;
-                w->rp_scales[dst] = bn_fp16_to_fp32(blocks[src].d);
-                memcpy(w->rp_qs + dst * 16, blocks[src].qs, 16);
+                w->rp_scales[gb * 4 + r] = bn_fp16_to_fp32(blocks[src].d);
+            }
+            // Quants: nibble-transpose within 64-byte chunk
+            uint8_t *dst = w->rp_qs + gb * 64;
+            for (int ng = 0; ng < 4; ng++) {
+                for (int r = 0; r < 4; r++) {
+                    size_t src = (size_t)(g * 4 + r) * n_blocks_per_row + b;
+                    memcpy(dst + ng * 16 + r * 4, blocks[src].qs + ng * 4, 4);
+                }
             }
         }
     }
