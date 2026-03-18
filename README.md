@@ -2,7 +2,7 @@
 
 A minimal, embeddable LLM inference engine in pure C11.
 
-Loads GGUF models and runs autoregressive text generation on CPU. Supports 20+ quantization formats — from ternary (I2_S, TQ1/TQ2) through k-quants (Q2–Q8) and imatrix (IQ2–IQ4) to unquantized (F16, BF16, F32). Inspired by Karpathy's [llama2.c](https://github.com/karpathy/llama2.c).
+Loads GGUF models and runs autoregressive text generation on CPU. Supports 20+ quantization formats — from ternary (I2_S, TQ1/TQ2) through k-quants (Q2–Q8) and imatrix (IQ2–IQ4) to unquantized (F16, BF16, F32). Handles both standard transformer and hybrid SSM+Attention architectures (Gated DeltaNet). Inspired by Karpathy's [llama2.c](https://github.com/karpathy/llama2.c).
 
 Zero dependencies beyond libc and libm, four SIMD backends, compiles to WASM, and fits in ~8,000 lines of modular C.
 
@@ -12,6 +12,7 @@ Zero dependencies beyond libc and libm, four SIMD backends, compiles to WASM, an
 - **GGUF model loading** — loads any GGUF file with supported tensor types
 - **20+ quantization formats** — ternary, k-quants, imatrix codebook, and unquantized (see table below)
 - **Full transformer forward pass** — RoPE, GQA, RMSNorm, sub-norms, tied/untied embeddings
+- **Hybrid SSM + Attention** — Gated DeltaNet SSM layers (conv1d, SiLU, delta rule recurrence) alongside standard GQA attention layers
 - **Flash GQA attention** — online softmax with KV-head grouping, single-pass over KV cache
 - **Optional F16 KV cache** — `--kv16` halves attention DRAM bandwidth with minimal precision loss
 - **4 SIMD backends** — ARM NEON/SDOT, AVX2, WASM SIMD128, scalar fallback (auto-selected at compile time)
@@ -221,6 +222,27 @@ Requires [Emscripten](https://emscripten.org/):
 # Produces wasm/bitnet.js + wasm/bitnet.wasm
 # Open wasm/index.html in a browser
 ```
+
+## Model Support
+
+Tested models with generation quality and performance on Apple M1 Max (8 P-cores, 32 GB), release build, greedy decoding, 8 threads:
+
+| Model | Size | Quant | Architecture | tok/s | Quality |
+|-------|------|-------|--------------|-------|---------|
+| bitnet-b1.58-2B-4T | 1.1 GB | I2_S (ternary) | Transformer | **29–41** | Factual, correct code |
+| Qwen2.5-3B-Instruct | 1.7 GB | Q4_0 | Transformer | **23–25** | Coherent, instruct-following |
+| Llama3-8B-1.58 | 3.3 GB | TQ1_0 (ternary) | Transformer | **8–9** | Basic completion |
+| Qwen3.5-9B | 5.3 GB | Q4_K_M (mixed) | Hybrid SSM+Attention | **2.8–3.1** | Best quality, chain-of-thought |
+
+Any GGUF model using supported weight types works — these are just the tested configurations.
+
+### Hybrid SSM + Attention
+
+bitnet.c supports hybrid architectures that mix SSM (state space model) layers with standard attention layers, such as Qwen3.5's Gated DeltaNet:
+
+- **SSM layers**: Conv1d (kernel=4) → SiLU → L2-norm Q/K → delta rule recurrence → per-head RMSNorm → SiLU gate → output projection
+- **Attention layers**: Standard GQA with RoPE, flash attention, KV cache
+- **Mixed layout**: The model config specifies which layers use SSM vs attention
 
 ## Performance
 
