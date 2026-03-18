@@ -2,20 +2,13 @@
 #include "simd_helpers.h"
 #include <immintrin.h>
 
-// Extract 16 high bits from qh bitfield starting at bit_offset (must be multiple of 16).
-// Returns 16 bytes, each 0x00 or 0x10 (the 5th bit in position 4).
-static inline __m128i q5k_extract_hb(__m256i qh256, int bit_offset) {
-    uint8_t qh_bytes[32];
-    _mm256_storeu_si256((__m256i *)qh_bytes, qh256);
-    uint16_t bits16;
-    memcpy(&bits16, qh_bytes + bit_offset / 8, sizeof(uint16_t));
-
-    // Broadcast 16-bit value as [lo,hi,lo,hi,...], test each bit with per-byte masks
-    __m128i bcast = _mm_set1_epi16((int16_t)bits16);
-    const __m128i bit_masks = _mm_setr_epi8(
-        1, 2, 4, 8, 16, 32, 64, (char)128,
-        1, 2, 4, 8, 16, 32, 64, (char)128);
-    __m128i tested = _mm_and_si128(bcast, bit_masks);
+// Extract high bit `bit_pos` from 16 consecutive qh bytes starting at l_offset.
+// qh[l] stores high bits for position l across all groups.
+// Returns 16 bytes, each 0x00 or 0x10.
+static inline __m128i q5k_extract_hb(const uint8_t *qh, int l_offset, int bit_pos) {
+    __m128i qh_vec = _mm_loadu_si128((const __m128i *)(qh + l_offset));
+    __m128i mask = _mm_set1_epi8((char)(1 << bit_pos));
+    __m128i tested = _mm_and_si128(qh_vec, mask);
     __m128i is_zero = _mm_cmpeq_epi8(tested, _mm_setzero_si128());
     return _mm_andnot_si128(is_zero, _mm_set1_epi8(0x10));
 }
@@ -39,19 +32,22 @@ void bn_quant_q5k_avx2_range(void *ctx, int row_start, int row_end) {
             const uint8_t *qs = blk->qs;
             const float *xb = x + b * BN_QK_K;
 
-            __m256i qh256 = _mm256_loadu_si256((const __m256i *)blk->qh);
+            const uint8_t *qh = blk->qh;
             __m256 acc = _mm256_setzero_ps();
 
             for (int j = 0; j < BN_QK_K; j += 64) {
                 uint8_t sc, m;
                 int sub = j / 32;
+                int group = j / 64;
                 __m128i raw0 = _mm_loadu_si128((const __m128i *)qs);
                 __m128i raw1 = _mm_loadu_si128((const __m128i *)(qs + 16));
 
-                __m128i hb0 = q5k_extract_hb(qh256, j);
-                __m128i hb1 = q5k_extract_hb(qh256, j + 16);
-                __m128i hb2 = q5k_extract_hb(qh256, j + 32);
-                __m128i hb3 = q5k_extract_hb(qh256, j + 48);
+                int bit_lo = group * 2;      // bits 0,2,4,6
+                int bit_hi = group * 2 + 1;  // bits 1,3,5,7
+                __m128i hb0 = q5k_extract_hb(qh, 0,  bit_lo);   // l=0..15, first half
+                __m128i hb1 = q5k_extract_hb(qh, 16, bit_lo);   // l=16..31, first half
+                __m128i hb2 = q5k_extract_hb(qh, 0,  bit_hi);   // l=0..15, second half
+                __m128i hb3 = q5k_extract_hb(qh, 16, bit_hi);   // l=16..31, second half
 
                 bn_q4k_get_scale_min(sub, blk->scales, &sc, &m);
                 __m256 vds = _mm256_set1_ps(d * sc);

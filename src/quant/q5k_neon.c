@@ -2,17 +2,17 @@
 #include "quant_neon_helpers.h"
 #include <arm_neon.h>
 
-// Extract 16 high bits from qh bitfield starting at bit_offset (must be multiple of 16).
-// Returns 16 bytes, each 0x00 or 0x10 (the 5th bit in position 4).
-static inline uint8x16_t q5k_extract_hb_neon(const uint8_t *qh, int bit_offset) {
-    uint16_t bits16;
-    memcpy(&bits16, qh + bit_offset / 8, sizeof(uint16_t));
-
-    // Broadcast the 16-bit value as [lo,hi,lo,hi,...] and test each bit
-    uint8x16_t bcast = vreinterpretq_u8_u16(vdupq_n_u16(bits16));
-    const uint8x16_t bit_masks = {1, 2, 4, 8, 16, 32, 64, 128,
-                                   1, 2, 4, 8, 16, 32, 64, 128};
-    uint8x16_t tested = vandq_u8(bcast, bit_masks);
+// Extract high bits for 16 consecutive l-positions from qh, testing bit `bit_pos`.
+// qh[l] stores high bits for position l: bits are interleaved as lo/hi pairs per group.
+// bit_pos = group*2 (0,2,4,6) for first half, group*2+1 (1,3,5,7) for second half.
+// l_offset = starting l position (0 or 16).
+// Returns 16 bytes, each 0x00 or 0x10.
+static inline uint8x16_t q5k_extract_hb_neon(const uint8_t *qh, int l_offset, int bit_pos) {
+    // Load 16 consecutive qh bytes starting at l_offset
+    uint8x16_t qh_vec = vld1q_u8(qh + l_offset);
+    // Test the target bit using a mask
+    uint8x16_t mask = vdupq_n_u8(1 << bit_pos);
+    uint8x16_t tested = vandq_u8(qh_vec, mask);
     uint8x16_t nonzero = vcgtq_u8(tested, vdupq_n_u8(0));
     return vandq_u8(nonzero, vdupq_n_u8(0x10));
 }
@@ -43,14 +43,17 @@ void bn_quant_q5k_neon_range(void *ctx, int row_start, int row_end) {
             for (int j = 0; j < BN_QK_K; j += 64) {
                 uint8_t sc, m;
                 int sub = j / 32;
+                int group = j / 64;  // 0..3
+                int bit_lo = group * 2;      // bits 0,2,4,6 for first 32
+                int bit_hi = group * 2 + 1;  // bits 1,3,5,7 for second 32
 
                 uint8x16_t raw0 = vld1q_u8(qs);
                 uint8x16_t raw1 = vld1q_u8(qs + 16);
 
-                uint8x16_t hb0 = q5k_extract_hb_neon(qh, j);
-                uint8x16_t hb1 = q5k_extract_hb_neon(qh, j + 16);
-                uint8x16_t hb2 = q5k_extract_hb_neon(qh, j + 32);
-                uint8x16_t hb3 = q5k_extract_hb_neon(qh, j + 48);
+                uint8x16_t hb0 = q5k_extract_hb_neon(qh, 0,  bit_lo);  // l=0..15, first half
+                uint8x16_t hb1 = q5k_extract_hb_neon(qh, 16, bit_lo);  // l=16..31, first half
+                uint8x16_t hb2 = q5k_extract_hb_neon(qh, 0,  bit_hi);  // l=0..15, second half
+                uint8x16_t hb3 = q5k_extract_hb_neon(qh, 16, bit_hi);  // l=16..31, second half
 
                 bn_q4k_get_scale_min(sub, blk->scales, &sc, &m);
                 float ds = d * sc;

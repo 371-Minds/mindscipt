@@ -111,8 +111,8 @@ int bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f) {
 
     // Special token IDs
     int idx;
-    idx = bn_gguf_find_key(f, "tokenizer.ggml.bos_token_id");
-    t->bos_id = (idx >= 0) ? (int)bn_gguf_get_u32(f, "tokenizer.ggml.bos_token_id") : 1;
+    int has_bos = (bn_gguf_find_key(f, "tokenizer.ggml.bos_token_id") >= 0);
+    t->bos_id = has_bos ? (int)bn_gguf_get_u32(f, "tokenizer.ggml.bos_token_id") : 1;
 
     idx = bn_gguf_find_key(f, "tokenizer.ggml.eos_token_id");
     t->eos_id = (idx >= 0) ? (int)bn_gguf_get_u32(f, "tokenizer.ggml.eos_token_id") : 2;
@@ -120,9 +120,9 @@ int bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f) {
     idx = bn_gguf_find_key(f, "tokenizer.ggml.eot_token_id");
     t->eot_id = (idx >= 0) ? (int)bn_gguf_get_u32(f, "tokenizer.ggml.eot_token_id") : -1;
 
-    // add_bos_token: default true unless GGUF says otherwise
+    // add_bos_token: use GGUF value if present, otherwise add BOS only if bos_token_id is defined
     idx = bn_gguf_find_key(f, "tokenizer.ggml.add_bos_token");
-    t->add_bos = (idx >= 0) ? (int)f->kvs[idx].value.b : 1;
+    t->add_bos = (idx >= 0) ? (int)f->kvs[idx].value.b : has_bos;
 
     // #16: Build sorted index for binary search
     if ((size_t)t->vocab_size > SIZE_MAX / sizeof(int)) {

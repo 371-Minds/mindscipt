@@ -56,12 +56,15 @@ void bn_quant_q5k_wasm_range(void *ctx, int row_start, int row_end) {
                 } while(0)
                 #endif
 
+                int group = j / 64;
+                int bit_lo = group * 2;      // bits 0,2,4,6
+                int bit_hi = group * 2 + 1;  // bits 1,3,5,7
                 uint8_t lo0[16], lo1[16], hi0[16], hi1[16];
                 for (int l = 0; l < 16; l++) {
-                    lo0[l] = (qs[l] & 0xF) | (((qh[(j+l)/8] >> ((j+l)%8)) & 1) << 4);
-                    lo1[l] = (qs[l+16] & 0xF) | (((qh[(j+16+l)/8] >> ((j+16+l)%8)) & 1) << 4);
-                    hi0[l] = (qs[l] >> 4) | (((qh[(j+32+l)/8] >> ((j+32+l)%8)) & 1) << 4);
-                    hi1[l] = (qs[l+16] >> 4) | (((qh[(j+48+l)/8] >> ((j+48+l)%8)) & 1) << 4);
+                    lo0[l] = (qs[l] & 0xF) | (((qh[l] >> bit_lo) & 1) << 4);
+                    lo1[l] = (qs[l+16] & 0xF) | (((qh[l+16] >> bit_lo) & 1) << 4);
+                    hi0[l] = (qs[l] >> 4) | (((qh[l] >> bit_hi) & 1) << 4);
+                    hi1[l] = (qs[l+16] >> 4) | (((qh[l+16] >> bit_hi) & 1) << 4);
                 }
 
                 bn_q4k_get_scale_min(sub, blk->scales, &sc, &m);

@@ -210,6 +210,28 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         return -1;
     }
 
+    // Hybrid SSM + Attention config (all default to 0 for pure attention models)
+    snprintf(key, sizeof(key), "%s.rope.dimension_count", prefix);
+    c->rope_dim_count = (int)bn_gguf_get_u32(f, key);
+
+    snprintf(key, sizeof(key), "%s.full_attention_interval", prefix);
+    c->full_attn_interval = (int)bn_gguf_get_u32(f, key);
+
+    snprintf(key, sizeof(key), "%s.ssm.state_size", prefix);
+    c->ssm_state_size = (int)bn_gguf_get_u32(f, key);
+
+    snprintf(key, sizeof(key), "%s.ssm.conv_kernel", prefix);
+    c->ssm_conv_kernel = (int)bn_gguf_get_u32(f, key);
+
+    snprintf(key, sizeof(key), "%s.ssm.inner_size", prefix);
+    c->ssm_inner_size = (int)bn_gguf_get_u32(f, key);
+
+    snprintf(key, sizeof(key), "%s.ssm.time_step_rank", prefix);
+    c->ssm_time_step_rank = (int)bn_gguf_get_u32(f, key);
+
+    snprintf(key, sizeof(key), "%s.ssm.group_count", prefix);
+    c->ssm_group_count = (int)bn_gguf_get_u32(f, key);
+
     // Detect FFN gate and activation type
     c->has_ffn_gate = (bn_gguf_find_tensor(f, "blk.0.ffn_gate.weight") >= 0) ? 1 : 0;
 
@@ -228,6 +250,20 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         snprintf(vocab_s, sizeof(vocab_s), "%d", c->vocab_size);
         SH_LOG_DEBUG("Model config", "dim", dim_s, "layers", layers_s,
                      "heads", heads_s, "vocab", vocab_s);
+        if (c->full_attn_interval > 0) {
+            char fai_s[16], ssm_s[16];
+            snprintf(fai_s, sizeof(fai_s), "%d", c->full_attn_interval);
+            snprintf(ssm_s, sizeof(ssm_s), "%d", c->ssm_inner_size);
+            SH_LOG_DEBUG("Hybrid SSM+Attn", "attn_interval", fai_s,
+                         "ssm_inner", ssm_s);
+        }
+#ifdef DEBUG
+        fprintf(stderr, "CFG rope_theta=%.1f norm_eps=%.2e rope_dim_count=%d n_kv_heads=%d kv_dim=%d head_size=%d kv_mul=%d\n",
+                c->rope_theta, c->norm_eps, c->rope_dim_count, c->n_kv_heads, c->kv_dim, c->head_size, c->kv_mul);
+        fprintf(stderr, "CFG full_attn=%d ssm_state=%d ssm_conv=%d ssm_inner=%d ssm_rank=%d ssm_group=%d\n",
+                c->full_attn_interval, c->ssm_state_size, c->ssm_conv_kernel, c->ssm_inner_size, c->ssm_time_step_rank, c->ssm_group_count);
+        fprintf(stderr, "CFG act_type=%d has_ffn_gate=%d arch=%s\n", c->act_type, c->has_ffn_gate, arch ? arch : "(null)");
+#endif
     }
 
     // --- Load weights ---
@@ -315,6 +351,10 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         BnLayerWeights *lw = &w->layers[i];
         char wname[128], sname[128];
 
+        // Determine layer type for hybrid models
+        int is_ssm = (c->full_attn_interval > 0) &&
+                     ((i + 1) % c->full_attn_interval != 0);
+
         // #25: Attention norms — must exist
         snprintf(wname, sizeof(wname), "blk.%d.attn_norm.weight", i);
         lw->attn_norm = load_f32_tensor(f, wname);
@@ -326,36 +366,82 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         snprintf(wname, sizeof(wname), "blk.%d.attn_sub_norm.weight", i);
         lw->attn_sub_norm = load_f32_tensor(f, wname);  // optional
 
-        // #23: Check load_qweight return values
-        snprintf(wname, sizeof(wname), "blk.%d.attn_q.weight", i);
-        snprintf(sname, sizeof(sname), "blk.%d.attn_q.scale", i);
-        if (load_qweight(&lw->wq, f, wname, sname) != 0) goto fail_layers;
+        if (is_ssm) {
+            // --- SSM layer weights ---
+            snprintf(wname, sizeof(wname), "blk.%d.attn_qkv.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.attn_qkv.scale", i);
+            if (load_qweight(&lw->wqkv, f, wname, sname) != 0) goto fail_layers;
 
-        snprintf(wname, sizeof(wname), "blk.%d.attn_k.weight", i);
-        snprintf(sname, sizeof(sname), "blk.%d.attn_k.scale", i);
-        if (load_qweight(&lw->wk, f, wname, sname) != 0) goto fail_layers;
+            snprintf(wname, sizeof(wname), "blk.%d.attn_gate.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.attn_gate.scale", i);
+            if (load_qweight(&lw->wz, f, wname, sname) != 0) goto fail_layers;
 
-        snprintf(wname, sizeof(wname), "blk.%d.attn_v.weight", i);
-        snprintf(sname, sizeof(sname), "blk.%d.attn_v.scale", i);
-        if (load_qweight(&lw->wv, f, wname, sname) != 0) goto fail_layers;
+            snprintf(wname, sizeof(wname), "blk.%d.ssm_a", i);
+            lw->ssm_a = load_f32_tensor(f, wname);
 
-        snprintf(wname, sizeof(wname), "blk.%d.attn_output.weight", i);
-        snprintf(sname, sizeof(sname), "blk.%d.attn_output.scale", i);
-        if (load_qweight(&lw->wo, f, wname, sname) != 0) goto fail_layers;
+            snprintf(wname, sizeof(wname), "blk.%d.ssm_alpha.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.ssm_alpha.scale", i);
+            if (load_qweight(&lw->ssm_alpha, f, wname, sname) != 0) goto fail_layers;
 
-        // Attention biases (optional, used by Qwen2)
-        snprintf(wname, sizeof(wname), "blk.%d.attn_q.bias", i);
-        lw->q_bias = load_f32_tensor(f, wname);
-        snprintf(wname, sizeof(wname), "blk.%d.attn_k.bias", i);
-        lw->k_bias = load_f32_tensor(f, wname);
-        snprintf(wname, sizeof(wname), "blk.%d.attn_v.bias", i);
-        lw->v_bias = load_f32_tensor(f, wname);
+            snprintf(wname, sizeof(wname), "blk.%d.ssm_beta.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.ssm_beta.scale", i);
+            if (load_qweight(&lw->ssm_beta, f, wname, sname) != 0) goto fail_layers;
+
+            snprintf(wname, sizeof(wname), "blk.%d.ssm_conv1d.weight", i);
+            lw->ssm_conv1d = load_f32_tensor(f, wname);
+
+            snprintf(wname, sizeof(wname), "blk.%d.ssm_dt.bias", i);
+            lw->ssm_dt_bias = load_f32_tensor(f, wname);
+
+            snprintf(wname, sizeof(wname), "blk.%d.ssm_norm.weight", i);
+            lw->ssm_norm = load_f32_tensor(f, wname);
+
+            snprintf(wname, sizeof(wname), "blk.%d.ssm_out.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.ssm_out.scale", i);
+            if (load_qweight(&lw->ssm_out, f, wname, sname) != 0) goto fail_layers;
+        } else {
+            // --- Attention layer weights ---
+            snprintf(wname, sizeof(wname), "blk.%d.attn_q.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.attn_q.scale", i);
+            if (load_qweight(&lw->wq, f, wname, sname) != 0) goto fail_layers;
+
+            snprintf(wname, sizeof(wname), "blk.%d.attn_k.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.attn_k.scale", i);
+            if (load_qweight(&lw->wk, f, wname, sname) != 0) goto fail_layers;
+
+            snprintf(wname, sizeof(wname), "blk.%d.attn_v.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.attn_v.scale", i);
+            if (load_qweight(&lw->wv, f, wname, sname) != 0) goto fail_layers;
+
+            snprintf(wname, sizeof(wname), "blk.%d.attn_output.weight", i);
+            snprintf(sname, sizeof(sname), "blk.%d.attn_output.scale", i);
+            if (load_qweight(&lw->wo, f, wname, sname) != 0) goto fail_layers;
+
+            // Attention biases (optional, used by Qwen2)
+            snprintf(wname, sizeof(wname), "blk.%d.attn_q.bias", i);
+            lw->q_bias = load_f32_tensor(f, wname);
+            snprintf(wname, sizeof(wname), "blk.%d.attn_k.bias", i);
+            lw->k_bias = load_f32_tensor(f, wname);
+            snprintf(wname, sizeof(wname), "blk.%d.attn_v.bias", i);
+            lw->v_bias = load_f32_tensor(f, wname);
+
+            // Q/K norms (Qwen3.5 attention)
+            snprintf(wname, sizeof(wname), "blk.%d.attn_q_norm.weight", i);
+            lw->q_norm = load_f32_tensor(f, wname);
+            snprintf(wname, sizeof(wname), "blk.%d.attn_k_norm.weight", i);
+            lw->k_norm = load_f32_tensor(f, wname);
+        }
 
         // #25: FFN norms — must exist
         snprintf(wname, sizeof(wname), "blk.%d.ffn_norm.weight", i);
         lw->ffn_norm = load_f32_tensor(f, wname);
         if (!lw->ffn_norm) {
-            SH_LOG_ERROR("Tensor not found", "name", wname);
+            // Qwen3.5 uses post_attention_norm instead of ffn_norm
+            snprintf(wname, sizeof(wname), "blk.%d.post_attention_norm.weight", i);
+            lw->ffn_norm = load_f32_tensor(f, wname);
+        }
+        if (!lw->ffn_norm) {
+            SH_LOG_ERROR("FFN norm not found for layer");
             goto fail_layers;
         }
 
@@ -388,16 +474,37 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         goto fail_state;
     }
 
+    // Only attention layers need KV cache
+    int n_attn_layers = (c->full_attn_interval > 0)
+        ? c->n_layers / c->full_attn_interval : c->n_layers;
+    int n_ssm_layers = c->n_layers - n_attn_layers;
+
     // #14: Check for overflow before large KV cache allocations
-    size_t kv_cache_size = (size_t)c->n_layers * c->seq_len * c->kv_dim;
-    if (c->n_layers > 0 && c->seq_len > 0 && c->kv_dim > 0 &&
-        kv_cache_size / c->n_layers / c->seq_len != (size_t)c->kv_dim) {
+    size_t kv_cache_size = (size_t)n_attn_layers * c->seq_len * c->kv_dim;
+    if (n_attn_layers > 0 && c->seq_len > 0 && c->kv_dim > 0 &&
+        kv_cache_size / n_attn_layers / c->seq_len != (size_t)c->kv_dim) {
         SH_LOG_ERROR("KV cache size overflow");
         goto fail_state;
     }
 
     int x_q_size = c->dim > c->hidden_dim ? c->dim : c->hidden_dim;
     int half_head = c->head_size / 2;
+
+    // Scratch buffer sizes — enlarged for hybrid SSM + gated-Q attention
+    int hb_size = c->hidden_dim;
+    int hb2_size = c->hidden_dim;
+    int xb2_size = c->dim;
+    if (c->full_attn_interval > 0) {
+        // SSM: qkv projection → hb, z gate → hb2, recurrence output → xb2
+        int qkv_dim = c->ssm_group_count * c->ssm_state_size * 2 + c->ssm_inner_size;
+        if (qkv_dim > hb_size) hb_size = qkv_dim;
+        if (c->ssm_inner_size > hb2_size) hb2_size = c->ssm_inner_size;
+        if (c->ssm_inner_size > xb2_size) xb2_size = c->ssm_inner_size;
+        if (c->ssm_inner_size > x_q_size) x_q_size = c->ssm_inner_size;
+        // Gated Q attention: q_full (Q + gate) → hb
+        int gq = 2 * c->dim;
+        if (gq > hb_size) hb_size = gq;
+    }
 
     // INT8 embedding size (DOTPROD + F16 only)
     size_t emb_i8_bytes = 0;
@@ -424,6 +531,9 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         q4_repack_total += q4_repack_bytes(&lw->wk);
         q4_repack_total += q4_repack_bytes(&lw->wv);
         q4_repack_total += q4_repack_bytes(&lw->wo);
+        q4_repack_total += q4_repack_bytes(&lw->wqkv);
+        q4_repack_total += q4_repack_bytes(&lw->wz);
+        q4_repack_total += q4_repack_bytes(&lw->ssm_out);
         q4_repack_total += q4_repack_bytes(&lw->ffn_gate);
         q4_repack_total += q4_repack_bytes(&lw->ffn_up);
         q4_repack_total += q4_repack_bytes(&lw->ffn_down);
@@ -431,19 +541,33 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     q4_repack_total += q4_repack_bytes(&w->output_weight);
 #endif
 
+    // SSM state sizing
+    size_t ssm_state_size_total = 0;
+    size_t ssm_conv_state_total = 0;
+    if (n_ssm_layers > 0 && c->ssm_time_step_rank > 0) {
+        int head_v_dim = c->ssm_inner_size / c->ssm_time_step_rank;
+        size_t state_per_layer = (size_t)c->ssm_time_step_rank *
+                                  c->ssm_state_size * head_v_dim;
+        ssm_state_size_total = (size_t)n_ssm_layers * state_per_layer;
+        int conv_dim = c->ssm_group_count * c->ssm_state_size * 2 + c->ssm_inner_size;
+        ssm_conv_state_total = (size_t)n_ssm_layers *
+                                (c->ssm_conv_kernel - 1) * conv_dim;
+    }
+
     // Compute total arena capacity (all RunState buffers + INT8 embeddings + Q4 repacking)
     size_t arena_size = 0;
-    arena_size += 4 * (size_t)c->dim * sizeof(float);         // x, xb, xb2, q
-    arena_size += 2 * (size_t)c->hidden_dim * sizeof(float);  // hb, hb2
+    arena_size += (3 * (size_t)c->dim + (size_t)xb2_size) * sizeof(float); // x, xb, xb2, q  (xb2 may be > dim for SSM)
+    arena_size += ((size_t)hb_size + (size_t)hb2_size) * sizeof(float);    // hb, hb2
     arena_size += att_size * sizeof(float);                     // att
     arena_size += (size_t)c->vocab_size * sizeof(float);       // logits
     size_t kv_elem_size = c->kv_f16 ? sizeof(uint16_t) : sizeof(float);
     arena_size += 2 * kv_cache_size * kv_elem_size;           // key_cache, value_cache
     arena_size += (size_t)x_q_size * sizeof(int8_t);           // x_q
     arena_size += (size_t)half_head * sizeof(float);           // rope_freq
+    arena_size += (ssm_state_size_total + ssm_conv_state_total) * sizeof(float); // SSM state
     arena_size += emb_i8_bytes + emb_i8_scales_bytes;          // INT8 embeddings
     arena_size += q4_repack_total;                              // Q4_0 repacked weights
-    arena_size += 14 * SH_ARENA_ALIGN;                         // alignment padding
+    arena_size += 16 * SH_ARENA_ALIGN;                         // alignment padding
 
     m->arena = sh_arena_create(arena_size);
     if (!m->arena) {
@@ -453,16 +577,24 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
 
     s->x           = (float *)sh_arena_calloc(m->arena, c->dim, sizeof(float));
     s->xb          = (float *)sh_arena_calloc(m->arena, c->dim, sizeof(float));
-    s->xb2         = (float *)sh_arena_calloc(m->arena, c->dim, sizeof(float));
+    s->xb2         = (float *)sh_arena_calloc(m->arena, xb2_size, sizeof(float));
     s->q           = (float *)sh_arena_calloc(m->arena, c->dim, sizeof(float));
-    s->hb          = (float *)sh_arena_calloc(m->arena, c->hidden_dim, sizeof(float));
-    s->hb2         = (float *)sh_arena_calloc(m->arena, c->hidden_dim, sizeof(float));
+    s->hb          = (float *)sh_arena_calloc(m->arena, hb_size, sizeof(float));
+    s->hb2         = (float *)sh_arena_calloc(m->arena, hb2_size, sizeof(float));
     s->att         = (float *)sh_arena_calloc(m->arena, att_size, sizeof(float));
     s->logits      = (float *)sh_arena_calloc(m->arena, c->vocab_size, sizeof(float));
     s->key_cache   = (float *)sh_arena_calloc(m->arena, kv_cache_size, kv_elem_size);
     s->value_cache = (float *)sh_arena_calloc(m->arena, kv_cache_size, kv_elem_size);
     s->x_q         = (int8_t *)sh_arena_calloc(m->arena, x_q_size, sizeof(int8_t));
     s->rope_freq   = (float *)sh_arena_alloc(m->arena, half_head * sizeof(float));
+
+    // SSM state buffers
+    s->ssm_state = NULL;
+    s->ssm_conv_state = NULL;
+    if (ssm_state_size_total > 0) {
+        s->ssm_state = (float *)sh_arena_calloc(m->arena, ssm_state_size_total, sizeof(float));
+        s->ssm_conv_state = (float *)sh_arena_calloc(m->arena, ssm_conv_state_total, sizeof(float));
+    }
 
     // #1: Check all allocations succeeded
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 ||
@@ -471,10 +603,16 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         SH_LOG_ERROR("Failed to allocate run state buffers");
         goto fail_state;
     }
+    if (ssm_state_size_total > 0 && (!s->ssm_state || !s->ssm_conv_state)) {
+        SH_LOG_ERROR("Failed to allocate SSM state buffers");
+        goto fail_state;
+    }
 
-    // Precompute RoPE frequencies: freq[i] = 1/theta^(2i/head_size)
-    for (int i = 0; i < half_head; i++) {
-        s->rope_freq[i] = 1.0f / powf(c->rope_theta, (float)(2 * i) / (float)c->head_size);
+    // Precompute RoPE frequencies: freq[i] = 1/theta^(2i/rope_dims)
+    int rope_dims = c->rope_dim_count > 0 ? c->rope_dim_count : c->head_size;
+    int half_rope = rope_dims / 2;
+    for (int i = 0; i < half_rope; i++) {
+        s->rope_freq[i] = 1.0f / powf(c->rope_theta, (float)(2 * i) / (float)rope_dims);
     }
 
     // Quantize F16 embeddings to INT8 for fast SDOT logits kernel
@@ -507,6 +645,9 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
             q4_repack(&lw->wk, m->arena);
             q4_repack(&lw->wv, m->arena);
             q4_repack(&lw->wo, m->arena);
+            q4_repack(&lw->wqkv, m->arena);
+            q4_repack(&lw->wz, m->arena);
+            q4_repack(&lw->ssm_out, m->arena);
             q4_repack(&lw->ffn_gate, m->arena);
             q4_repack(&lw->ffn_up, m->arena);
             q4_repack(&lw->ffn_down, m->arena);
@@ -514,6 +655,69 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         q4_repack(&w->output_weight, m->arena);
         char rp_mb[16]; snprintf(rp_mb, sizeof(rp_mb), "%.0f", (double)q4_repack_total / (1024*1024));
         SH_LOG_INFO("Q4_0 weights repacked", "MB", rp_mb);
+    }
+#endif
+
+#ifdef DEBUG
+    // Validate SSM weight dimensions and values after loading
+    if (c->full_attn_interval > 0) {
+        BnLayerWeights *lw0 = &w->layers[0];
+        // Print all SSM tensor dimensions for layer 0
+        fprintf(stderr, "=== SSM L0 tensor dimensions ===\n");
+        fprintf(stderr, "wqkv: type=%d rows=%d cols=%d (expect rows=%d cols=%d)\n",
+            lw0->wqkv.type, lw0->wqkv.rows, lw0->wqkv.cols,
+            c->ssm_group_count * c->ssm_state_size * 2 + c->ssm_inner_size, c->dim);
+        fprintf(stderr, "wz: type=%d rows=%d cols=%d (expect rows=%d cols=%d)\n",
+            lw0->wz.type, lw0->wz.rows, lw0->wz.cols, c->ssm_inner_size, c->dim);
+        fprintf(stderr, "ssm_alpha: type=%d rows=%d cols=%d (expect rows=%d cols=%d)\n",
+            lw0->ssm_alpha.type, lw0->ssm_alpha.rows, lw0->ssm_alpha.cols,
+            c->ssm_time_step_rank, c->dim);
+        fprintf(stderr, "ssm_beta: type=%d rows=%d cols=%d (expect rows=%d cols=%d)\n",
+            lw0->ssm_beta.type, lw0->ssm_beta.rows, lw0->ssm_beta.cols,
+            c->ssm_time_step_rank, c->dim);
+        fprintf(stderr, "ssm_out: type=%d rows=%d cols=%d (expect rows=%d cols=%d)\n",
+            lw0->ssm_out.type, lw0->ssm_out.rows, lw0->ssm_out.cols,
+            c->dim, c->ssm_inner_size);
+        fprintf(stderr, "ssm_norm: %p (expect [%d] = head_v_dim)\n",
+            (void*)lw0->ssm_norm, c->ssm_inner_size / c->ssm_time_step_rank);
+        if (lw0->ssm_norm)
+            fprintf(stderr, "ssm_norm[0..3]: %.6f %.6f %.6f %.6f\n",
+                lw0->ssm_norm[0], lw0->ssm_norm[1], lw0->ssm_norm[2], lw0->ssm_norm[3]);
+        // Print attention layer (L3) dimensions
+        int attn_l = c->full_attn_interval - 1;
+        if (attn_l < c->n_layers) {
+            BnLayerWeights *lwa = &w->layers[attn_l];
+            fprintf(stderr, "=== ATN L%d tensor dimensions ===\n", attn_l);
+            fprintf(stderr, "wq: type=%d rows=%d cols=%d\n", lwa->wq.type, lwa->wq.rows, lwa->wq.cols);
+            fprintf(stderr, "wk: type=%d rows=%d cols=%d\n", lwa->wk.type, lwa->wk.rows, lwa->wk.cols);
+            fprintf(stderr, "wv: type=%d rows=%d cols=%d\n", lwa->wv.type, lwa->wv.rows, lwa->wv.cols);
+            fprintf(stderr, "wo: type=%d rows=%d cols=%d\n", lwa->wo.type, lwa->wo.rows, lwa->wo.cols);
+            fprintf(stderr, "q_norm: %p  k_norm: %p\n", (void*)lwa->q_norm, (void*)lwa->k_norm);
+            if (lwa->q_norm)
+                fprintf(stderr, "q_norm[0..3]: %.6f %.6f %.6f %.6f\n",
+                    lwa->q_norm[0], lwa->q_norm[1], lwa->q_norm[2], lwa->q_norm[3]);
+        }
+        if (lw0->ssm_conv1d) {
+            int kern = c->ssm_conv_kernel;
+            fprintf(stderr, "CONV1D L0 [ch=0]: %.6f %.6f %.6f %.6f\n",
+                lw0->ssm_conv1d[0*kern+0], lw0->ssm_conv1d[0*kern+1],
+                lw0->ssm_conv1d[0*kern+2], lw0->ssm_conv1d[0*kern+3]);
+        }
+        if (lw0->ssm_a)
+            fprintf(stderr, "SSM_A L0 [0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                lw0->ssm_a[0], lw0->ssm_a[1], lw0->ssm_a[2], lw0->ssm_a[3],
+                lw0->ssm_a[4], lw0->ssm_a[5], lw0->ssm_a[6], lw0->ssm_a[7]);
+        if (lw0->ssm_dt_bias)
+            fprintf(stderr, "DT_BIAS L0 [0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                lw0->ssm_dt_bias[0], lw0->ssm_dt_bias[1], lw0->ssm_dt_bias[2], lw0->ssm_dt_bias[3],
+                lw0->ssm_dt_bias[4], lw0->ssm_dt_bias[5], lw0->ssm_dt_bias[6], lw0->ssm_dt_bias[7]);
+        fprintf(stderr, "OUTPUT type=%d rows=%d cols=%d\n",
+                w->output_weight.type, w->output_weight.rows, w->output_weight.cols);
+        fprintf(stderr, "=== Buffer sizes ===\n");
+        fprintf(stderr, "hb_size=%d hb2_size=%d xb2_size=%d x_q_size=%d\n",
+                hb_size, hb2_size, xb2_size, x_q_size);
+        fprintf(stderr, "n_attn=%d n_ssm=%d ssm_state_total=%zu ssm_conv_total=%zu\n",
+                n_attn_layers, n_ssm_layers, ssm_state_size_total, ssm_conv_state_total);
     }
 #endif
 

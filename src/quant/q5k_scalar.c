@@ -20,20 +20,21 @@ void bn_quant_q5k_scalar_range(void *ctx, int row_start, int row_end) {
             for (int j = 0; j < BN_QK_K; j += 64) {
                 uint8_t sc, m;
                 int sub = j / 32;
+                int group = j / 64;  // 0..3
+                int bit_lo = group * 2;      // bits 0,2,4,6
+                int bit_hi = group * 2 + 1;  // bits 1,3,5,7
                 bn_q4k_get_scale_min(sub, blk->scales, &sc, &m);
                 float ds = d * sc;
                 float dm = dmin * m;
                 for (int l = 0; l < 32; l++) {
-                    int bit_idx = j + l;
-                    int q5 = (qs[l] & 0xF) | (((qh[bit_idx / 8] >> (bit_idx % 8)) & 1) << 4);
+                    int q5 = (qs[l] & 0xF) | (((qh[l] >> bit_lo) & 1) << 4);
                     row_sum += (ds * q5 - dm) * xb[j + l];
                 }
                 bn_q4k_get_scale_min(sub + 1, blk->scales, &sc, &m);
                 ds = d * sc;
                 dm = dmin * m;
                 for (int l = 0; l < 32; l++) {
-                    int bit_idx = j + 32 + l;
-                    int q5 = (qs[l] >> 4) | (((qh[bit_idx / 8] >> (bit_idx % 8)) & 1) << 4);
+                    int q5 = (qs[l] >> 4) | (((qh[l] >> bit_hi) & 1) << 4);
                     row_sum += (ds * q5 - dm) * xb[j + l + 32];
                 }
                 qs += 32;
