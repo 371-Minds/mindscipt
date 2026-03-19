@@ -700,6 +700,35 @@ fail_layers:
     return -1;
 }
 
+void bn_model_reset_state(BnModel *m) {
+    if (!m) return;
+    BnConfig *c = &m->config;
+    BnRunState *s = &m->state;
+
+    // KV cache
+    int n_attn = (c->full_attn_interval > 0)
+        ? c->n_layers / c->full_attn_interval : c->n_layers;
+    size_t kv_size = (size_t)n_attn * c->seq_len * c->kv_dim;
+    size_t kv_elem = c->kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    memset(s->key_cache, 0, kv_size * kv_elem);
+    memset(s->value_cache, 0, kv_size * kv_elem);
+
+    // SSM state
+    if (s->ssm_state && c->ssm_time_step_rank > 0) {
+        int n_ssm = c->n_layers - n_attn;
+        int head_v_dim = c->ssm_inner_size / c->ssm_time_step_rank;
+        size_t state_total = (size_t)n_ssm * c->ssm_time_step_rank *
+                             c->ssm_state_size * head_v_dim;
+        memset(s->ssm_state, 0, state_total * sizeof(float));
+    }
+    if (s->ssm_conv_state) {
+        int n_ssm = c->n_layers - n_attn;
+        int conv_dim = c->ssm_group_count * c->ssm_state_size * 2 + c->ssm_inner_size;
+        size_t conv_total = (size_t)n_ssm * (c->ssm_conv_kernel - 1) * conv_dim;
+        memset(s->ssm_conv_state, 0, conv_total * sizeof(float));
+    }
+}
+
 void bn_model_free(BnModel *m) {
     if (!m) return;
     bn_tp_free(m->pool);

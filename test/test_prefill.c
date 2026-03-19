@@ -67,11 +67,8 @@ int main(int argc, char **argv) {
     assert(lp != NULL);
     memcpy(logits_prefill, lp, vocab_size * sizeof(float));
 
-    // --- Reset KV cache ---
-    BnRunState *s = &model.state;
-    size_t kv_size = (size_t)model.config.n_layers * model.config.seq_len * model.config.kv_dim;
-    memset(s->key_cache, 0, kv_size * sizeof(float));
-    memset(s->value_cache, 0, kv_size * sizeof(float));
+    // --- Reset ALL state (KV cache + SSM state) ---
+    bn_model_reset_state(&model);
 
     // --- Run 2: Sequential forward ---
     printf("Running sequential forward...\n");

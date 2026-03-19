@@ -83,6 +83,7 @@ typedef struct {
 
 int  bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16);
 void bn_model_free(BnModel *m);
+void bn_model_reset_state(BnModel *m);
 void bn_model_embed_token(const BnModel *m, float *out, int token);
 
 #endif // BN_MODEL_H

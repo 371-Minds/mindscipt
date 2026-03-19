@@ -2,6 +2,7 @@
 #include "quant_internal.h"
 #include "sh_log.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 // Max elements for stack VLAs (head_size, dim). Prevents stack overflow
 // from malicious model configs. 8192 = 32KB of floats, well within stack.
@@ -255,9 +256,11 @@ static void forward_ffn_block(BnModel *m, BnLayerWeights *lw) {
     residual_add(s->x, s->xb, dim);
 }
 
-// Embed + all layers (attention + FFN). Populates KV cache at `pos`.
-// Leaves final activation in s->x. Returns 0 on success, -1 on error.
-static int forward_layers(BnModel *m, int token, int pos) {
+// Process a single layer (attention/SSM block + FFN). Reads/writes s->x.
+// Returns 0 on success.
+static int forward_single_layer(BnModel *m, int l, int pos, int cache_pos,
+                                int rope_dims, const float *rope_cos,
+                                const float *rope_sin) {
     BnConfig *c = &m->config;
     BnWeights *w = &m->weights;
     BnRunState *s = &m->state;
@@ -266,9 +269,262 @@ static int forward_layers(BnModel *m, int token, int pos) {
     int kv_mul = c->kv_mul;
     int head_size = c->head_size;
     int n_heads = c->n_heads;
+    BnLayerWeights *lw = &w->layers[l];
+
+    int is_attn = (c->full_attn_interval == 0) ||
+                  ((l + 1) % c->full_attn_interval == 0);
+
+    if (is_attn) {
+        // ---- Attention block ----
+
+        // KV cache offset: contiguous among attention layers only
+        int attn_idx = (c->full_attn_interval > 0)
+            ? (l + 1) / c->full_attn_interval - 1 : l;
+        size_t loff = (size_t)attn_idx * c->seq_len * kv_dim;
+
+        // Gated Q: Q weight produces 2x dim (interleaved [Q,gate] per head)
+        int q_gated = lw->wq.data && (lw->wq.rows > dim);
+
+        rmsnorm(s->xb, s->x, lw->attn_norm, dim, c->norm_eps);
+
+        if (q_gated) {
+            // --- Gated Q path (Qwen3.5 attention) ---
+            float *q_full = s->hb;  // [2*dim]
+
+            if (c->kv_f16) {
+                float *k_tmp = s->hb2;
+                float *v_tmp = s->hb2 + kv_dim;
+                BnMatvecTask q_task[1] = {{ q_full, &lw->wq }};
+                bn_quant_matvec_batch(q_task, 1, s->xb, s->x_q, m->pool);
+                BnMatvecTask kv[2] = {
+                    { k_tmp, &lw->wk },
+                    { v_tmp, &lw->wv },
+                };
+                bn_quant_matvec_batch(kv, 2, s->xb, s->x_q, m->pool);
+
+                for (int h = 0; h < n_heads; h++)
+                    memcpy(s->q + h * head_size,
+                           q_full + h * 2 * head_size,
+                           head_size * sizeof(float));
+
+                if (lw->q_norm)
+                    for (int h = 0; h < n_heads; h++)
+                        rmsnorm(s->q + h*head_size, s->q + h*head_size,
+                                lw->q_norm, head_size, c->norm_eps);
+                if (lw->k_norm)
+                    for (int h = 0; h < c->n_kv_heads; h++)
+                        rmsnorm(k_tmp + h*head_size, k_tmp + h*head_size,
+                                lw->k_norm, head_size, c->norm_eps);
+
+                apply_rope_heads(s->q, n_heads, head_size,
+                                 rope_dims, rope_cos, rope_sin);
+                apply_rope_heads(k_tmp, c->n_kv_heads, head_size,
+                                 rope_dims, rope_cos, rope_sin);
+
+                uint16_t *kc = (uint16_t *)s->key_cache   + loff + (size_t)cache_pos * kv_dim;
+                uint16_t *vc = (uint16_t *)s->value_cache + loff + (size_t)cache_pos * kv_dim;
+#ifdef __ARM_NEON
+                for (int i = 0; i < kv_dim; i += 4) {
+                    vst1_u16(kc + i, vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(k_tmp + i))));
+                    vst1_u16(vc + i, vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(v_tmp + i))));
+                }
+#elif defined(__AVX2__)
+                for (int i = 0; i < kv_dim; i += 8) {
+                    _mm_storeu_si128((__m128i *)(kc + i), _mm256_cvtps_ph(_mm256_loadu_ps(k_tmp + i), _MM_FROUND_TO_NEAREST_INT));
+                    _mm_storeu_si128((__m128i *)(vc + i), _mm256_cvtps_ph(_mm256_loadu_ps(v_tmp + i), _MM_FROUND_TO_NEAREST_INT));
+                }
+#else
+                for (int i = 0; i < kv_dim; i++) {
+                    kc[i] = bn_fp32_to_fp16(k_tmp[i]);
+                    vc[i] = bn_fp32_to_fp16(v_tmp[i]);
+                }
+#endif
+            } else {
+                float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
+                float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
+                BnMatvecTask q_task[1] = {{ q_full, &lw->wq }};
+                bn_quant_matvec_batch(q_task, 1, s->xb, s->x_q, m->pool);
+                BnMatvecTask kv[2] = {
+                    { key_cache_row,   &lw->wk },
+                    { value_cache_row, &lw->wv },
+                };
+                bn_quant_matvec_batch(kv, 2, s->xb, s->x_q, m->pool);
+
+                for (int h = 0; h < n_heads; h++)
+                    memcpy(s->q + h * head_size,
+                           q_full + h * 2 * head_size,
+                           head_size * sizeof(float));
+
+                if (lw->q_norm)
+                    for (int h = 0; h < n_heads; h++)
+                        rmsnorm(s->q + h*head_size, s->q + h*head_size,
+                                lw->q_norm, head_size, c->norm_eps);
+                if (lw->k_norm)
+                    for (int h = 0; h < c->n_kv_heads; h++)
+                        rmsnorm(key_cache_row + h*head_size,
+                                key_cache_row + h*head_size,
+                                lw->k_norm, head_size, c->norm_eps);
+
+                apply_rope_heads(s->q, n_heads, head_size,
+                                 rope_dims, rope_cos, rope_sin);
+                apply_rope_heads(key_cache_row, c->n_kv_heads, head_size,
+                                 rope_dims, rope_cos, rope_sin);
+            }
+
+            // GQA attention
+            {
+                int n_kv = (pos + 1 < c->seq_len) ? pos + 1 : c->seq_len;
+                BnGQACtx gctx = { c, s, loff, pos, n_kv, kv_mul, head_size, kv_dim, c->seq_len };
+#ifdef __ARM_NEON
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_neon_range : bn_transformer_gqa_neon_range;
+#elif defined(__AVX2__)
+                bn_tp_fn attn_fn = bn_transformer_gqa_avx2_range;
+#elif defined(__wasm_simd128__)
+                bn_tp_fn attn_fn = bn_transformer_gqa_wasm_range;
+#else
+                bn_tp_fn attn_fn = bn_transformer_gqa_scalar_range;
+#endif
+                BnTPTask gqa = { attn_fn, &gctx, n_heads };
+                bn_tp_dispatch(m->pool, &gqa, 1);
+            }
+
+            // Sigmoid gate: xb *= sigmoid(gate)
+            for (int h = 0; h < n_heads; h++) {
+                float *gate_h = q_full + h * 2 * head_size + head_size;
+                float *xb_h = s->xb + h * head_size;
+                for (int d = 0; d < head_size; d++)
+                    xb_h[d] *= 1.0f / (1.0f + expf(-gate_h[d]));
+            }
+
+            // wo projection + residual
+            if (lw->attn_sub_norm)
+                rmsnorm(s->xb, s->xb, lw->attn_sub_norm, dim, c->norm_eps);
+            {
+                BnMatvecTask wo[1] = {{ s->xb2, &lw->wo }};
+                bn_quant_matvec_batch(wo, 1, s->xb, s->x_q, m->pool);
+            }
+            residual_add(s->x, s->xb2, dim);
+
+        } else {
+            // --- Classic attention path (existing) ---
+            float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
+            float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
+
+            if (c->kv_f16) {
+                float *k_tmp = s->hb, *v_tmp = s->hb2;
+                BnMatvecTask qkv[3] = {
+                    { s->q,  &lw->wq },
+                    { k_tmp, &lw->wk },
+                    { v_tmp, &lw->wv },
+                };
+                bn_quant_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
+
+                if (lw->q_bias) for (int i = 0; i < dim; i++) s->q[i] += lw->q_bias[i];
+                if (lw->k_bias) for (int i = 0; i < kv_dim; i++) k_tmp[i] += lw->k_bias[i];
+                if (lw->v_bias) for (int i = 0; i < kv_dim; i++) v_tmp[i] += lw->v_bias[i];
+
+                apply_rope_heads(s->q, n_heads, head_size,
+                                 rope_dims, rope_cos, rope_sin);
+                apply_rope_heads(k_tmp, c->n_kv_heads, head_size,
+                                 rope_dims, rope_cos, rope_sin);
+
+                uint16_t *kc = (uint16_t *)s->key_cache   + loff + (size_t)cache_pos * kv_dim;
+                uint16_t *vc = (uint16_t *)s->value_cache + loff + (size_t)cache_pos * kv_dim;
+#ifdef __ARM_NEON
+                for (int i = 0; i < kv_dim; i += 4) {
+                    float32x4_t kv4 = vld1q_f32(k_tmp + i);
+                    float16x4_t kh4 = vcvt_f16_f32(kv4);
+                    vst1_u16(kc + i, vreinterpret_u16_f16(kh4));
+                    float32x4_t vv4 = vld1q_f32(v_tmp + i);
+                    float16x4_t vh4 = vcvt_f16_f32(vv4);
+                    vst1_u16(vc + i, vreinterpret_u16_f16(vh4));
+                }
+#elif defined(__AVX2__)
+                for (int i = 0; i < kv_dim; i += 8) {
+                    _mm_storeu_si128((__m128i *)(kc + i), _mm256_cvtps_ph(_mm256_loadu_ps(k_tmp + i), _MM_FROUND_TO_NEAREST_INT));
+                    _mm_storeu_si128((__m128i *)(vc + i), _mm256_cvtps_ph(_mm256_loadu_ps(v_tmp + i), _MM_FROUND_TO_NEAREST_INT));
+                }
+#else
+                for (int i = 0; i < kv_dim; i++) {
+                    kc[i] = bn_fp32_to_fp16(k_tmp[i]);
+                    vc[i] = bn_fp32_to_fp16(v_tmp[i]);
+                }
+#endif
+            } else {
+                BnMatvecTask qkv[3] = {
+                    { s->q,            &lw->wq },
+                    { key_cache_row,   &lw->wk },
+                    { value_cache_row, &lw->wv },
+                };
+                bn_quant_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
+
+                if (lw->q_bias) for (int i = 0; i < dim; i++) s->q[i] += lw->q_bias[i];
+                if (lw->k_bias) for (int i = 0; i < kv_dim; i++) key_cache_row[i] += lw->k_bias[i];
+                if (lw->v_bias) for (int i = 0; i < kv_dim; i++) value_cache_row[i] += lw->v_bias[i];
+
+                apply_rope_heads(s->q, n_heads, head_size,
+                                 rope_dims, rope_cos, rope_sin);
+                apply_rope_heads(key_cache_row, c->n_kv_heads, head_size,
+                                 rope_dims, rope_cos, rope_sin);
+            }
+
+            // GQA attention
+            {
+                int n_kv = (pos + 1 < c->seq_len) ? pos + 1 : c->seq_len;
+                BnGQACtx gctx = { c, s, loff, pos, n_kv, kv_mul, head_size, kv_dim, c->seq_len };
+#ifdef __ARM_NEON
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_neon_range : bn_transformer_gqa_neon_range;
+#elif defined(__AVX2__)
+                bn_tp_fn attn_fn = bn_transformer_gqa_avx2_range;
+#elif defined(__wasm_simd128__)
+                bn_tp_fn attn_fn = bn_transformer_gqa_wasm_range;
+#else
+                bn_tp_fn attn_fn = bn_transformer_gqa_scalar_range;
+#endif
+                BnTPTask gqa = { attn_fn, &gctx, n_heads };
+                bn_tp_dispatch(m->pool, &gqa, 1);
+            }
+
+            // Attention sub-norm + wo projection + residual
+            if (lw->attn_sub_norm)
+                rmsnorm(s->xb, s->xb, lw->attn_sub_norm, dim, c->norm_eps);
+            {
+                BnMatvecTask wo[1] = {{ s->xb2, &lw->wo }};
+                bn_quant_matvec_batch(wo, 1, s->xb, s->x_q, m->pool);
+            }
+            residual_add(s->x, s->xb2, dim);
+        }
+
+    } else {
+        // ---- SSM block ----
+        forward_ssm_block(m, lw, l);
+        residual_add(s->x, s->xb, dim);
+    }
+
+    // ---- FFN block ---- (shared by both layer types)
+    forward_ffn_block(m, lw);
+
+    if (l == 0 && pos == 0) {
+        char v0[16], v1[16], v2[16], v3[16];
+        snprintf(v0, sizeof(v0), "%.6f", s->x[0]);
+        snprintf(v1, sizeof(v1), "%.6f", s->x[1]);
+        snprintf(v2, sizeof(v2), "%.6f", s->x[2]);
+        snprintf(v3, sizeof(v3), "%.6f", s->x[3]);
+        SH_LOG_DEBUG("Layer 0 pos 0", "x0", v0, "x1", v1, "x2", v2, "x3", v3);
+    }
+
+    return 0;
+}
+
+// Embed + all layers (attention + FFN). Populates KV cache at `pos`.
+// Leaves final activation in s->x. Returns 0 on success, -1 on error.
+static int forward_layers(BnModel *m, int token, int pos) {
+    BnConfig *c = &m->config;
+    BnRunState *s = &m->state;
+    int head_size = c->head_size;
 
     // Guard against stack overflow from VLAs sized by model config
-    if (head_size > BN_MAX_VLA_ELEMS || dim > BN_MAX_VLA_ELEMS) {
+    if (head_size > BN_MAX_VLA_ELEMS || c->dim > BN_MAX_VLA_ELEMS) {
         SH_LOG_ERROR("Model dimensions too large for stack VLAs");
         return -1;
     }
@@ -301,259 +557,9 @@ static int forward_layers(BnModel *m, int token, int pos) {
     // Process each layer
     int cache_pos = pos % c->seq_len;
     for (int l = 0; l < c->n_layers; l++) {
-        BnLayerWeights *lw = &w->layers[l];
-
-        int is_attn = (c->full_attn_interval == 0) ||
-                      ((l + 1) % c->full_attn_interval == 0);
-
-        if (is_attn) {
-            // ---- Attention block ----
-
-            // KV cache offset: contiguous among attention layers only
-            int attn_idx = (c->full_attn_interval > 0)
-                ? (l + 1) / c->full_attn_interval - 1 : l;
-            size_t loff = (size_t)attn_idx * c->seq_len * kv_dim;
-
-            // Gated Q: Q weight produces 2x dim (interleaved [Q,gate] per head)
-            int q_gated = lw->wq.data && (lw->wq.rows > dim);
-
-            rmsnorm(s->xb, s->x, lw->attn_norm, dim, c->norm_eps);
-
-            if (q_gated) {
-                // --- Gated Q path (Qwen3.5 attention) ---
-                // Q matvec to hb (>= 2*dim), K/V to hb2 (temp) or cache
-                // q_full layout: [Q_h0(hs), gate_h0(hs), Q_h1(hs), gate_h1(hs), ...]
-                float *q_full = s->hb;  // [2*dim]
-
-                if (c->kv_f16) {
-                    float *k_tmp = s->hb2;
-                    float *v_tmp = s->hb2 + kv_dim;
-                    BnMatvecTask q_task[1] = {{ q_full, &lw->wq }};
-                    bn_quant_matvec_batch(q_task, 1, s->xb, s->x_q, m->pool);
-                    BnMatvecTask kv[2] = {
-                        { k_tmp, &lw->wk },
-                        { v_tmp, &lw->wv },
-                    };
-                    bn_quant_matvec_batch(kv, 2, s->xb, s->x_q, m->pool);
-
-                    // De-interleave Q from per-head [Q_h, gate_h] layout
-                    for (int h = 0; h < n_heads; h++)
-                        memcpy(s->q + h * head_size,
-                               q_full + h * 2 * head_size,
-                               head_size * sizeof(float));
-
-                    // Q/K RMSNorm
-                    if (lw->q_norm)
-                        for (int h = 0; h < n_heads; h++)
-                            rmsnorm(s->q + h*head_size, s->q + h*head_size,
-                                    lw->q_norm, head_size, c->norm_eps);
-                    if (lw->k_norm)
-                        for (int h = 0; h < c->n_kv_heads; h++)
-                            rmsnorm(k_tmp + h*head_size, k_tmp + h*head_size,
-                                    lw->k_norm, head_size, c->norm_eps);
-
-                    // Partial RoPE
-                    apply_rope_heads(s->q, n_heads, head_size,
-                                     rope_dims, rope_cos, rope_sin);
-                    apply_rope_heads(k_tmp, c->n_kv_heads, head_size,
-                                     rope_dims, rope_cos, rope_sin);
-
-                    // F32→F16 into cache
-                    uint16_t *kc = (uint16_t *)s->key_cache   + loff + (size_t)cache_pos * kv_dim;
-                    uint16_t *vc = (uint16_t *)s->value_cache + loff + (size_t)cache_pos * kv_dim;
-#ifdef __ARM_NEON
-                    for (int i = 0; i < kv_dim; i += 4) {
-                        vst1_u16(kc + i, vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(k_tmp + i))));
-                        vst1_u16(vc + i, vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(v_tmp + i))));
-                    }
-#elif defined(__AVX2__)
-                    for (int i = 0; i < kv_dim; i += 8) {
-                        _mm_storeu_si128((__m128i *)(kc + i), _mm256_cvtps_ph(_mm256_loadu_ps(k_tmp + i), _MM_FROUND_TO_NEAREST_INT));
-                        _mm_storeu_si128((__m128i *)(vc + i), _mm256_cvtps_ph(_mm256_loadu_ps(v_tmp + i), _MM_FROUND_TO_NEAREST_INT));
-                    }
-#else
-                    for (int i = 0; i < kv_dim; i++) {
-                        kc[i] = bn_fp32_to_fp16(k_tmp[i]);
-                        vc[i] = bn_fp32_to_fp16(v_tmp[i]);
-                    }
-#endif
-                } else {
-                    // F32 cache
-                    float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
-                    float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
-                    BnMatvecTask q_task[1] = {{ q_full, &lw->wq }};
-                    bn_quant_matvec_batch(q_task, 1, s->xb, s->x_q, m->pool);
-                    BnMatvecTask kv[2] = {
-                        { key_cache_row,   &lw->wk },
-                        { value_cache_row, &lw->wv },
-                    };
-                    bn_quant_matvec_batch(kv, 2, s->xb, s->x_q, m->pool);
-
-                    // De-interleave Q from per-head [Q_h, gate_h] layout
-                    for (int h = 0; h < n_heads; h++)
-                        memcpy(s->q + h * head_size,
-                               q_full + h * 2 * head_size,
-                               head_size * sizeof(float));
-
-                    // Q/K RMSNorm
-                    if (lw->q_norm)
-                        for (int h = 0; h < n_heads; h++)
-                            rmsnorm(s->q + h*head_size, s->q + h*head_size,
-                                    lw->q_norm, head_size, c->norm_eps);
-                    if (lw->k_norm)
-                        for (int h = 0; h < c->n_kv_heads; h++)
-                            rmsnorm(key_cache_row + h*head_size,
-                                    key_cache_row + h*head_size,
-                                    lw->k_norm, head_size, c->norm_eps);
-
-                    // Partial RoPE
-                    apply_rope_heads(s->q, n_heads, head_size,
-                                     rope_dims, rope_cos, rope_sin);
-                    apply_rope_heads(key_cache_row, c->n_kv_heads, head_size,
-                                     rope_dims, rope_cos, rope_sin);
-                }
-
-                // GQA attention
-                {
-                    int n_kv = (pos + 1 < c->seq_len) ? pos + 1 : c->seq_len;
-                    BnGQACtx gctx = { c, s, loff, pos, n_kv, kv_mul, head_size, kv_dim, c->seq_len };
-#ifdef __ARM_NEON
-                    bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_neon_range : bn_transformer_gqa_neon_range;
-#elif defined(__AVX2__)
-                    bn_tp_fn attn_fn = bn_transformer_gqa_avx2_range;
-#elif defined(__wasm_simd128__)
-                    bn_tp_fn attn_fn = bn_transformer_gqa_wasm_range;
-#else
-                    bn_tp_fn attn_fn = bn_transformer_gqa_scalar_range;
-#endif
-                    BnTPTask gqa = { attn_fn, &gctx, n_heads };
-                    bn_tp_dispatch(m->pool, &gqa, 1);
-                }
-
-                // Sigmoid gate: xb *= sigmoid(gate)
-                for (int h = 0; h < n_heads; h++) {
-                    float *gate_h = q_full + h * 2 * head_size + head_size;
-                    float *xb_h = s->xb + h * head_size;
-                    for (int d = 0; d < head_size; d++)
-                        xb_h[d] *= 1.0f / (1.0f + expf(-gate_h[d]));
-                }
-
-                // wo projection + residual
-                if (lw->attn_sub_norm)
-                    rmsnorm(s->xb, s->xb, lw->attn_sub_norm, dim, c->norm_eps);
-                {
-                    BnMatvecTask wo[1] = {{ s->xb2, &lw->wo }};
-                    bn_quant_matvec_batch(wo, 1, s->xb, s->x_q, m->pool);
-                }
-                residual_add(s->x, s->xb2, dim);
-
-            } else {
-                // --- Classic attention path (existing) ---
-                float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
-                float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
-
-                if (c->kv_f16) {
-                    float *k_tmp = s->hb, *v_tmp = s->hb2;
-                    BnMatvecTask qkv[3] = {
-                        { s->q,  &lw->wq },
-                        { k_tmp, &lw->wk },
-                        { v_tmp, &lw->wv },
-                    };
-                    bn_quant_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
-
-                    if (lw->q_bias) for (int i = 0; i < dim; i++) s->q[i] += lw->q_bias[i];
-                    if (lw->k_bias) for (int i = 0; i < kv_dim; i++) k_tmp[i] += lw->k_bias[i];
-                    if (lw->v_bias) for (int i = 0; i < kv_dim; i++) v_tmp[i] += lw->v_bias[i];
-
-                    apply_rope_heads(s->q, n_heads, head_size,
-                                     rope_dims, rope_cos, rope_sin);
-                    apply_rope_heads(k_tmp, c->n_kv_heads, head_size,
-                                     rope_dims, rope_cos, rope_sin);
-
-                    uint16_t *kc = (uint16_t *)s->key_cache   + loff + (size_t)cache_pos * kv_dim;
-                    uint16_t *vc = (uint16_t *)s->value_cache + loff + (size_t)cache_pos * kv_dim;
-#ifdef __ARM_NEON
-                    for (int i = 0; i < kv_dim; i += 4) {
-                        float32x4_t kv4 = vld1q_f32(k_tmp + i);
-                        float16x4_t kh4 = vcvt_f16_f32(kv4);
-                        vst1_u16(kc + i, vreinterpret_u16_f16(kh4));
-                        float32x4_t vv4 = vld1q_f32(v_tmp + i);
-                        float16x4_t vh4 = vcvt_f16_f32(vv4);
-                        vst1_u16(vc + i, vreinterpret_u16_f16(vh4));
-                    }
-#elif defined(__AVX2__)
-                    for (int i = 0; i < kv_dim; i += 8) {
-                        _mm_storeu_si128((__m128i *)(kc + i), _mm256_cvtps_ph(_mm256_loadu_ps(k_tmp + i), _MM_FROUND_TO_NEAREST_INT));
-                        _mm_storeu_si128((__m128i *)(vc + i), _mm256_cvtps_ph(_mm256_loadu_ps(v_tmp + i), _MM_FROUND_TO_NEAREST_INT));
-                    }
-#else
-                    for (int i = 0; i < kv_dim; i++) {
-                        kc[i] = bn_fp32_to_fp16(k_tmp[i]);
-                        vc[i] = bn_fp32_to_fp16(v_tmp[i]);
-                    }
-#endif
-                } else {
-                    BnMatvecTask qkv[3] = {
-                        { s->q,            &lw->wq },
-                        { key_cache_row,   &lw->wk },
-                        { value_cache_row, &lw->wv },
-                    };
-                    bn_quant_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
-
-                    if (lw->q_bias) for (int i = 0; i < dim; i++) s->q[i] += lw->q_bias[i];
-                    if (lw->k_bias) for (int i = 0; i < kv_dim; i++) key_cache_row[i] += lw->k_bias[i];
-                    if (lw->v_bias) for (int i = 0; i < kv_dim; i++) value_cache_row[i] += lw->v_bias[i];
-
-                    apply_rope_heads(s->q, n_heads, head_size,
-                                     rope_dims, rope_cos, rope_sin);
-                    apply_rope_heads(key_cache_row, c->n_kv_heads, head_size,
-                                     rope_dims, rope_cos, rope_sin);
-                }
-
-                // GQA attention
-                {
-                    int n_kv = (pos + 1 < c->seq_len) ? pos + 1 : c->seq_len;
-                    BnGQACtx gctx = { c, s, loff, pos, n_kv, kv_mul, head_size, kv_dim, c->seq_len };
-#ifdef __ARM_NEON
-                    bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_neon_range : bn_transformer_gqa_neon_range;
-#elif defined(__AVX2__)
-                    bn_tp_fn attn_fn = bn_transformer_gqa_avx2_range;
-#elif defined(__wasm_simd128__)
-                    bn_tp_fn attn_fn = bn_transformer_gqa_wasm_range;
-#else
-                    bn_tp_fn attn_fn = bn_transformer_gqa_scalar_range;
-#endif
-                    BnTPTask gqa = { attn_fn, &gctx, n_heads };
-                    bn_tp_dispatch(m->pool, &gqa, 1);
-                }
-
-                // Attention sub-norm + wo projection + residual
-                if (lw->attn_sub_norm)
-                    rmsnorm(s->xb, s->xb, lw->attn_sub_norm, dim, c->norm_eps);
-                {
-                    BnMatvecTask wo[1] = {{ s->xb2, &lw->wo }};
-                    bn_quant_matvec_batch(wo, 1, s->xb, s->x_q, m->pool);
-                }
-                residual_add(s->x, s->xb2, dim);
-            }
-
-        } else {
-            // ---- SSM block ----
-            forward_ssm_block(m, lw, l);
-            residual_add(s->x, s->xb, dim);
-        }
-
-        // ---- FFN block ---- (shared by both layer types)
-        forward_ffn_block(m, lw);
-
-        if (l == 0 && pos == 0) {
-            char v0[16], v1[16], v2[16], v3[16];
-            snprintf(v0, sizeof(v0), "%.6f", s->x[0]);
-            snprintf(v1, sizeof(v1), "%.6f", s->x[1]);
-            snprintf(v2, sizeof(v2), "%.6f", s->x[2]);
-            snprintf(v3, sizeof(v3), "%.6f", s->x[3]);
-            SH_LOG_DEBUG("Layer 0 pos 0", "x0", v0, "x1", v1, "x2", v2, "x3", v3);
-        }
+        if (forward_single_layer(m, l, pos, cache_pos, rope_dims,
+                                 rope_cos, rope_sin) != 0)
+            return -1;
     }
 
     return 0;
@@ -702,8 +708,78 @@ float *bn_transformer_forward(BnModel *m, int token, int pos) {
 
 float *bn_transformer_prefill(BnModel *m, const int *tokens, int n_tokens, int pos0) {
     if (n_tokens <= 0) return NULL;
-    for (int i = 0; i < n_tokens; i++) {
-        if (forward_layers(m, tokens[i], pos0 + i) != 0) return NULL;
+    if (n_tokens == 1) return bn_transformer_forward(m, tokens[0], pos0);
+
+    BnConfig *c = &m->config;
+    BnRunState *s = &m->state;
+    int dim = c->dim;
+    int head_size = c->head_size;
+
+    if (head_size > BN_MAX_VLA_ELEMS || dim > BN_MAX_VLA_ELEMS) {
+        SH_LOG_ERROR("Model dimensions too large for stack VLAs");
+        return NULL;
     }
+
+    // Validate all tokens
+    for (int t = 0; t < n_tokens; t++) {
+        if (tokens[t] < 0 || tokens[t] >= c->vocab_size) {
+            SH_LOG_ERROR("Token out of range");
+            return NULL;
+        }
+    }
+    if (pos0 < 0) {
+        SH_LOG_ERROR("Position out of range");
+        return NULL;
+    }
+
+    // Activation buffer: n_tokens × dim
+    size_t act_elems = (size_t)n_tokens * dim;
+    if (act_elems / n_tokens != (size_t)dim) {
+        SH_LOG_ERROR("Prefill activation buffer size overflow");
+        return NULL;
+    }
+    float *act = (float *)malloc(act_elems * sizeof(float));
+    if (!act) return NULL;
+
+    // Embed all tokens
+    for (int t = 0; t < n_tokens; t++)
+        bn_model_embed_token(m, act + (size_t)t * dim, tokens[t]);
+
+    int rope_dims = c->rope_dim_count > 0 ? c->rope_dim_count : head_size;
+    int half_rope = rope_dims / 2;
+    if (half_rope > BN_MAX_VLA_ELEMS) {
+        SH_LOG_ERROR("RoPE dimensions too large for stack VLAs");
+        free(act);
+        return NULL;
+    }
+
+    // Layer-by-layer, token-inner-loop
+    for (int l = 0; l < c->n_layers; l++) {
+        for (int t = 0; t < n_tokens; t++) {
+            int pos = pos0 + t;
+            memcpy(s->x, act + (size_t)t * dim, dim * sizeof(float));
+
+            // Compute RoPE for this position
+            float rope_cos[half_rope], rope_sin[half_rope];
+            for (int i = 0; i < half_rope; i++) {
+                float angle = pos * s->rope_freq[i];
+                rope_cos[i] = cosf(angle);
+                rope_sin[i] = sinf(angle);
+            }
+
+            int cache_pos = pos % c->seq_len;
+            if (forward_single_layer(m, l, pos, cache_pos, rope_dims,
+                                     rope_cos, rope_sin) != 0) {
+                free(act);
+                return NULL;
+            }
+
+            memcpy(act + (size_t)t * dim, s->x, dim * sizeof(float));
+        }
+    }
+
+    // Final token's activation → logits
+    memcpy(s->x, act + (size_t)(n_tokens - 1) * dim, dim * sizeof(float));
+    free(act);
     return forward_logits(m);
 }
