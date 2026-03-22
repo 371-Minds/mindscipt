@@ -732,14 +732,7 @@ static int forward_single_layer(BnModel *m, int l, int pos, int cache_pos,
     }
     BL_ACC(bl_ffn_us);
 
-    if (l == 0 && pos == 0) {
-        char v0[16], v1[16], v2[16], v3[16];
-        snprintf(v0, sizeof(v0), "%.6f", s->x[0]);
-        snprintf(v1, sizeof(v1), "%.6f", s->x[1]);
-        snprintf(v2, sizeof(v2), "%.6f", s->x[2]);
-        snprintf(v3, sizeof(v3), "%.6f", s->x[3]);
-        SH_LOG_DEBUG("Layer 0 pos 0", "x0", v0, "x1", v1, "x2", v2, "x3", v3);
-    }
+    (void)is_attn; // used only in debug builds
 
 #ifdef BN_BENCH_LAYERS
     bl_layer_count++;
@@ -945,21 +938,16 @@ float *bn_transformer_forward(BnModel *m, int token, int pos) {
     return forward_logits(m);
 }
 
-float *bn_transformer_prefill(BnModel *m, const int *tokens, int n_tokens, int pos0) {
+// Internal prefill: if all_logits is non-NULL, compute logits at every position.
+static float *prefill_internal(BnModel *m, const int *tokens, int n_tokens,
+                                int pos0, float *all_logits) {
     if (n_tokens <= 0) return NULL;
     if (n_tokens == 1) return bn_transformer_forward(m, tokens[0], pos0);
 
     BnConfig *c = &m->config;
 
-    // MoE models: fall back to sequential (batch MoE is Phase 3)
-    if (c->n_experts > 0) {
-        float *logits = NULL;
-        for (int i = 0; i < n_tokens; i++) {
-            logits = bn_transformer_forward(m, tokens[i], pos0 + i);
-            if (!logits) return NULL;
-        }
-        return logits;
-    }
+    // MoE models use batch MoE prefill (token-expert grouping + per-expert matmul)
+    // Falls through to the batched layer loop which calls bn_moe_forward_batch
     BnRunState *s = &m->state;
     int dim = c->dim;
     int head_size = c->head_size;
@@ -1143,14 +1131,20 @@ float *bn_transformer_prefill(BnModel *m, const int *tokens, int n_tokens, int p
                 }
 
                 // Store attention output for batch Wo
-                memcpy(Xb + (size_t)t * dim, s->xb, dim * sizeof(float));
+                // For wide-Q: GQA outputs q_dim elements; for classic: dim elements
+                int wo_cols = lw->wo.cols;
+                memcpy(Q_buf + (size_t)t * wo_cols, s->xb, wo_cols * sizeof(float));
             }
 
-            // Batch sub-norm + Wo matmul
-            if (lw->attn_sub_norm)
-                for (int t = 0; t < n_tokens; t++)
-                    rmsnorm(Xb + t * dim, Xb + t * dim, lw->attn_sub_norm, dim, c->norm_eps);
-            bn_quant_matmul(Xb2, &lw->wo, Xb, n_tokens, s->x_q, m->pool);
+            // Batch sub-norm + Wo matmul (use Q_buf as Wo input, correctly strided)
+            {
+                int wo_cols = lw->wo.cols;
+                if (lw->attn_sub_norm)
+                    for (int t = 0; t < n_tokens; t++)
+                        rmsnorm(Q_buf + (size_t)t * wo_cols, Q_buf + (size_t)t * wo_cols,
+                                lw->attn_sub_norm, wo_cols, c->norm_eps);
+                bn_quant_matmul(Xb2, &lw->wo, Q_buf, n_tokens, s->x_q, m->pool);
+            }
 
             // Batch residual add
             for (int t = 0; t < n_tokens; t++)
@@ -1180,11 +1174,9 @@ float *bn_transformer_prefill(BnModel *m, const int *tokens, int n_tokens, int p
 
         // --- FFN block ---
         if (lw->router_weight) {
-            // MoE: process per-token (Phase 1 — batch MoE is Phase 3)
-            for (int t = 0; t < n_tokens; t++) {
-                memcpy(s->x, act + (size_t)t * dim, dim * sizeof(float));
-                bn_moe_forward(m, lw, l);
-                memcpy(act + (size_t)t * dim, s->x, dim * sizeof(float));
+            // Batch MoE: route all tokens, group by expert, batch matmul
+            if (bn_moe_forward_batch(m, lw, l, act, Xb, n_tokens) != 0) {
+                free(batch_buf); free(act); return NULL;
             }
         } else if (lw->ffn_up.data) {
             // Dense FFN: batched matmul
@@ -1244,9 +1236,40 @@ float *bn_transformer_prefill(BnModel *m, const int *tokens, int n_tokens, int p
         }
     }
 
-    // Final token's activation → logits
-    memcpy(s->x, act + (size_t)(n_tokens - 1) * dim, dim * sizeof(float));
+    // Compute logits for all positions (if requested) or just the last
+    if (all_logits) {
+        int vocab_size = c->vocab_size;
+        for (int t = 0; t < n_tokens; t++) {
+            memcpy(s->x, act + (size_t)t * dim, dim * sizeof(float));
+            float *lg = forward_logits(m);
+            if (!lg) { free(batch_buf); free(act); return NULL; }
+            memcpy(all_logits + (size_t)t * vocab_size, lg, vocab_size * sizeof(float));
+        }
+    } else {
+        memcpy(s->x, act + (size_t)(n_tokens - 1) * dim, dim * sizeof(float));
+    }
+
     free(batch_buf);
     free(act);
     return forward_logits(m);
+}
+
+float *bn_transformer_prefill(BnModel *m, const int *tokens, int n_tokens, int pos0) {
+    return prefill_internal(m, tokens, n_tokens, pos0, NULL);
+}
+
+int bn_transformer_prefill_all(BnModel *m, const int *tokens, int n_tokens,
+                                int pos0, float *all_logits) {
+    if (!all_logits || n_tokens <= 0) return -1;
+
+    // Single token: just forward
+    if (n_tokens == 1) {
+        float *logits = bn_transformer_forward(m, tokens[0], pos0);
+        if (!logits) return -1;
+        memcpy(all_logits, logits, m->config.vocab_size * sizeof(float));
+        return 0;
+    }
+
+    float *result = prefill_internal(m, tokens, n_tokens, pos0, all_logits);
+    return result ? 0 : -1;
 }

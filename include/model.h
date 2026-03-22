@@ -91,6 +91,7 @@ typedef struct {
     int kv_f16;                     // store KV cache in FP16 (halves attention DRAM bandwidth)
     // Hybrid SSM + Attention (all zero = pure attention, backward compatible)
     int rope_dim_count;             // partial RoPE dim count (0 = full head_size)
+    int rope_text_dims;             // MROPE: dims for text section only (0 = use rope_dim_count)
     int full_attn_interval;         // 0 = all attention, N = every Nth layer is attention
     int ssm_state_size;             // head_k_dim (128)
     int ssm_conv_kernel;            // conv kernel size (4)
@@ -127,6 +128,7 @@ typedef struct {
     BnMoEExpertMap expert_map;              // file offsets for gate/up/down expert tensors
     // Shared expert (always resident, standard QWeight)
     BnQWeight shared_gate, shared_up, shared_down;
+    float *shared_expert_gate;   // [dim] sigmoid gate for shared expert output (NULL if absent)
 } BnLayerWeights;
 
 typedef struct {

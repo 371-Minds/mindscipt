@@ -267,10 +267,15 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     // Vocab size from tokenizer metadata
     c->vocab_size = (int)bn_gguf_get_arr_n(f, "tokenizer.ggml.tokens");
 
+    // Early MoE expert count read (needed for validation — hidden_dim can be 0 for MoE-only FFN)
+    snprintf(key, sizeof(key), "%s.expert_count", prefix);
+    int early_n_experts = (int)bn_gguf_get_u32(f, key);
+
     // #15, #38: Validate BEFORE computing derived dimensions to avoid division by zero
+    // hidden_dim may be 0 for pure MoE models (all FFN is expert-based)
     if (c->dim <= 0 || c->n_layers <= 0 || c->n_heads <= 0 ||
-        c->vocab_size <= 0 || c->n_kv_heads <= 0 || c->hidden_dim <= 0 ||
-        c->seq_len <= 0) {
+        c->vocab_size <= 0 || c->n_kv_heads <= 0 || c->seq_len <= 0 ||
+        (c->hidden_dim <= 0 && early_n_experts <= 0)) {
         SH_LOG_ERROR("Invalid model config");
         return -1;
     }
@@ -304,6 +309,19 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     // Hybrid SSM + Attention config (all default to 0 for pure attention models)
     snprintf(key, sizeof(key), "%s.rope.dimension_count", prefix);
     c->rope_dim_count = (int)bn_gguf_get_u32(f, key);
+
+    // MROPE: dimension_sections[0] = text-only RoPE pairs (sections 1,2 are vision)
+    // For text-only inference, only apply RoPE to the first section's dimensions.
+    snprintf(key, sizeof(key), "%s.rope.dimension_sections", prefix);
+    {
+        uint64_t nsect = bn_gguf_get_arr_n(f, key);
+        if (nsect > 0) {
+            const int32_t *sections = (const int32_t *)bn_gguf_get_arr_data(f, key);
+            if (sections && sections[0] > 0 && c->rope_dim_count > 0) {
+                c->rope_text_dims = sections[0] * 2;  // pairs → dims
+            }
+        }
+    }
 
     snprintf(key, sizeof(key), "%s.full_attention_interval", prefix);
     c->full_attn_interval = (int)bn_gguf_get_u32(f, key);
@@ -648,6 +666,10 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
                 snprintf(wname, sizeof(wname), "blk.%d.ffn_down_shexp.weight", i);
                 snprintf(sname, sizeof(sname), "blk.%d.ffn_down_shexp.scale", i);
                 if (load_qweight(&lw->shared_down, f, wname, sname) != 0) goto fail_layers;
+
+                // Shared expert sigmoid gate (optional, Qwen3.5 MoE)
+                snprintf(wname, sizeof(wname), "blk.%d.ffn_gate_inp_shexp.weight", i);
+                lw->shared_expert_gate = load_f32_tensor(f, wname);
             }
         } else {
             // --- Dense FFN ---
@@ -924,6 +946,13 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     int half_rope = rope_dims / 2;
     for (int i = 0; i < half_rope; i++) {
         s->rope_freq[i] = 1.0f / powf(c->rope_theta, (float)(2 * i) / (float)rope_dims);
+    }
+    // MROPE text-only: zero out non-text section frequencies.
+    // Sections 1,2 (vision height/width) get position=0 for text tokens → no rotation.
+    if (c->rope_text_dims > 0) {
+        int text_pairs = c->rope_text_dims / 2;
+        for (int i = text_pairs; i < half_rope; i++)
+            s->rope_freq[i] = 0.0f;
     }
 
     // Quantize F16 embeddings to INT8 for fast SDOT logits kernel
