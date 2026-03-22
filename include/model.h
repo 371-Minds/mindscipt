@@ -15,6 +15,10 @@ typedef struct {
     int gate_rows, gate_cols;
     int up_rows, up_cols;
     int down_rows, down_cols;
+    // Repacked: contiguous [gate|up|down] per expert for cache locality.
+    // NULL if not repacked (pread mode or insufficient memory).
+    uint8_t *repacked;          // [n_experts * expert_total_bytes]
+    size_t expert_total_bytes;  // gate_bytes + up_bytes + down_bytes
 } BnMoEExpertMap;
 
 #define BN_MAX_MOE_K 16
