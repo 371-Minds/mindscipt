@@ -6,27 +6,27 @@ Apple M1 Max (32 GB), 8 threads, 64 tokens generated. Hybrid SSM + MoE architect
 
 | Mode | tok/s | RSS | MB/tok | Cache hit | pf_wait (ms) |
 |------|-------|-----|--------|-----------|-------------|
-| mmap | **10.40** | 20.1 GB | 580 | — | 0 |
+| mmap | **11.74** | 20.1 GB | 580 | — | 0 |
 | pread + 4 GB cache | **9.67** | 11.3 GB | 157 | 72.9% | 1176 |
 | pread (no cache) | **5.83** | 11.0 GB | 580 | — | 4069 |
 
-vs llama.cpp CPU-only (`-ngl 0`, same hardware): **5.65 tok/s** → bitnet.c is **73-84% faster**.
+vs llama.cpp CPU-only (`-ngl 0`, same hardware): **5.65 tok/s** → bitnet.c is **107% faster**.
 
-## Time Breakdown (mmap, per token ≈ 96ms)
+## Time Breakdown (mmap, per token ≈ 85ms)
 
 | Phase | Total (ms) | Per-tok (ms) | % | Description |
 |-------|-----------|-------------|---|-------------|
-| **down** | 1985 | 31.0 | **52%** | Down projection matvec (per expert, individual dispatch) |
-| **gate+up** | 1143 | 17.9 | **30%** | Gate+up batch matvec (cross-expert batched) |
-| **shared** | 514 | 8.0 | **13%** | Shared expert FFN (gate+up+SwiGLU+down, always resident) |
-| route | 181 | 2.8 | 5% | Router matvec + softmax + top-K selection |
-| swiglu | 165 | 2.6 | — | SwiGLU activation (element-wise) |
+| **down** | 1819 | 28.4 | **59%** | Down projection matvec (batched multi-dispatch) |
+| **gate+up** | 697 | 10.9 | **23%** | Gate+up batch matvec (cross-expert batched) |
+| **shared** | 406 | 6.3 | **13%** | Shared expert FFN (gate+up batched + down) |
+| route | 188 | 2.9 | 6% | Router matvec + softmax + top-K selection |
+| swiglu | 161 | 2.5 | — | SwiGLU activation (element-wise) |
 | norm | 4 | 0.1 | — | RMSNorm |
 | accum | 6 | 0.1 | — | Weighted expert accumulation |
 
-## Why Down Projection Dominates
+## Dispatch Batching
 
-Gate+up projections are batched across all K=8 experts in a single `bn_quant_matvec_batch` dispatch (2K=16 tasks). Down projections run **individually** because each expert has a different post-SwiGLU input vector — the x quantization can't be shared across experts. This means 8 separate `bn_quant_matvec` calls per layer × 40 layers = **320 individual dispatches per token**, each with thread pool wake/wait overhead.
+Gate+up projections are batched across all K=8 experts in a single `bn_quant_matvec_batch` dispatch (2K=16 tasks). Down projections use `bn_quant_matvec_multi` — each expert has a different post-SwiGLU input, but all K are pre-quantized independently and dispatched in a single thread pool wake/wait cycle. Shared expert gate+up are also batched (2 tasks, one dispatch). This reduces dispatches from ~480/token to ~80/token.
 
 ## Pread Cache Efficiency
 

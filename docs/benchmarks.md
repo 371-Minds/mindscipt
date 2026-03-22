@@ -17,21 +17,30 @@ Llama3 8B (3.3 GB) exceeds the WASM 4 GB address space with runtime allocations.
 
 ## MoE Throughput (tok/s)
 
-Qwen3-30B-A3B-Q4_K_M (17.7 GB, 128 experts/layer, K=8), Apple M1 Max 8T, 128 tokens generated.
+Apple M1 Max 8T, 64-128 tokens generated.
 
-| Mode | tok/s | Hit rate | MB/tok | pf_wait (ms) | RSS |
-|------|-------|----------|--------|-------------|-----|
-| mmap | 14.13 | — | 1046 | 0 | 16.2 GB |
-| pread + 4 GB cache | 11.88 | 86% | 144 | 1148 | 10.3 GB |
-| pread + 2 GB cache | 9.18 | 63% | 388 | 3666 | 10.2 GB |
-| pread (no cache) | 6.54 | — | 1046 | 8858 | 8.3 GB |
+### Qwen3-30B-A3B-Q4_K_M (17.7 GB, 128 experts/layer, K=8)
 
-The expert LRU cache (open-addressing hash + intrusive LRU list) stores full expert weights (gate+up+down) in a contiguous slab. Default 4 GB budget → 1402 slots → 86% hit rate, cutting I/O from 1046 → 144 MB/tok. Cache hits are batched (cross-expert gate+up matvec dispatch like the mmap path). First miss I/O is overlapped with hit batch compute. `--cache-mb N` to configure (0 to disable, pread mode only).
+| Mode | tok/s | Hit rate | MB/tok | RSS |
+|------|-------|----------|--------|-----|
+| mmap | **19.04** | — | 1046 | 16.2 GB |
+| pread + 4 GB cache | 11.88 | 86% | 144 | 10.3 GB |
+| pread (no cache) | 6.54 | — | 1046 | 8.3 GB |
+
+### Qwen3.5-35B-A3B-Q4_K_M (21.0 GB, 256 experts/layer, K=8, hybrid SSM+MoE)
+
+| Mode | tok/s | Hit rate | MB/tok | RSS |
+|------|-------|----------|--------|-----|
+| mmap | **11.74** | — | 580 | 20.1 GB |
+| pread + 4 GB cache | 9.67 | 73% | 157 | 11.3 GB |
+| pread (no cache) | 5.83 | — | 580 | 11.0 GB |
+
+Expert LRU cache (open-addressing hash + intrusive LRU list) stores full expert weights (gate+up+down) in a contiguous slab. Batched down projection dispatch (K tasks in one wake/wait cycle) and shared expert gate+up batching reduce dispatch overhead. `--cache-mb N` to configure (0 to disable, pread mode only).
 
 **When to use which mode:**
 - **mmap** (default): Use when the model fits comfortably in RAM. Best throughput, simplest.
-- **pread + cache**: Use when the model exceeds available RAM, or you want to limit RSS. The 4 GB default cache gives 86% hit rate on Qwen3-30B with 10 GB RSS vs 16 GB for mmap.
-- **madvise**: Experimental. Currently slower than both mmap and pread due to syscall overhead (1152 madvise calls/token). Not recommended for production use.
+- **pread + cache**: Use when the model exceeds available RAM, or you want to limit RSS.
+- **madvise**: Experimental. Currently slower than both mmap and pread due to syscall overhead. Not recommended for production use.
 
 ## vs llama.cpp (b8320)
 
@@ -42,8 +51,10 @@ Measured with `llama-bench`, same hardware (M1 Max, 8 threads). Both use `-p 0 -
 | BitNet b1.58 2B-4T | I2_S | 52.5 | — | — | — |
 | Qwen2.5 3B Instruct | Q4_0 | 25.4 | 40.2 | 84.4 | 63% |
 | Llama3 8B 1.58 | TQ1_0 | 14.5 | 19.3 | N/A | 76% |
+| Qwen3-30B-A3B MoE | Q4_K_M | 19.0 | 13.5 | — | **141%** |
+| Qwen3.5-35B-A3B MoE | Q4_K_M | 11.7 | 5.7 | — | **207%** |
 
-llama.cpp's remaining CPU advantage comes from multi-row interleaved kernels (`block_q4_0x4` packing 4 rows together, using `vdotq_laneq_s32` to compute 4 output rows per pass and amortize activation loads). Both engines use weight-repacked NEON kernels for Q4_0 matvec. Metal is GPU offload (`-ngl 99`). TQ1_0 Metal is not implemented in llama.cpp b8320.
+Dense models: llama.cpp CPU leads due to multi-row interleaved kernels. MoE models: bitnet.c leads significantly due to batched expert dispatch, Q8_K integer accumulation, and atomic work-stealing. Metal comparison not available for MoE CPU-only (`-ngl 0`). TQ1_0 Metal is not implemented in llama.cpp b8320.
 
 ## Per-Kernel Bandwidth (GB/s)
 
