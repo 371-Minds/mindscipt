@@ -51,10 +51,10 @@ Measured with `llama-bench`, same hardware (M1 Max, 8 threads). Both use `-p 0 -
 | BitNet b1.58 2B-4T | I2_S | 52.5 | — | — | — |
 | Qwen2.5 3B Instruct | Q4_0 | 25.4 | 40.2 | 84.4 | 63% |
 | Llama3 8B 1.58 | TQ1_0 | 14.5 | 19.3 | N/A | 76% |
-| Qwen3-30B-A3B MoE | Q4_K_M | 19.0 | 13.5 | — | **141%** |
-| Qwen3.5-35B-A3B MoE | Q4_K_M | 11.7 | 5.7 | — | **207%** |
+| Qwen3-30B-A3B MoE | Q4_K_M | 6.1 | 7.5 | — | 82% |
+| Qwen3.5-35B-A3B MoE | Q4_K_M | 5.2 | 6.0 | — | 85% |
 
-Dense models: llama.cpp CPU leads due to multi-row interleaved kernels. MoE models: bitnet.c leads significantly due to batched expert dispatch, Q8_K integer accumulation, and atomic work-stealing. Metal comparison not available for MoE CPU-only (`-ngl 0`). TQ1_0 Metal is not implemented in llama.cpp b8320.
+Dense models: llama.cpp CPU leads due to multi-row interleaved kernels. MoE models: llama.cpp also leads (~18%) — likely from tighter Q4_K kernels and potentially Metal-assisted operations even with `-ngl 0`. All numbers measured with 60s cooldown between solo runs to eliminate thermal artifacts. Earlier inflated numbers were caused by back-to-back runs where the first runner benefited from cold CPU.
 
 ## Per-Kernel Bandwidth (GB/s)
 
