@@ -823,7 +823,8 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         moe_arena_bytes += (size_t)moe_k * c->moe_intermediate_size * sizeof(float); // hb_batch
         moe_arena_bytes += (size_t)moe_k * c->moe_intermediate_size * sizeof(float); // hb2_batch
         moe_arena_bytes += (size_t)moe_k * c->dim * sizeof(float);                   // down_batch
-        moe_arena_bytes += (12 + 3 * moe_k) * SH_ARENA_ALIGN;                       // alignment
+        moe_arena_bytes += (size_t)moe_k * c->moe_intermediate_size;               // down_x_q_bufs
+        moe_arena_bytes += (13 + 3 * moe_k) * SH_ARENA_ALIGN;                       // alignment
     }
 
     // Compute total arena capacity (all RunState buffers + INT8 embeddings + Q4 repacking)
@@ -934,6 +935,10 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
                 goto fail_state;
             }
         }
+
+        // Per-expert x_q buffers for batched down projection dispatch
+        ms->down_x_q_bufs = (int8_t *)sh_arena_alloc(m->arena,
+            (size_t)moe_k * c->moe_intermediate_size);
 
         m->moe_state = ms;
 

@@ -75,6 +75,7 @@ typedef struct {
     float *expert_hb_batch[BN_MAX_MOE_K];   // K gate outputs [moe_hidden]
     float *expert_hb2_batch[BN_MAX_MOE_K];  // K up outputs [moe_hidden]
     float *expert_down_batch[BN_MAX_MOE_K]; // K down outputs [dim]
+    int8_t *down_x_q_bufs;                 // [K * moe_hidden] int8 scratch for multi-dispatch down
 } BnMoEState;
 
 #define BN_DEFAULT_ROPE_THETA  10000.0f

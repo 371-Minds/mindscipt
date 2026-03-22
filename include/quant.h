@@ -212,6 +212,18 @@ typedef struct {
 void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
                            const float *x, int8_t *x_q_buf, BnThreadPool *pool);
 
+// Multi-input matvec: K independent (W, x) pairs dispatched in a single cycle.
+// Each task has its own weight matrix and input vector.
+// x_q_bufs must be [n_tasks * max_cols] int8 (pre-allocated scratch).
+typedef struct {
+    float *out;
+    const BnQWeight *W;
+    const float *x;
+} BnMatvecMultiTask;
+
+void bn_quant_matvec_multi(const BnMatvecMultiTask *tasks, int n_tasks,
+                            int8_t *x_q_bufs, BnThreadPool *pool);
+
 // Matrix-matrix multiply: Out[n_tokens][rows] = W[rows][cols] @ X[n_tokens][cols]^T
 // Processes n_tokens input vectors against the same weight matrix.
 // out must be [n_tokens * W->rows] floats, X is [n_tokens * W->cols] floats.

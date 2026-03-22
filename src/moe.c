@@ -787,13 +787,18 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
                                               lw->expert_map.down_rows, lw->expert_map.down_cols);
             }
 
-            // Individual matvec for each expert's down projection.
-            // Each expert has different input (hb after SwiGLU), so we can't
-            // share x quantization. Individual dispatch uses SDOT automatically.
-            for (int k = 0; k < valid_k; k++) {
-                if (valid_weights[k] == 0.0f) continue;
-                bn_quant_matvec(ms->expert_down_batch[k], &wdowns[k],
-                                ms->expert_hb_batch[k], s->x_q, m->pool);
+            // Batched down projection: K independent (W, x) pairs in one dispatch.
+            // Each expert has different input (hb after SwiGLU) and different weights.
+            {
+                BnMatvecMultiTask down_tasks[BN_MAX_MOE_K];
+                int n_down = 0;
+                for (int k = 0; k < valid_k; k++) {
+                    if (valid_weights[k] == 0.0f) continue;
+                    down_tasks[n_down++] = (BnMatvecMultiTask){
+                        ms->expert_down_batch[k], &wdowns[k], ms->expert_hb_batch[k]
+                    };
+                }
+                bn_quant_matvec_multi(down_tasks, n_down, ms->down_x_q_bufs, m->pool);
             }
             ms->stats.down_time_ms += moe_time_ms() - t0;
 
@@ -1134,8 +1139,13 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
     if (c->has_shared_expert && lw->shared_gate.data) {
         int shared_hidden = c->shared_expert_intermediate_size;
 
-        bn_quant_matvec(s->hb, &lw->shared_gate, s->xb, s->x_q, m->pool);
-        bn_quant_matvec(s->hb2, &lw->shared_up, s->xb, s->x_q, m->pool);
+        {
+            BnMatvecTask shared_gu[2] = {
+                { s->hb,  &lw->shared_gate },
+                { s->hb2, &lw->shared_up   },
+            };
+            bn_quant_matvec_batch(shared_gu, 2, s->xb, s->x_q, m->pool);
+        }
         moe_swiglu(s->hb, s->hb, s->hb2, shared_hidden);
         bn_quant_matvec(s->xb2, &lw->shared_down, s->hb, s->x_q, m->pool);
 
