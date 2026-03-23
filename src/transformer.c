@@ -499,11 +499,11 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
 #ifdef __ARM_NEON
                 bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_neon_range : bn_transformer_gqa_neon_range;
 #elif defined(__AVX2__)
-                bn_tp_fn attn_fn = bn_transformer_gqa_avx2_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_avx2_range : bn_transformer_gqa_avx2_range;
 #elif defined(__wasm_simd128__)
-                bn_tp_fn attn_fn = bn_transformer_gqa_wasm_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_wasm_range : bn_transformer_gqa_wasm_range;
 #else
-                bn_tp_fn attn_fn = bn_transformer_gqa_scalar_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_scalar_range : bn_transformer_gqa_scalar_range;
 #endif
                 BnTPTask gqa = { attn_fn, &gctx, n_heads };
                 bn_tp_dispatch(m->pool, &gqa, 1);
@@ -580,11 +580,11 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
 #ifdef __ARM_NEON
                 bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_neon_range : bn_transformer_gqa_neon_range;
 #elif defined(__AVX2__)
-                bn_tp_fn attn_fn = bn_transformer_gqa_avx2_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_avx2_range : bn_transformer_gqa_avx2_range;
 #elif defined(__wasm_simd128__)
-                bn_tp_fn attn_fn = bn_transformer_gqa_wasm_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_wasm_range : bn_transformer_gqa_wasm_range;
 #else
-                bn_tp_fn attn_fn = bn_transformer_gqa_scalar_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_scalar_range : bn_transformer_gqa_scalar_range;
 #endif
                 BnTPTask gqa = { attn_fn, &gctx, n_heads };
                 bn_tp_dispatch(m->pool, &gqa, 1);
@@ -693,11 +693,11 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
 #ifdef __ARM_NEON
                 bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_neon_range : bn_transformer_gqa_neon_range;
 #elif defined(__AVX2__)
-                bn_tp_fn attn_fn = bn_transformer_gqa_avx2_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_avx2_range : bn_transformer_gqa_avx2_range;
 #elif defined(__wasm_simd128__)
-                bn_tp_fn attn_fn = bn_transformer_gqa_wasm_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_wasm_range : bn_transformer_gqa_wasm_range;
 #else
-                bn_tp_fn attn_fn = bn_transformer_gqa_scalar_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_scalar_range : bn_transformer_gqa_scalar_range;
 #endif
                 BnTPTask gqa = { attn_fn, &gctx, n_heads };
                 bn_tp_dispatch(m->pool, &gqa, 1);
@@ -828,6 +828,14 @@ static float *forward_logits(BnModel *m, BnSession *sess) {
             BnTPTask logits_task = { bn_transformer_logits_i8_avx2_range, &lctx, n_rows };
             bn_tp_dispatch(m->pool, &logits_task, 1);
         } else
+#elif defined(__wasm_relaxed_simd__)
+        if (w->emb_out_i8) {
+            float x_scale = bn_quant_x_to_i8(s->x, s->x_q, dim);
+            BnLogitsI8Ctx lctx = { s->logits, w->emb_out_i8, w->emb_out_scales,
+                                 s->x_q, x_scale, dim };
+            BnTPTask logits_task = { bn_transformer_logits_i8_wasm_range, &lctx, n_rows };
+            bn_tp_dispatch(m->pool, &logits_task, 1);
+        } else
 #endif
         {
             const uint16_t *emb = (const uint16_t *)w->output_weight.data;
@@ -885,6 +893,14 @@ static float *forward_logits(BnModel *m, BnSession *sess) {
             BnLogitsI8Ctx lctx = { s->logits, w->emb_out_i8, w->emb_out_scales,
                                  s->x_q, x_scale, dim };
             BnTPTask logits_task = { bn_transformer_logits_i8_avx2_range, &lctx, c->vocab_size };
+            bn_tp_dispatch(m->pool, &logits_task, 1);
+        } else
+#elif defined(__wasm_relaxed_simd__)
+        if (w->emb_out_i8) {
+            float x_scale = bn_quant_x_to_i8(s->x, s->x_q, dim);
+            BnLogitsI8Ctx lctx = { s->logits, w->emb_out_i8, w->emb_out_scales,
+                                 s->x_q, x_scale, dim };
+            BnTPTask logits_task = { bn_transformer_logits_i8_wasm_range, &lctx, c->vocab_size };
             bn_tp_dispatch(m->pool, &logits_task, 1);
         } else
 #endif
@@ -1112,11 +1128,11 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens, i
 #ifdef __ARM_NEON
                 bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_neon_range : bn_transformer_gqa_neon_range;
 #elif defined(__AVX2__)
-                bn_tp_fn attn_fn = bn_transformer_gqa_avx2_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_avx2_range : bn_transformer_gqa_avx2_range;
 #elif defined(__wasm_simd128__)
-                bn_tp_fn attn_fn = bn_transformer_gqa_wasm_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_wasm_range : bn_transformer_gqa_wasm_range;
 #else
-                bn_tp_fn attn_fn = bn_transformer_gqa_scalar_range;
+                bn_tp_fn attn_fn = c->flash_attn ? bn_transformer_flash_gqa_scalar_range : bn_transformer_gqa_scalar_range;
 #endif
                 BnTPTask gqa = { attn_fn, &gctx, c->n_heads };
                 bn_tp_dispatch(m->pool, &gqa, 1);

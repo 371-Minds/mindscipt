@@ -243,11 +243,9 @@ void bn_quant_x_to_q8_blocks(const float *x, int8_t *x_q, float *x_scales, int n
 void bn_quant_x_to_q8k(const float *x, int8_t *x_q, float *x_d,
                          int16_t *x_bsums, int n);
 
-#if !defined(__wasm_relaxed_simd__)
 // Quantize F16 rows to INT8 + per-row scales for INT8 logits kernel.
 void bn_quant_f16_rows_to_i8(const uint16_t *f16, int8_t *i8_out,
                               float *scales_out, int n_rows, int dim);
-#endif
 #endif
 
 #endif // BN_QUANT_H

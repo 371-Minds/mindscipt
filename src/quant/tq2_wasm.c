@@ -71,3 +71,54 @@ void bn_quant_tq2_wasm_range(void *ctx, int row_start, int row_end) {
         c->out[row] = bn_wasm_hsum_f32x4(sum) * tensor_scale;
     }
 }
+
+#ifdef __wasm_relaxed_simd__
+void bn_quant_tq2_wasm_sdot_range(void *ctx, int row_start, int row_end) {
+    BnTQ2SdotCtx *c = (BnTQ2SdotCtx *)ctx;
+    const BnBlockTQ2 *blocks = (const BnBlockTQ2 *)c->W->data;
+    int n_blocks_per_row = c->W->cols / BN_QK_K;
+    const int8_t *x_q = c->x_q;
+
+    const v128_t mask3 = wasm_i8x16_splat(3);
+    const v128_t one = wasm_i8x16_splat(1);
+
+    for (int row = row_start; row < row_end; row++) {
+        float row_sum = 0.0f;
+        for (int b = 0; b < n_blocks_per_row; b++) {
+            const BnBlockTQ2 *blk = &blocks[row * n_blocks_per_row + b];
+            float d = bn_fp16_to_fp32(blk->d);
+            const int8_t *xb = x_q + b * BN_QK_K;
+
+            v128_t iaccA = wasm_i32x4_splat(0), iaccB = wasm_i32x4_splat(0);
+            v128_t iaccC = wasm_i32x4_splat(0), iaccD = wasm_i32x4_splat(0);
+
+            for (int half = 0; half < 2; half++) {
+                const uint8_t *qs = blk->qs + half * 32;
+                const int8_t *xh = xb + half * 128;
+                for (int i = 0; i < 2; i++) {
+                    v128_t raw = wasm_v128_load(qs + i * 16);
+                    const int8_t *xp = xh + i * 16;
+                    v128_t t0 = wasm_i8x16_sub(wasm_v128_and(raw, mask3), one);
+                    v128_t t1 = wasm_i8x16_sub(wasm_v128_and(wasm_u8x16_shr(raw, 2), mask3), one);
+                    v128_t t2 = wasm_i8x16_sub(wasm_v128_and(wasm_u8x16_shr(raw, 4), mask3), one);
+                    v128_t t3 = wasm_i8x16_sub(wasm_v128_and(wasm_u8x16_shr(raw, 6), mask3), one);
+                    iaccA = wasm_i32x4_relaxed_dot_i8x16_i7x16_add(t0, wasm_v128_load(xp), iaccA);
+                    iaccB = wasm_i32x4_relaxed_dot_i8x16_i7x16_add(t1, wasm_v128_load(xp + 32), iaccB);
+                    iaccC = wasm_i32x4_relaxed_dot_i8x16_i7x16_add(t2, wasm_v128_load(xp + 64), iaccC);
+                    iaccD = wasm_i32x4_relaxed_dot_i8x16_i7x16_add(t3, wasm_v128_load(xp + 96), iaccD);
+                }
+            }
+
+            v128_t sum4 = wasm_i32x4_add(wasm_i32x4_add(iaccA, iaccB), wasm_i32x4_add(iaccC, iaccD));
+            int32_t total = wasm_i32x4_extract_lane(sum4, 0) + wasm_i32x4_extract_lane(sum4, 1) +
+                            wasm_i32x4_extract_lane(sum4, 2) + wasm_i32x4_extract_lane(sum4, 3);
+            row_sum += (float)total * d;
+        }
+        c->out[row] = row_sum * c->combined_scale;
+    }
+}
+#else
+void bn_quant_tq2_wasm_sdot_range(void *ctx, int row_start, int row_end) {
+    (void)ctx; (void)row_start; (void)row_end;
+}
+#endif

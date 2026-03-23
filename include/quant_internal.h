@@ -153,6 +153,7 @@ void bn_quant_tq2_neon_sdot_range(void *ctx, int start, int end);
 void bn_quant_tq2_neon_range(void *ctx, int start, int end);
 void bn_quant_tq2_avx2_range(void *ctx, int start, int end);
 void bn_quant_tq2_wasm_range(void *ctx, int start, int end);
+void bn_quant_tq2_wasm_sdot_range(void *ctx, int start, int end);
 void bn_quant_tq2_scalar_range(void *ctx, int start, int end);
 
 // TQ1_0 kernels
@@ -167,6 +168,7 @@ void bn_quant_q8_neon_sdot_range(void *ctx, int start, int end);
 void bn_quant_q8_neon_range(void *ctx, int start, int end);
 void bn_quant_q8_avx2_range(void *ctx, int start, int end);
 void bn_quant_q8_wasm_range(void *ctx, int start, int end);
+void bn_quant_q8_wasm_sdot_range(void *ctx, int start, int end);
 void bn_quant_q8_scalar_range(void *ctx, int start, int end);
 
 // Q4_0 kernels

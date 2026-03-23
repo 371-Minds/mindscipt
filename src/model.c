@@ -694,7 +694,7 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     // INT8 embedding size (DOTPROD + F16 only)
     size_t emb_i8_bytes = 0;
     size_t emb_i8_scales_bytes = 0;
-#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__)
+#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__) || defined(__wasm_relaxed_simd__)
     int want_i8_emb = (w->emb_type == BN_GGUF_TENSOR_F16) ||
                        (w->output_weight.data && w->output_weight.type == BN_GGUF_TENSOR_F16);
     int i8_emb_rows = 0;
@@ -740,7 +740,7 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         }
 
         // Quantize F16 embeddings to INT8 for fast SDOT logits kernel
-#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__)
+#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__) || defined(__wasm_relaxed_simd__)
         if (want_i8_emb) {
             w->emb_out_i8 = (int8_t *)sh_arena_alloc(m->weight_arena, emb_i8_bytes);
             w->emb_out_scales = (float *)sh_arena_alloc(m->weight_arena, emb_i8_scales_bytes);

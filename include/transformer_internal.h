@@ -78,6 +78,9 @@ void bn_transformer_gqa_avx2_range(void *ctx, int start, int end);
 void bn_transformer_gqa_wasm_range(void *ctx, int start, int end);
 void bn_transformer_gqa_scalar_range(void *ctx, int start, int end);
 void bn_transformer_flash_gqa_neon_range(void *ctx, int start, int end);
+void bn_transformer_flash_gqa_avx2_range(void *ctx, int start, int end);
+void bn_transformer_flash_gqa_wasm_range(void *ctx, int start, int end);
+void bn_transformer_flash_gqa_scalar_range(void *ctx, int start, int end);
 
 // --- Logits range function declarations ---
 
@@ -86,6 +89,7 @@ void bn_transformer_logits_i8_avx2_range(void *ctx, int start, int end);
 void bn_transformer_logits_f16_native_neon_range(void *ctx, int start, int end);
 void bn_transformer_logits_f16_neon_range(void *ctx, int start, int end);
 void bn_transformer_logits_f16_avx2_range(void *ctx, int start, int end);
+void bn_transformer_logits_i8_wasm_range(void *ctx, int start, int end);
 void bn_transformer_logits_f16_wasm_range(void *ctx, int start, int end);
 void bn_transformer_logits_f16_scalar_range(void *ctx, int start, int end);
 void bn_transformer_logits_f32_range(void *ctx, int start, int end);
