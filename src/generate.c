@@ -9,16 +9,14 @@
 #include <math.h>
 
 // Resolve allocator: if NULL, use stdlib default.
-static BnAllocator _default_alloc;
-static int _default_alloc_init;
-
+// The static is initialized on first call. Concurrent init is benign:
+// bn_allocator_default() is pure (returns same struct every time).
 static BnAllocator *resolve_alloc(BnAllocator *a) {
+    static BnAllocator def;
+    static int init;
     if (a) return a;
-    if (!_default_alloc_init) {
-        _default_alloc = bn_allocator_default();
-        _default_alloc_init = 1;
-    }
-    return &_default_alloc;
+    if (!init) { def = bn_allocator_default(); init = 1; }
+    return &def;
 }
 
 // --- Stop string matching ---

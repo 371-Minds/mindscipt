@@ -275,9 +275,17 @@ void bn_prompt_cache_clear(BnPromptCache *cache) {
 }
 
 int bn_prompt_cache_count(const BnPromptCache *cache) {
-    return cache ? cache->n_entries : 0;
+    if (!cache) return 0;
+    cache_lock((BnPromptCache *)cache);
+    int n = cache->n_entries;
+    cache_unlock((BnPromptCache *)cache);
+    return n;
 }
 
 size_t bn_prompt_cache_bytes(const BnPromptCache *cache) {
-    return cache ? cache->used_bytes : 0;
+    if (!cache) return 0;
+    cache_lock((BnPromptCache *)cache);
+    size_t b = cache->used_bytes;
+    cache_unlock((BnPromptCache *)cache);
+    return b;
 }

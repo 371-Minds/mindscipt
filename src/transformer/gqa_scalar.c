@@ -12,6 +12,7 @@ void bn_transformer_gqa_scalar_range(void *ctx, int h_start, int h_end) {
     int start = g->pos - n_kv + 1;
     size_t loff = g->loff;
     int kv_f16 = c->kv_f16;
+    if (head_size > BN_MAX_VLA_ELEMS) return;
 
     for (int h = h_start; h < h_end; h++) {
         float *q_h = s->q + h * head_size;
@@ -73,6 +74,7 @@ void bn_transformer_flash_gqa_scalar_range(void *ctx, int h_start, int h_end) {
     size_t loff = g->loff;
     int kv_f16 = c->kv_f16;
     float inv_sqrt_hs = 1.0f / sqrtf((float)head_size);
+    if (head_size > BN_MAX_VLA_ELEMS) return;
 
     for (int h = h_start; h < h_end; h++) {
         float *q_h = s->q + h * head_size;

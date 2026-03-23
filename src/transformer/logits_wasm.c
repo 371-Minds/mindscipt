@@ -38,6 +38,7 @@ void bn_transformer_logits_f16_wasm_range(void *ctx, int v_start, int v_end) {
     const uint16_t *emb = (const uint16_t *)lc->emb;
     const float *x = lc->x;
     int dim = lc->dim;
+    if (dim % 8 != 0) return;  // SIMD alignment guard
 
     for (int v = v_start; v < v_end; v++) {
         const uint16_t *row = emb + (size_t)v * dim;
@@ -66,6 +67,7 @@ void bn_transformer_logits_i8_wasm_range(void *ctx, int v_start, int v_end) {
     const int8_t *x_q = lc->x_q;
     float x_scale = lc->x_scale;
     int dim = lc->dim;
+    if (dim % 64 != 0) return;  // SIMD alignment guard
 
     for (int v = v_start; v < v_end; v++) {
         const int8_t *row = emb_i8 + (size_t)v * dim;

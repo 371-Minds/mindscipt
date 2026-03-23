@@ -40,6 +40,12 @@ typedef struct {
     int dim;
 } BnLogitsCtx;
 
+// Max elements for stack VLAs in backend range functions.
+// Prevents stack overflow from malicious model configs.
+#ifndef BN_MAX_VLA_ELEMS
+#define BN_MAX_VLA_ELEMS 8192
+#endif
+
 // --- Shared inline helpers ---
 
 #ifdef __ARM_NEON
