@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include <math.h>
 
 // Resolve allocator: if NULL, use stdlib default.
 static BnAllocator _default_alloc;
@@ -441,5 +442,62 @@ int bn_chat_turn_end_id(const BnTokenizer *tok, BnChatFormat fmt) {
     case BN_CHAT_LLAMA:  return tok->eot_id;
     case BN_CHAT_RAW:    return -1;
     default:             return -1;
+    }
+}
+
+// --- Logprobs ---
+
+void bn_logprobs_compute(const float *logits, int vocab_size,
+                         int chosen_token, int top_k,
+                         const BnTokenizer *tok,
+                         BnLogprobs *result) {
+    if (top_k > BN_LOGPROBS_MAX_TOP_K) top_k = BN_LOGPROBS_MAX_TOP_K;
+    if (top_k < 0) top_k = 0;
+    result->top_k = top_k;
+
+    // Find max logit for numerical stability
+    float max_logit = logits[0];
+    for (int i = 1; i < vocab_size; i++) {
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
+
+    // Compute log-sum-exp for log-softmax: log(sum(exp(logits - max)))
+    float sum_exp = 0.0f;
+    for (int i = 0; i < vocab_size; i++) {
+        sum_exp += expf(logits[i] - max_logit);
+    }
+    float log_sum = logf(sum_exp) + max_logit;  // log(sum(exp(logits)))
+
+    // Chosen token logprob
+    float chosen_logprob = logits[chosen_token] - log_sum;
+    result->chosen.token_id = chosen_token;
+    result->chosen.logprob = chosen_logprob;
+    result->chosen.text = tok ? bn_tokenizer_decode(tok, chosen_token) : NULL;
+
+    // Find top-K by logit value (equivalent to top-K by logprob since
+    // log-softmax is monotonic with logits)
+    if (top_k > 0) {
+        // Partial selection: maintain a sorted top-K array via insertion
+        for (int k = 0; k < top_k; k++) {
+            result->top[k].token_id = -1;
+            result->top[k].logprob = -INFINITY;
+            result->top[k].text = NULL;
+        }
+
+        for (int i = 0; i < vocab_size; i++) {
+            float lp = logits[i] - log_sum;
+            // Check if this logprob is larger than the smallest in top-K
+            if (top_k > 0 && lp > result->top[top_k - 1].logprob) {
+                // Insert in sorted position (descending by logprob)
+                int pos = top_k - 1;
+                while (pos > 0 && lp > result->top[pos - 1].logprob) {
+                    result->top[pos] = result->top[pos - 1];
+                    pos--;
+                }
+                result->top[pos].token_id = i;
+                result->top[pos].logprob = lp;
+                result->top[pos].text = tok ? bn_tokenizer_decode(tok, i) : NULL;
+            }
+        }
     }
 }

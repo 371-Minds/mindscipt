@@ -806,6 +806,131 @@ static void test_generate_stop_empty_list(void) {
 }
 
 // ===================================================================
+// Test logprobs
+// ===================================================================
+static void test_logprobs_basic(void) {
+    printf("test_logprobs_basic... ");
+
+    // Simple logits: token 2 has highest logit
+    float logits[6] = {0.0f, 1.0f, 5.0f, 2.0f, -1.0f, 0.5f};
+
+    uint8_t buf[4096];
+    BnGGUFFile *gf = build_test_gguf(buf, sizeof(buf));
+    assert(gf != NULL);
+    BnTokenizer tok;
+    int rc = bn_tokenizer_init(&tok, gf);
+    assert(rc == 0);
+
+    BnLogprobs lp;
+    bn_logprobs_compute(logits, 6, 2, 3, &tok, &lp);
+
+    // Chosen token should be token 2
+    assert(lp.chosen.token_id == 2);
+    // Logprob should be negative (probability < 1)
+    assert(lp.chosen.logprob < 0.0f);
+    // Logprob should be close to 0 since token 2 has highest logit
+    assert(lp.chosen.logprob > -1.0f);  // dominant token
+
+    // Top-3 should be sorted descending
+    assert(lp.top_k == 3);
+    assert(lp.top[0].logprob >= lp.top[1].logprob);
+    assert(lp.top[1].logprob >= lp.top[2].logprob);
+    // Top-1 should be token 2 (highest logit)
+    assert(lp.top[0].token_id == 2);
+
+    bn_tokenizer_free(&tok);
+    bn_gguf_free(gf);
+    printf("PASSED\n");
+}
+
+static void test_logprobs_sum_to_one(void) {
+    printf("test_logprobs_sum_to_one... ");
+
+    // Verify that exp(logprob) values sum to ~1.0 when we get all tokens
+    float logits[6] = {1.0f, 2.0f, 3.0f, 1.5f, 0.5f, 2.5f};
+
+    BnLogprobs lp;
+    // Get all 6 tokens as top-K
+    bn_logprobs_compute(logits, 6, 0, 6, NULL, &lp);
+
+    float sum = 0.0f;
+    for (int i = 0; i < lp.top_k; i++)
+        sum += expf(lp.top[i].logprob);
+    // Should sum to ~1.0 (all tokens accounted for)
+    assert(fabsf(sum - 1.0f) < 1e-5f);
+
+    printf("PASSED\n");
+}
+
+static void test_logprobs_zero_topk(void) {
+    printf("test_logprobs_zero_topk... ");
+
+    float logits[6] = {0.0f, 1.0f, 5.0f, 2.0f, -1.0f, 0.5f};
+
+    BnLogprobs lp;
+    bn_logprobs_compute(logits, 6, 2, 0, NULL, &lp);
+
+    // Should still have chosen token logprob
+    assert(lp.chosen.token_id == 2);
+    assert(lp.chosen.logprob < 0.0f);
+    assert(lp.top_k == 0);
+
+    printf("PASSED\n");
+}
+
+static void test_logprobs_uniform(void) {
+    printf("test_logprobs_uniform... ");
+
+    // All logits equal — uniform distribution, each logprob = ln(1/6)
+    float logits[6] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+
+    BnLogprobs lp;
+    bn_logprobs_compute(logits, 6, 0, 6, NULL, &lp);
+
+    float expected = logf(1.0f / 6.0f);
+    assert(fabsf(lp.chosen.logprob - expected) < 1e-5f);
+
+    // All top-K logprobs should be equal
+    for (int i = 0; i < lp.top_k; i++)
+        assert(fabsf(lp.top[i].logprob - expected) < 1e-5f);
+
+    printf("PASSED\n");
+}
+
+static void test_logprobs_text(void) {
+    printf("test_logprobs_text... ");
+
+    float logits[6] = {0.0f, 0.0f, 5.0f, 0.0f, 0.0f, 0.0f};
+
+    uint8_t buf[4096];
+    BnGGUFFile *gf = build_test_gguf(buf, sizeof(buf));
+    assert(gf != NULL);
+    BnTokenizer tok;
+    int rc = bn_tokenizer_init(&tok, gf);
+    assert(rc == 0);
+
+    BnLogprobs lp;
+    bn_logprobs_compute(logits, 6, 2, 3, &tok, &lp);
+
+    // Chosen token text should be "hello" (token 2 in our test vocab)
+    assert(lp.chosen.text != NULL);
+    assert(strcmp(lp.chosen.text, "hello") == 0);
+
+    // Top entries should have text
+    assert(lp.top[0].text != NULL);
+
+    // With NULL tokenizer, text should be NULL
+    BnLogprobs lp2;
+    bn_logprobs_compute(logits, 6, 2, 3, NULL, &lp2);
+    assert(lp2.chosen.text == NULL);
+    assert(lp2.top[0].text == NULL);
+
+    bn_tokenizer_free(&tok);
+    bn_gguf_free(gf);
+    printf("PASSED\n");
+}
+
+// ===================================================================
 // Main
 // ===================================================================
 
@@ -831,6 +956,11 @@ int main(void) {
     test_generate_stop_multiple();
     test_generate_stop_empty_list();
     test_prefill_null_model();
+    test_logprobs_basic();
+    test_logprobs_sum_to_one();
+    test_logprobs_zero_topk();
+    test_logprobs_uniform();
+    test_logprobs_text();
     printf("All generate API tests passed!\n");
     return 0;
 }

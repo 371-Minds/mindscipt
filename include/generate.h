@@ -98,4 +98,34 @@ int bn_chat_format_messages(const BnTokenizer *tok, BnChatFormat fmt,
 // Returns -1 if no end-of-turn token exists for the format.
 int bn_chat_turn_end_id(const BnTokenizer *tok, BnChatFormat fmt);
 
+// --- Logprobs API ---
+
+#define BN_LOGPROBS_MAX_TOP_K 20
+
+// A single token's log probability entry.
+typedef struct {
+    int   token_id;
+    float logprob;    // natural log probability (ln)
+    const char *text; // decoded token text (pointer into tokenizer vocab, not owned)
+} BnLogprobEntry;
+
+// Logprobs result for one generated token.
+typedef struct {
+    BnLogprobEntry chosen;                        // the sampled token
+    BnLogprobEntry top[BN_LOGPROBS_MAX_TOP_K];    // top-K alternatives (sorted by logprob, descending)
+    int top_k;                                     // number of valid entries in top[]
+} BnLogprobs;
+
+// Compute logprobs from raw logits.
+// logits: [vocab_size] raw logits from the forward pass.
+// chosen_token: the token that was sampled (its logprob is returned in result->chosen).
+// top_k: number of top alternatives to return (clamped to BN_LOGPROBS_MAX_TOP_K).
+//        Pass 0 to only compute the chosen token's logprob.
+// tok: tokenizer for decoding token text (may be NULL, text fields will be NULL).
+// result: output struct, filled by this function.
+void bn_logprobs_compute(const float *logits, int vocab_size,
+                         int chosen_token, int top_k,
+                         const BnTokenizer *tok,
+                         BnLogprobs *result);
+
 #endif // BN_GENERATE_H
