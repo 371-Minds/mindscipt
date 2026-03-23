@@ -1,4 +1,5 @@
 #include "generate.h"
+#include "session.h"
 #include "transformer.h"
 
 #include <stdlib.h>
@@ -44,12 +45,12 @@ static int check_stop_strings(const char *buf, int buf_len,
 #define LOOP_BUF_SIZE 32
 #define LOOP_NGRAM    4
 
-int bn_generate(BnModel *model, BnTokenizer *tok, BnSampler *sampler,
+int bn_generate(BnModel *model, BnSession *s, BnTokenizer *tok, BnSampler *sampler,
                 int max_tokens, int *pos,
                 bn_token_callback cb, void *user_data,
                 const BnStopStrings *stop,
                 BnAllocator *alloc) {
-    if (!pos) return -2;
+    if (!pos || !s) return -2;
     (void)alloc;
 
     int loop_buf[LOOP_BUF_SIZE];
@@ -68,7 +69,7 @@ int bn_generate(BnModel *model, BnTokenizer *tok, BnSampler *sampler,
         if (max_stop_len > STOP_BUF_SIZE) max_stop_len = STOP_BUF_SIZE;
     }
 
-    float *logits = model->state.logits;
+    float *logits = s->state.logits;
     if (!logits) return -2;
 
     for (int i = 0; i < max_tokens; i++) {
@@ -124,7 +125,7 @@ int bn_generate(BnModel *model, BnTokenizer *tok, BnSampler *sampler,
             }
         }
 
-        logits = bn_transformer_forward(model, next, *pos);
+        logits = bn_transformer_forward(model, s, next, *pos);
         (*pos)++;
         if (!logits) return -2;
     }
@@ -135,7 +136,8 @@ int bn_generate(BnModel *model, BnTokenizer *tok, BnSampler *sampler,
 #define MAX_DRAFT_K 20
 
 int bn_generate_speculative(
-    BnModel *target, BnModel *draft, int draft_k,
+    BnModel *target, BnSession *ts,
+    BnModel *draft, BnSession *ds, int draft_k,
     BnTokenizer *tok, BnSampler *sampler,
     int max_tokens, int *pos,
     bn_token_callback cb, void *user_data,
@@ -148,8 +150,8 @@ int bn_generate_speculative(
     if (draft_k > MAX_DRAFT_K) draft_k = MAX_DRAFT_K;
     int n_accepted_total = 0, n_drafted_total = 0;
 
-    float *target_logits = target->state.logits;
-    float *draft_logits = draft->state.logits;
+    float *target_logits = ts->state.logits;
+    float *draft_logits = ds->state.logits;
     if (!target_logits || !draft_logits) return -2;
 
     while (gen_count < max_tokens) {
@@ -160,7 +162,7 @@ int bn_generate_speculative(
             if (d == tok->eot_id || d == tok->eos_id || d == tok->im_end_id)
                 break;
             draft_tokens[k_actual++] = d;
-            draft_logits = bn_transformer_forward(draft, d, *pos + k_actual - 1);
+            draft_logits = bn_transformer_forward(draft, ds, d, *pos + k_actual - 1);
             if (!draft_logits) return -2;
         }
 
@@ -171,8 +173,8 @@ int bn_generate_speculative(
             bn_sampler_accept(sampler, t);
             const char *piece = bn_tokenizer_decode(tok, t);
             if (piece && cb && cb(piece, t, user_data)) break;
-            target_logits = bn_transformer_forward(target, t, *pos);
-            draft_logits = bn_transformer_forward(draft, t, *pos);
+            target_logits = bn_transformer_forward(target, ts, t, *pos);
+            draft_logits = bn_transformer_forward(draft, ds, t, *pos);
             (*pos)++;
             gen_count++;
             if (!target_logits || !draft_logits) return -2;
@@ -189,7 +191,7 @@ int bn_generate_speculative(
 
         memcpy(verify_logits, target_logits, (size_t)vocab_size * sizeof(float));
 
-        if (bn_transformer_prefill_all(target, draft_tokens, k_actual, *pos,
+        if (bn_transformer_prefill_all(target, ts, draft_tokens, k_actual, *pos,
                                         verify_logits + vocab_size) != 0) {
             bn_free(alloc, verify_logits, verify_size);
             return -2;
@@ -207,7 +209,7 @@ int bn_generate_speculative(
                 break;
             }
         }
-        target_logits = target->state.logits;
+        target_logits = ts->state.logits;
         bn_free(alloc, verify_logits, verify_size);
 
         // Stream accepted draft tokens
@@ -231,9 +233,9 @@ int bn_generate_speculative(
             }
             *pos += n_accepted + 1;
 
-            target_logits = bn_transformer_forward(target, corrected, *pos - 1);
+            target_logits = bn_transformer_forward(target, ts, corrected, *pos - 1);
             if (!target_logits) return -2;
-            draft_logits = bn_transformer_forward(draft, corrected, *pos - 1);
+            draft_logits = bn_transformer_forward(draft, ds, corrected, *pos - 1);
             if (!draft_logits) return -2;
         } else {
             *pos += n_accepted;
@@ -244,8 +246,8 @@ int bn_generate_speculative(
                 const char *piece = bn_tokenizer_decode(tok, bonus);
                 if (piece && cb && cb(piece, bonus, user_data)) goto done;
                 gen_count++;
-                target_logits = bn_transformer_forward(target, bonus, *pos);
-                draft_logits = bn_transformer_forward(draft, bonus, *pos);
+                target_logits = bn_transformer_forward(target, ts, bonus, *pos);
+                draft_logits = bn_transformer_forward(draft, ds, bonus, *pos);
                 (*pos)++;
                 if (!target_logits || !draft_logits) return -2;
             } else {
@@ -265,14 +267,14 @@ done:
     return gen_count;
 }
 
-float *bn_prefill(BnModel *model, const int *tokens, int n_tokens,
+float *bn_prefill(BnModel *model, BnSession *s, const int *tokens, int n_tokens,
                   int pos0, int no_prefill) {
     float *logits = NULL;
     if (!no_prefill && n_tokens > 1) {
-        logits = bn_transformer_prefill(model, tokens, n_tokens, pos0);
+        logits = bn_transformer_prefill(model, s, tokens, n_tokens, pos0);
     } else {
         for (int i = 0; i < n_tokens; i++) {
-            logits = bn_transformer_forward(model, tokens[i], pos0 + i);
+            logits = bn_transformer_forward(model, s, tokens[i], pos0 + i);
         }
     }
     return logits;

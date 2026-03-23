@@ -16,7 +16,7 @@ docs/      — documentation and roadmap
 
 Modules have strict, one-directional dependencies. When modifying a module, only its own files and downstream consumers should be affected. Never introduce circular dependencies.
 
-**Dependency order**: platform → gguf → quant → model → tokenizer → moe → transformer → sampler → threadpool → main
+**Dependency order**: platform → gguf → quant → model → tokenizer → moe → session → transformer → sampler → threadpool → generate → main
 
 ## Agent Workflow
 
@@ -56,9 +56,10 @@ Modules have strict, one-directional dependencies. When modifying a module, only
 - C11 standard, no GNU extensions
 - All public functions prefixed with module name: `gguf_open()`, `model_load()`, etc.
 - Internal helpers are `static`
-- Memory management: `_init`/`_free` pairs; caller owns the struct, module fills it
+- Memory management: `_init`/`_free` pairs; caller owns the struct, module fills it. Exception: `BnSession` is heap-allocated via `bn_session_create`/`bn_session_free`.
 - Error handling: return -1 or NULL on failure, print to stderr
 - No global mutable state in library modules (only in main.c and wasm/api.c)
+- **Model/Session split**: `BnModel` is shared and immutable after load (config, weights, file, pool, MoE I/O). `BnSession` holds per-request mutable state (KV cache, activation buffers, MoE compute buffers, pos). All forward pass and generation functions take both `BnModel *` and `BnSession *`.
 - Platform-specific code gated by `#ifdef __EMSCRIPTEN__`
 
 ## Performance Considerations

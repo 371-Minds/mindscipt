@@ -4,6 +4,7 @@
 #include "sampler.h"
 #include "tokenizer.h"
 #include "model.h"
+#include "session.h"
 #include "transformer.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -317,15 +318,19 @@ static void test_transformer_bounds(void) {
     m.config.dim = 64;
     m.config.n_layers = 0;  // skip layer processing
 
+    // Create a minimal session for the test
+    BnSession sess;
+    memset(&sess, 0, sizeof(sess));
+
     // bn_transformer_forward should reject invalid token
-    float *logits = bn_transformer_forward(&m, -1, 0);
+    float *logits = bn_transformer_forward(&m, &sess, -1, 0);
     assert(logits == NULL);
 
-    logits = bn_transformer_forward(&m, 100, 0);  // == vocab_size
+    logits = bn_transformer_forward(&m, &sess, 100, 0);  // == vocab_size
     assert(logits == NULL);
 
     // bn_transformer_forward should reject invalid pos
-    logits = bn_transformer_forward(&m, 0, -1);
+    logits = bn_transformer_forward(&m, &sess, 0, -1);
     assert(logits == NULL);
 
     printf("PASSED\n");

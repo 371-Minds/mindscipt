@@ -1,4 +1,5 @@
 #include "moe.h"
+#include "session.h"
 #include "platform.h"
 #include "quant.h"
 #include "simd_helpers.h"
@@ -549,9 +550,9 @@ static int moe_proj_info(const BnMoEExpertMap *map, int expert_idx, int proj,
 // madvise helper: issue WILLNEED or DONTNEED for expert projections.
 // proj_mask: bitmask (1=gate, 2=up, 4=down), advice: MADV_WILLNEED or MADV_DONTNEED.
 #if !defined(__EMSCRIPTEN__)
-static void moe_madvise_experts(const BnMoEState *ms, const BnMoEExpertMap *map,
+static void moe_madvise_experts(const BnMoEIO *io, const BnMoEExpertMap *map,
                                  const int *indices, int n, int advice, int proj_mask) {
-    if (!ms->io.mmap_base) return;
+    if (!io->mmap_base) return;
     long page_size = sysconf(_SC_PAGESIZE);
     for (int k = 0; k < n; k++) {
         int eidx = indices[k];
@@ -561,7 +562,7 @@ static void moe_madvise_experts(const BnMoEState *ms, const BnMoEExpertMap *map,
             size_t offset, proj_bytes;
             moe_proj_info(map, eidx, proj, &offset, &proj_bytes);
             // Page-align: round down start, round up end
-            uintptr_t addr = (uintptr_t)ms->io.mmap_base + offset;
+            uintptr_t addr = (uintptr_t)io->mmap_base + offset;
             uintptr_t aligned_start = addr & ~((uintptr_t)page_size - 1);
             size_t aligned_len = (addr + proj_bytes - aligned_start + page_size - 1) & ~((size_t)page_size - 1);
             madvise((void *)aligned_start, aligned_len, advice);
@@ -572,24 +573,25 @@ static void moe_madvise_experts(const BnMoEState *ms, const BnMoEExpertMap *map,
 
 // Load one expert projection into a specific buffer.
 // Returns pointer to data (mmap pointer or buf), or NULL on error.
-static const void *moe_load_expert_proj_into(BnMoEState *ms, const BnMoEExpertMap *map,
+static const void *moe_load_expert_proj_into(const BnMoEIO *io, BnMoEStats *stats,
+                                              const BnMoEExpertMap *map,
                                               int expert_idx, int proj,
                                               uint8_t *buf, size_t buf_size) {
     size_t offset, proj_bytes;
     if (moe_proj_info(map, expert_idx, proj, &offset, &proj_bytes) < 0)
         return NULL;
 
-    ms->stats.io_bytes += proj_bytes;
-    ms->stats.io_count++;
+    stats->io_bytes += proj_bytes;
+    stats->io_count++;
 
-    if (ms->io.mmap_base)
-        return ms->io.mmap_base + offset;
+    if (io->mmap_base)
+        return io->mmap_base + offset;
 
 #if !defined(__EMSCRIPTEN__)
-    if (ms->io.fd < 0 || proj_bytes > buf_size) return NULL;
+    if (io->fd < 0 || proj_bytes > buf_size) return NULL;
     double t0 = bn_platform_time_ms();
-    ssize_t n = pread(ms->io.fd, buf, proj_bytes, (off_t)offset);
-    ms->stats.io_time_ms += bn_platform_time_ms() - t0;
+    ssize_t n = pread(io->fd, buf, proj_bytes, (off_t)offset);
+    stats->io_time_ms += bn_platform_time_ms() - t0;
     if (n != (ssize_t)proj_bytes) return NULL;
     return buf;
 #else
@@ -598,10 +600,11 @@ static const void *moe_load_expert_proj_into(BnMoEState *ms, const BnMoEExpertMa
 }
 
 // Load one expert projection into the default expert_buf.
-static const void *moe_load_expert_proj(BnMoEState *ms, const BnMoEExpertMap *map,
+static const void *moe_load_expert_proj(const BnMoEIO *io, BnMoEState *ms,
+                                         const BnMoEExpertMap *map,
                                          int expert_idx, int proj) {
-    return moe_load_expert_proj_into(ms, map, expert_idx, proj,
-                                      ms->io.buf, ms->io.buf_size);
+    return moe_load_expert_proj_into(io, &ms->stats, map, expert_idx, proj,
+                                      ms->buf, ms->buf_size);
 }
 
 // Build a temporary BnQWeight from pread'd expert data
@@ -674,13 +677,13 @@ static inline double moe_time_ms(void) {
 }
 
 // Full MoE FFN block
-void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
+void bn_moe_forward(BnModel *m, BnSession *sess, BnLayerWeights *lw, int l) {
 #if defined(__EMSCRIPTEN__)
     (void)l;
 #endif
     BnConfig *c = &m->config;
-    BnRunState *s = &m->state;
-    BnMoEState *ms = m->moe_state;
+    BnRunState *s = &sess->state;
+    BnMoEState *ms = sess->moe_state;
     int dim = c->dim;
     int moe_hidden = c->moe_intermediate_size;
     int K = c->n_experts_active;
@@ -702,7 +705,7 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
     // 4. Expert FFN compute
     double t_compute = moe_time_ms();
 
-    if (ms->io.mmap_base && K <= BN_MAX_MOE_K) {
+    if (m->moe_io.mmap_base && K <= BN_MAX_MOE_K) {
         // --- Cross-expert batched dispatch (mmap path) ---
         int valid_k = 0;
         int valid_indices[BN_MAX_MOE_K];
@@ -711,9 +714,9 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
 
         // Prefetch gate+up pages for all K experts (madvise mode)
 #if !defined(__EMSCRIPTEN__)
-        if (ms->io.madvise_mode) {
+        if (m->moe_io.madvise_mode) {
             double ta = moe_time_ms();
-            moe_madvise_experts(ms, &lw->expert_map, ms->expert_indices, K,
+            moe_madvise_experts(&m->moe_io, &lw->expert_map, ms->expert_indices, K,
                                 MADV_WILLNEED, 0x3 /* gate+up */);
             ms->stats.madvise_time_ms += moe_time_ms() - ta;
         }
@@ -722,8 +725,8 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
         for (int k = 0; k < K; k++) {
             int eidx = ms->expert_indices[k];
             if (eidx < 0) continue;
-            const void *gate_data = moe_load_expert_proj(ms, &lw->expert_map, eidx, 0);
-            const void *up_data   = moe_load_expert_proj(ms, &lw->expert_map, eidx, 1);
+            const void *gate_data = moe_load_expert_proj(&m->moe_io, ms, &lw->expert_map, eidx, 0);
+            const void *up_data   = moe_load_expert_proj(&m->moe_io, ms, &lw->expert_map, eidx, 1);
             if (!gate_data || !up_data) {
                 SH_LOG_ERROR("Failed to load expert gate/up projection");
                 continue;
@@ -765,9 +768,9 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
 
             // Prefetch down projection pages (madvise mode)
 #if !defined(__EMSCRIPTEN__)
-            if (ms->io.madvise_mode) {
+            if (m->moe_io.madvise_mode) {
                 double ta = moe_time_ms();
-                moe_madvise_experts(ms, &lw->expert_map, valid_indices, valid_k,
+                moe_madvise_experts(&m->moe_io, &lw->expert_map, valid_indices, valid_k,
                                     MADV_WILLNEED, 0x4 /* down */);
                 ms->stats.madvise_time_ms += moe_time_ms() - ta;
             }
@@ -777,7 +780,7 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
             t0 = moe_time_ms();
             BnQWeight wdowns[BN_MAX_MOE_K];
             for (int k = 0; k < valid_k; k++) {
-                const void *down_data = moe_load_expert_proj(ms, &lw->expert_map, valid_indices[k], 2);
+                const void *down_data = moe_load_expert_proj(&m->moe_io, ms, &lw->expert_map, valid_indices[k], 2);
                 if (!down_data) {
                     SH_LOG_ERROR("Failed to load expert down projection");
                     valid_weights[k] = 0.0f;
@@ -815,11 +818,11 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
         }
     }
 #if !defined(__EMSCRIPTEN__)
-    else if (ms->io.fd >= 0 && !ms->io.mmap_base) {
+    else if (m->moe_io.fd >= 0 && !m->moe_io.mmap_base) {
         // --- Pipelined pread path with LRU cache ---
-        BnMoEPrefetch *pf_gu = (BnMoEPrefetch *)ms->io.prefetch;
-        BnMoEPrefetch *pf_dn = (BnMoEPrefetch *)ms->io.prefetch_down;
-        BnMoECache *cache = (BnMoECache *)ms->io.cache;
+        BnMoEPrefetch *pf_gu = (BnMoEPrefetch *)m->moe_io.prefetch;
+        BnMoEPrefetch *pf_dn = (BnMoEPrefetch *)m->moe_io.prefetch_down;
+        BnMoECache *cache = (BnMoECache *)m->moe_io.cache;
         const BnMoEExpertMap *map = &lw->expert_map;
 
         // Sort expert indices ascending (insertion sort, K is small)
@@ -888,9 +891,9 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
             moe_proj_info(map, meidx, 2, &miss_d_off, &miss_d_sz);
 
             miss_slot_ptr = cache ? moe_cache_insert(cache, l, meidx) : NULL;
-            miss_g_dst = miss_slot_ptr ? miss_slot_ptr : ms->io.buf;
-            miss_u_dst = miss_slot_ptr ? miss_slot_ptr + cache->gate_bytes : ms->io.buf2;
-            miss_d_dst = miss_slot_ptr ? miss_slot_ptr + cache->gate_bytes + cache->up_bytes : ms->io.buf5;
+            miss_g_dst = miss_slot_ptr ? miss_slot_ptr : ms->buf;
+            miss_u_dst = miss_slot_ptr ? miss_slot_ptr + cache->gate_bytes : ms->buf2;
+            miss_d_dst = miss_slot_ptr ? miss_slot_ptr + cache->gate_bytes + cache->up_bytes : ms->buf5;
 
             if (pf_gu) {
                 moe_prefetch_start2(pf_gu, miss_g_dst, miss_g_sz, (off_t)miss_g_off,
@@ -969,18 +972,18 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
                     ms->stats.prefetch_wait_ms += moe_time_ms() - tw;
                     COLLECT_PF_STATS(pf_gu);
                     if (!ok) {
-                        if (pread(ms->io.fd, miss_g_dst, miss_g_sz, (off_t)miss_g_off) != (ssize_t)miss_g_sz)
+                        if (pread(m->moe_io.fd, miss_g_dst, miss_g_sz, (off_t)miss_g_off) != (ssize_t)miss_g_sz)
                             SH_LOG_ERROR("Fallback gate pread failed");
-                        if (pread(ms->io.fd, miss_u_dst, miss_u_sz, (off_t)miss_u_off) != (ssize_t)miss_u_sz)
+                        if (pread(m->moe_io.fd, miss_u_dst, miss_u_sz, (off_t)miss_u_off) != (ssize_t)miss_u_sz)
                             SH_LOG_ERROR("Fallback up pread failed");
                     }
                 } else {
-                    if (pread(ms->io.fd, miss_g_dst, miss_g_sz, (off_t)miss_g_off) != (ssize_t)miss_g_sz)
+                    if (pread(m->moe_io.fd, miss_g_dst, miss_g_sz, (off_t)miss_g_off) != (ssize_t)miss_g_sz)
                         SH_LOG_ERROR("Sync gate pread failed");
-                    if (pread(ms->io.fd, miss_u_dst, miss_u_sz, (off_t)miss_u_off) != (ssize_t)miss_u_sz)
+                    if (pread(m->moe_io.fd, miss_u_dst, miss_u_sz, (off_t)miss_u_off) != (ssize_t)miss_u_sz)
                         SH_LOG_ERROR("Sync up pread failed");
                     if (!pf_dn)
-                        if (pread(ms->io.fd, miss_d_dst, miss_d_sz, (off_t)miss_d_off) != (ssize_t)miss_d_sz)
+                        if (pread(m->moe_io.fd, miss_d_dst, miss_d_sz, (off_t)miss_d_off) != (ssize_t)miss_d_sz)
                             SH_LOG_ERROR("Sync down pread failed");
                 }
                 gate_ptr = miss_g_dst;
@@ -994,9 +997,9 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
                 moe_proj_info(map, eidx, 2, &d_off, &d_sz);
 
                 uint8_t *slot = cache ? moe_cache_insert(cache, l, eidx) : NULL;
-                uint8_t *g_dst = slot ? slot : ms->io.buf;
-                uint8_t *u_dst = slot ? slot + cache->gate_bytes : ms->io.buf2;
-                uint8_t *d_dst = slot ? slot + cache->gate_bytes + cache->up_bytes : ms->io.buf5;
+                uint8_t *g_dst = slot ? slot : ms->buf;
+                uint8_t *u_dst = slot ? slot + cache->gate_bytes : ms->buf2;
+                uint8_t *d_dst = slot ? slot + cache->gate_bytes + cache->up_bytes : ms->buf5;
 
                 if (pf_gu) {
                     moe_prefetch_start2(pf_gu, g_dst, g_sz, (off_t)g_off,
@@ -1012,17 +1015,17 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
                     ms->stats.prefetch_wait_ms += moe_time_ms() - tw;
                     COLLECT_PF_STATS(pf_gu);
                     if (!ok) {
-                        if (pread(ms->io.fd, g_dst, g_sz, (off_t)g_off) != (ssize_t)g_sz)
+                        if (pread(m->moe_io.fd, g_dst, g_sz, (off_t)g_off) != (ssize_t)g_sz)
                             SH_LOG_ERROR("Fallback gate pread failed");
-                        if (pread(ms->io.fd, u_dst, u_sz, (off_t)u_off) != (ssize_t)u_sz)
+                        if (pread(m->moe_io.fd, u_dst, u_sz, (off_t)u_off) != (ssize_t)u_sz)
                             SH_LOG_ERROR("Fallback up pread failed");
                     }
                 } else {
-                    if (pread(ms->io.fd, g_dst, g_sz, (off_t)g_off) != (ssize_t)g_sz)
+                    if (pread(m->moe_io.fd, g_dst, g_sz, (off_t)g_off) != (ssize_t)g_sz)
                         SH_LOG_ERROR("Sync gate pread failed");
-                    if (pread(ms->io.fd, u_dst, u_sz, (off_t)u_off) != (ssize_t)u_sz)
+                    if (pread(m->moe_io.fd, u_dst, u_sz, (off_t)u_off) != (ssize_t)u_sz)
                         SH_LOG_ERROR("Sync up pread failed");
-                    if (pread(ms->io.fd, d_dst, d_sz, (off_t)d_off) != (ssize_t)d_sz)
+                    if (pread(m->moe_io.fd, d_dst, d_sz, (off_t)d_off) != (ssize_t)d_sz)
                         SH_LOG_ERROR("Sync down pread failed");
                 }
 
@@ -1061,7 +1064,7 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
                 if (!ok) {
                     size_t d_off, d_sz;
                     moe_proj_info(map, eidx, 2, &d_off, &d_sz);
-                    if (pread(ms->io.fd, (void *)(uintptr_t)down_ptr, d_sz, (off_t)d_off) != (ssize_t)d_sz)
+                    if (pread(m->moe_io.fd, (void *)(uintptr_t)down_ptr, d_sz, (off_t)d_off) != (ssize_t)d_sz)
                         SH_LOG_ERROR("Fallback down pread failed");
                 }
             }
@@ -1092,8 +1095,8 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
             if (eidx < 0) continue;
 
             t0 = moe_time_ms();
-            const void *gate_data = moe_load_expert_proj(ms, &lw->expert_map, eidx, 0);
-            const void *up_data = moe_load_expert_proj(ms, &lw->expert_map, eidx, 1);
+            const void *gate_data = moe_load_expert_proj(&m->moe_io, ms, &lw->expert_map, eidx, 0);
+            const void *up_data = moe_load_expert_proj(&m->moe_io, ms, &lw->expert_map, eidx, 1);
             if (!gate_data || !up_data) {
                 SH_LOG_ERROR("Failed to load expert gate/up projection");
                 continue;
@@ -1116,7 +1119,7 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
 
             // Down projection
             t0 = moe_time_ms();
-            const void *down_data = moe_load_expert_proj(ms, &lw->expert_map, eidx, 2);
+            const void *down_data = moe_load_expert_proj(&m->moe_io, ms, &lw->expert_map, eidx, 2);
             if (!down_data) {
                 SH_LOG_ERROR("Failed to load expert down projection");
                 continue;
@@ -1177,11 +1180,11 @@ void bn_moe_forward(BnModel *m, BnLayerWeights *lw, int l) {
 
 // --- Batch MoE FFN for prefill ---
 // Route all n_tokens, group by expert, batch matmul per expert.
-int bn_moe_forward_batch(BnModel *m, BnLayerWeights *lw, int l,
+int bn_moe_forward_batch(BnModel *m, BnSession *sess, BnLayerWeights *lw, int l,
                           float *act, float *Xb, int n_tokens) {
     (void)l;  // reserved for pread cache keying in future
     BnConfig *c = &m->config;
-    BnMoEState *ms = m->moe_state;
+    BnMoEState *ms = sess->moe_state;
     int dim = c->dim;
     int moe_hidden = c->moe_intermediate_size;
     int K = c->n_experts_active;
@@ -1285,9 +1288,9 @@ int bn_moe_forward_batch(BnModel *m, BnLayerWeights *lw, int l,
                    dim * sizeof(float));
 
         // Load expert weights (mmap: zero-copy pointer)
-        const void *gate_data = moe_load_expert_proj(ms, map, e, 0);
-        const void *up_data   = moe_load_expert_proj(ms, map, e, 1);
-        const void *down_data = moe_load_expert_proj(ms, map, e, 2);
+        const void *gate_data = moe_load_expert_proj(&m->moe_io, ms, map, e, 0);
+        const void *up_data   = moe_load_expert_proj(&m->moe_io, ms, map, e, 1);
+        const void *down_data = moe_load_expert_proj(&m->moe_io, ms, map, e, 2);
         if (!gate_data || !up_data || !down_data) continue;
 
         BnQWeight wgate = moe_make_qweight(gate_data, map->gate_type,
@@ -1470,34 +1473,34 @@ void bn_moe_reset_stats(BnMoEState *ms) {
     ms->stats.cache_misses = 0;
 }
 
-void bn_moe_prefetch_create(BnMoEState *ms) {
-    if (!ms || ms->io.prefetch) return;
+void bn_moe_prefetch_create(BnMoEIO *io) {
+    if (!io || io->prefetch) return;
 #if !defined(__EMSCRIPTEN__)
-    if (ms->io.fd >= 0 && !ms->io.mmap_base) {
-        ms->io.prefetch = moe_prefetch_init(ms->io.fd);
-        ms->io.prefetch_down = moe_prefetch_init(ms->io.fd);
-        if (ms->io.prefetch && ms->io.prefetch_down) {
+    if (io->fd >= 0 && !io->mmap_base) {
+        io->prefetch = moe_prefetch_init(io->fd);
+        io->prefetch_down = moe_prefetch_init(io->fd);
+        if (io->prefetch && io->prefetch_down) {
             SH_LOG_INFO("MoE I/O prefetch threads", "status", "2 created (gate+up, down)");
         } else {
             // Clean up partial init — free whichever succeeded
-            if (ms->io.prefetch) { moe_prefetch_free((BnMoEPrefetch *)ms->io.prefetch); ms->io.prefetch = NULL; }
-            if (ms->io.prefetch_down) { moe_prefetch_free((BnMoEPrefetch *)ms->io.prefetch_down); ms->io.prefetch_down = NULL; }
+            if (io->prefetch) { moe_prefetch_free((BnMoEPrefetch *)io->prefetch); io->prefetch = NULL; }
+            if (io->prefetch_down) { moe_prefetch_free((BnMoEPrefetch *)io->prefetch_down); io->prefetch_down = NULL; }
             SH_LOG_WARN("MoE I/O prefetch threads failed to create");
         }
     }
 #endif
 }
 
-void bn_moe_prefetch_destroy(BnMoEState *ms) {
-    if (!ms) return;
+void bn_moe_prefetch_destroy(BnMoEIO *io) {
+    if (!io) return;
 #if !defined(__EMSCRIPTEN__)
-    if (ms->io.prefetch) {
-        moe_prefetch_free((BnMoEPrefetch *)ms->io.prefetch);
-        ms->io.prefetch = NULL;
+    if (io->prefetch) {
+        moe_prefetch_free((BnMoEPrefetch *)io->prefetch);
+        io->prefetch = NULL;
     }
-    if (ms->io.prefetch_down) {
-        moe_prefetch_free((BnMoEPrefetch *)ms->io.prefetch_down);
-        ms->io.prefetch_down = NULL;
+    if (io->prefetch_down) {
+        moe_prefetch_free((BnMoEPrefetch *)io->prefetch_down);
+        io->prefetch_down = NULL;
     }
 #endif
 }

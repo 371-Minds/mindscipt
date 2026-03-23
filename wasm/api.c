@@ -10,11 +10,13 @@
 #include "transformer.h"
 #include "tokenizer.h"
 #include "sampler.h"
+#include "session.h"
 
 #include <stdlib.h>
 #include <string.h>
 
 static BnModel     g_model;
+static BnSession  *g_session;
 static BnGGUFFile *g_gguf;
 static BnTokenizer g_tokenizer;
 static BnSampler   g_sampler;
@@ -35,6 +37,13 @@ int bitnet_init(const uint8_t *data, size_t size) {
     }
     g_model.file = mf;
 
+    g_session = bn_session_create(&g_model, NULL);
+    if (!g_session) {
+        bn_model_free(&g_model);
+        bn_gguf_free(g_gguf);
+        return -1;
+    }
+
     if (bn_tokenizer_init(&g_tokenizer, g_gguf) != 0) {
         bn_model_free(&g_model);
         bn_gguf_free(g_gguf);
@@ -54,14 +63,14 @@ int bitnet_init(const uint8_t *data, size_t size) {
 EMSCRIPTEN_KEEPALIVE
 int bitnet_forward_token(int token, int pos) {
     if (!g_initialized) return -1;
-    float *logits = bn_transformer_forward(&g_model, token, pos);
+    float *logits = bn_transformer_forward(&g_model, g_session, token, pos);
     return logits ? 0 : -1;
 }
 
 EMSCRIPTEN_KEEPALIVE
 float *bitnet_get_logits(void) {
     if (!g_initialized) return NULL;
-    return g_model.state.logits;
+    return g_session->state.logits;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -69,7 +78,7 @@ int bitnet_sample(float temperature, float topp) {
     if (!g_initialized) return -1;
     g_sampler.temperature = temperature;
     g_sampler.topp = topp;
-    return bn_sampler_sample(&g_sampler, g_model.state.logits);
+    return bn_sampler_sample(&g_sampler, g_session->state.logits);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -107,6 +116,8 @@ void bitnet_free(void) {
     if (!g_initialized) return;
     bn_sampler_free(&g_sampler);
     bn_tokenizer_free(&g_tokenizer);
+    bn_session_free(g_session, NULL);
+    g_session = NULL;
     bn_model_free(&g_model);
     bn_gguf_free(g_gguf);
     g_initialized = 0;
@@ -137,7 +148,7 @@ void bitnet_chat_reset(void) {
     g_loop_idx = 0;
     memset(g_loop_buf, -1, sizeof(g_loop_buf));
     bn_sampler_reset_recent(&g_sampler);
-    bn_transformer_forward(&g_model, g_tokenizer.bos_id, g_chat_pos);
+    bn_transformer_forward(&g_model, g_session, g_tokenizer.bos_id, g_chat_pos);
     g_chat_pos++;
 }
 
@@ -172,10 +183,10 @@ int bitnet_chat_submit(const char *text) {
 
     // Prefill all prompt tokens
     if (n > 1) {
-        bn_transformer_prefill(&g_model, g_chat_tokens, n, g_chat_pos);
+        bn_transformer_prefill(&g_model, g_session, g_chat_tokens, n, g_chat_pos);
         g_chat_pos += n;
     } else if (n == 1) {
-        bn_transformer_forward(&g_model, g_chat_tokens[0], g_chat_pos);
+        bn_transformer_forward(&g_model, g_session, g_chat_tokens[0], g_chat_pos);
         g_chat_pos++;
     }
 
@@ -191,7 +202,7 @@ EMSCRIPTEN_KEEPALIVE
 int bitnet_chat_next(void) {
     if (!g_initialized) return -2;
 
-    float *logits = g_model.state.logits;
+    float *logits = g_session->state.logits;
     if (!logits) return -2;
 
     int next = bn_sampler_sample(&g_sampler, logits);
@@ -218,7 +229,7 @@ int bitnet_chat_next(void) {
     bn_sampler_accept(&g_sampler, next);
 
     // Forward pass for next token
-    bn_transformer_forward(&g_model, next, g_chat_pos);
+    bn_transformer_forward(&g_model, g_session, next, g_chat_pos);
     g_chat_pos++;
 
     return next;
@@ -229,7 +240,7 @@ int bitnet_chat_end_turn(void) {
     if (!g_initialized) return 0;
 
     // Feed EOT to close assistant turn
-    bn_transformer_forward(&g_model, g_tokenizer.eot_id, g_chat_pos);
+    bn_transformer_forward(&g_model, g_session, g_tokenizer.eot_id, g_chat_pos);
     g_chat_pos++;
 
     g_chat_turn_count++;

@@ -689,61 +689,7 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
         }
     }
 
-    // --- Allocate BnRunState via arena ---
-    // #1, #14: Check all allocations and guard against overflow
-    BnRunState *s = &m->state;
-
-    size_t att_size = (size_t)c->n_heads * c->seq_len;
-    if (att_size / c->n_heads != (size_t)c->seq_len) {
-        SH_LOG_ERROR("Attention buffer size overflow");
-        goto fail_state;
-    }
-
-    // Only attention layers need KV cache
-    int n_attn_layers = (c->full_attn_interval > 0)
-        ? c->n_layers / c->full_attn_interval : c->n_layers;
-    int n_ssm_layers = c->n_layers - n_attn_layers;
-
-    // #14: Check for overflow before large KV cache allocations
-    size_t kv_cache_size = (size_t)n_attn_layers * c->seq_len * c->kv_dim;
-    if (n_attn_layers > 0 && c->seq_len > 0 && c->kv_dim > 0 &&
-        kv_cache_size / n_attn_layers / c->seq_len != (size_t)c->kv_dim) {
-        SH_LOG_ERROR("KV cache size overflow");
-        goto fail_state;
-    }
-
-    // q_dim = n_heads * head_size (may differ from dim when attention.key_length is set)
-    int q_dim = c->n_heads * c->head_size;
-    int xb_size = q_dim > c->dim ? q_dim : c->dim;  // xb must hold attention output
-    int q_size = xb_size;  // q must match xb for attention head access pattern
-
-    int x_q_size = c->dim > c->hidden_dim ? c->dim : c->hidden_dim;
-    if (q_dim > x_q_size) x_q_size = q_dim;
-    int half_head = c->head_size / 2;
-
-    // Scratch buffer sizes — enlarged for hybrid SSM + gated-Q attention
-    int hb_size = c->hidden_dim;
-    int hb2_size = c->hidden_dim;
-    int xb2_size = c->dim;
-    if (c->full_attn_interval > 0) {
-        // SSM: qkv projection → hb, z gate → hb2, recurrence output → xb2
-        int qkv_dim = c->ssm_group_count * c->ssm_state_size * 2 + c->ssm_inner_size;
-        if (qkv_dim > hb_size) hb_size = qkv_dim;
-        if (c->ssm_inner_size > hb2_size) hb2_size = c->ssm_inner_size;
-        if (c->ssm_inner_size > xb2_size) xb2_size = c->ssm_inner_size;
-        if (c->ssm_inner_size > x_q_size) x_q_size = c->ssm_inner_size;
-        // Gated Q attention: q_full (Q + gate) → hb
-        int gq = 2 * q_dim;
-        if (gq > hb_size) hb_size = gq;
-    }
-    // MoE shared expert may need larger hb/hb2 buffers
-    if (c->has_shared_expert && c->shared_expert_intermediate_size > hb_size)
-        hb_size = c->shared_expert_intermediate_size;
-    if (c->has_shared_expert && c->shared_expert_intermediate_size > hb2_size)
-        hb2_size = c->shared_expert_intermediate_size;
-    // MoE expert intermediate for x_q scratch
-    if (c->n_experts > 0 && c->moe_intermediate_size > x_q_size)
-        x_q_size = c->moe_intermediate_size;
+    // --- Weight arena: INT8 embeddings + Q4_0 repacking ---
 
     // INT8 embedding size (DOTPROD + F16 only)
     size_t emb_i8_bytes = 0;
@@ -753,7 +699,6 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
                        (w->output_weight.data && w->output_weight.type == BN_GGUF_TENSOR_F16);
     int i8_emb_rows = 0;
     if (want_i8_emb) {
-        // For untied F16 output weight, quantize that; otherwise quantize tied embeddings
         i8_emb_rows = (w->output_weight.data && w->output_weight.type == BN_GGUF_TENSOR_F16)
                        ? w->output_weight.rows : c->vocab_size;
         emb_i8_bytes = (size_t)i8_emb_rows * c->dim;
@@ -780,231 +725,63 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
     q4_repack_total += q4_repack_bytes(&w->output_weight);
 #endif
 
-    // SSM state sizing
-    size_t ssm_state_size_total = 0;
-    size_t ssm_conv_state_total = 0;
-    if (n_ssm_layers > 0 && c->ssm_time_step_rank > 0) {
-        int head_v_dim = c->ssm_inner_size / c->ssm_time_step_rank;
-        size_t state_per_layer = (size_t)c->ssm_time_step_rank *
-                                  c->ssm_state_size * head_v_dim;
-        ssm_state_size_total = (size_t)n_ssm_layers * state_per_layer;
-        int conv_dim = c->ssm_group_count * c->ssm_state_size * 2 + c->ssm_inner_size;
-        ssm_conv_state_total = (size_t)n_ssm_layers *
-                                (c->ssm_conv_kernel - 1) * conv_dim;
-    }
-
-    // MoE buffer sizing
-    size_t moe_arena_bytes = 0;
-    size_t moe_expert_buf_size = 0;
-    if (c->n_experts > 0) {
-        // Determine max expert projection size from layer 0
-        BnMoEExpertMap *em0 = &w->layers[0].expert_map;
-        moe_expert_buf_size = em0->expert_gate_bytes;
-        if (em0->expert_up_bytes > moe_expert_buf_size)
-            moe_expert_buf_size = em0->expert_up_bytes;
-        if (em0->expert_down_bytes > moe_expert_buf_size)
-            moe_expert_buf_size = em0->expert_down_bytes;
-
-        moe_arena_bytes += sizeof(BnMoEState);                                    // state struct
-        moe_arena_bytes += (size_t)c->n_experts * sizeof(float);                  // router_logits
-        moe_arena_bytes += (size_t)c->dim * sizeof(float);                        // expert_out
-        moe_arena_bytes += (size_t)c->n_experts_active * sizeof(float);           // expert_weights
-        moe_arena_bytes += (size_t)c->n_experts_active * sizeof(int);             // expert_indices
-        moe_arena_bytes += (size_t)c->moe_intermediate_size * sizeof(float);      // expert_hb
-        moe_arena_bytes += (size_t)c->moe_intermediate_size * sizeof(float);      // expert_hb2
-        moe_arena_bytes += moe_expert_buf_size;                                    // expert_buf (pread)
-        moe_arena_bytes += moe_expert_buf_size;                                    // expert_buf2 (pread double-buffer)
-        moe_arena_bytes += moe_expert_buf_size;                                    // expert_buf3 (prefetch gate)
-        moe_arena_bytes += moe_expert_buf_size;                                    // expert_buf4 (prefetch up)
-        moe_arena_bytes += moe_expert_buf_size;                                    // expert_buf5 (down)
-        // Batch buffers for cross-expert dispatch (mmap path)
-        int moe_k = c->n_experts_active;
-        if (moe_k > BN_MAX_MOE_K) moe_k = BN_MAX_MOE_K;
-        moe_arena_bytes += (size_t)moe_k * c->moe_intermediate_size * sizeof(float); // hb_batch
-        moe_arena_bytes += (size_t)moe_k * c->moe_intermediate_size * sizeof(float); // hb2_batch
-        moe_arena_bytes += (size_t)moe_k * c->dim * sizeof(float);                   // down_batch
-        moe_arena_bytes += (size_t)moe_k * c->moe_intermediate_size;               // down_x_q_bufs
-        moe_arena_bytes += (13 + 3 * moe_k) * SH_ARENA_ALIGN;                       // alignment
-    }
-
-    // Compute total arena capacity (all RunState buffers + INT8 embeddings + Q4 repacking)
-    size_t arena_size = 0;
-    arena_size += ((size_t)c->dim + (size_t)xb_size + (size_t)xb2_size + (size_t)q_size) * sizeof(float); // x, xb, xb2, q
-    arena_size += ((size_t)hb_size + (size_t)hb2_size) * sizeof(float);    // hb, hb2
-    arena_size += att_size * sizeof(float);                     // att
-    arena_size += (size_t)c->vocab_size * sizeof(float);       // logits
-    size_t kv_elem_size = c->kv_f16 ? sizeof(uint16_t) : sizeof(float);
-    arena_size += 2 * kv_cache_size * kv_elem_size;           // key_cache, value_cache
-    arena_size += (size_t)x_q_size * sizeof(int8_t);           // x_q
-    arena_size += (size_t)half_head * sizeof(float);           // rope_freq
-    arena_size += (ssm_state_size_total + ssm_conv_state_total) * sizeof(float); // SSM state
-    arena_size += emb_i8_bytes + emb_i8_scales_bytes;          // INT8 embeddings
-    arena_size += q4_repack_total;                              // Q4_0 repacked weights
-    arena_size += moe_arena_bytes;                              // MoE buffers
-    arena_size += 16 * SH_ARENA_ALIGN;                         // alignment padding
-
-    if (arena_size > SIZE_MAX / 2) {
-        SH_LOG_ERROR("Arena size overflow");
-        goto fail_state;
-    }
-
-    m->arena = sh_arena_create(arena_size);
-    if (!m->arena) {
-        SH_LOG_ERROR("Failed to allocate run state arena");
-        goto fail_state;
-    }
-
-    s->x           = (float *)sh_arena_calloc(m->arena, c->dim, sizeof(float));
-    s->xb          = (float *)sh_arena_calloc(m->arena, xb_size, sizeof(float));
-    s->xb2         = (float *)sh_arena_calloc(m->arena, xb2_size, sizeof(float));
-    s->q           = (float *)sh_arena_calloc(m->arena, q_size, sizeof(float));
-    s->hb          = (float *)sh_arena_calloc(m->arena, hb_size, sizeof(float));
-    s->hb2         = (float *)sh_arena_calloc(m->arena, hb2_size, sizeof(float));
-    s->att         = (float *)sh_arena_calloc(m->arena, att_size, sizeof(float));
-    s->logits      = (float *)sh_arena_calloc(m->arena, c->vocab_size, sizeof(float));
-    s->key_cache   = (float *)sh_arena_calloc(m->arena, kv_cache_size, kv_elem_size);
-    s->value_cache = (float *)sh_arena_calloc(m->arena, kv_cache_size, kv_elem_size);
-    s->x_q         = (int8_t *)sh_arena_calloc(m->arena, x_q_size, sizeof(int8_t));
-    s->rope_freq   = (float *)sh_arena_alloc(m->arena, half_head * sizeof(float));
-
-    // SSM state buffers
-    s->ssm_state = NULL;
-    s->ssm_conv_state = NULL;
-    if (ssm_state_size_total > 0) {
-        s->ssm_state = (float *)sh_arena_calloc(m->arena, ssm_state_size_total, sizeof(float));
-        s->ssm_conv_state = (float *)sh_arena_calloc(m->arena, ssm_conv_state_total, sizeof(float));
-    }
-
-    // #1: Check all allocations succeeded
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 ||
-        !s->q || !s->att || !s->logits || !s->key_cache || !s->value_cache ||
-        !s->x_q || !s->rope_freq) {
-        SH_LOG_ERROR("Failed to allocate run state buffers");
-        goto fail_state;
-    }
-    if (ssm_state_size_total > 0 && (!s->ssm_state || !s->ssm_conv_state)) {
-        SH_LOG_ERROR("Failed to allocate SSM state buffers");
-        goto fail_state;
-    }
-
-    // MoE state buffers
-    m->moe_state = NULL;
+    size_t weight_arena_size = emb_i8_bytes + emb_i8_scales_bytes + q4_repack_total
+                              + 4 * SH_ARENA_ALIGN;
+    m->weight_arena = NULL;
     m->expert_fd = -1;
-    if (c->n_experts > 0) {
-        BnMoEState *ms = (BnMoEState *)sh_arena_calloc(m->arena, 1, sizeof(BnMoEState));
-        if (!ms) {
-            SH_LOG_ERROR("Failed to allocate MoE state");
-            goto fail_state;
-        }
-        ms->io.fd = -1;  // will be set from BnMappedFile.fd after model.file is assigned
-        ms->router_logits  = (float *)sh_arena_calloc(m->arena, c->n_experts, sizeof(float));
-        ms->expert_out     = (float *)sh_arena_calloc(m->arena, c->dim, sizeof(float));
-        ms->expert_weights = (float *)sh_arena_calloc(m->arena, c->n_experts_active, sizeof(float));
-        ms->expert_indices = (int *)sh_arena_calloc(m->arena, c->n_experts_active, sizeof(int));
-        ms->expert_hb      = (float *)sh_arena_calloc(m->arena, c->moe_intermediate_size, sizeof(float));
-        ms->expert_hb2     = (float *)sh_arena_calloc(m->arena, c->moe_intermediate_size, sizeof(float));
-        ms->io.buf      = (uint8_t *)sh_arena_alloc(m->arena, moe_expert_buf_size);
-        ms->io.buf_size  = moe_expert_buf_size;
-        ms->io.buf2     = (uint8_t *)sh_arena_alloc(m->arena, moe_expert_buf_size);
-        ms->io.buf2_size = moe_expert_buf_size;
-        ms->io.buf3     = (uint8_t *)sh_arena_alloc(m->arena, moe_expert_buf_size);
-        ms->io.buf3_size = moe_expert_buf_size;
-        ms->io.buf4     = (uint8_t *)sh_arena_alloc(m->arena, moe_expert_buf_size);
-        ms->io.buf4_size = moe_expert_buf_size;
-        ms->io.buf5     = (uint8_t *)sh_arena_alloc(m->arena, moe_expert_buf_size);
-        ms->io.buf5_size = moe_expert_buf_size;
-        ms->io.prefetch = NULL;
+    memset(&m->moe_io, 0, sizeof(m->moe_io));
+    m->moe_io.fd = -1;
 
-        if (!ms->router_logits || !ms->expert_out || !ms->expert_weights ||
-            !ms->expert_indices || !ms->expert_hb || !ms->expert_hb2 ||
-            !ms->io.buf || !ms->io.buf2 ||
-            !ms->io.buf3 || !ms->io.buf4 || !ms->io.buf5) {
-            SH_LOG_ERROR("Failed to allocate MoE buffers");
+    if (weight_arena_size > 4 * SH_ARENA_ALIGN) {
+        m->weight_arena = sh_arena_create(weight_arena_size);
+        if (!m->weight_arena) {
+            SH_LOG_ERROR("Failed to allocate weight arena");
             goto fail_state;
         }
 
-        // Batch buffers for cross-expert dispatch
-        int moe_k = c->n_experts_active;
-        if (moe_k > BN_MAX_MOE_K) moe_k = BN_MAX_MOE_K;
-        for (int k = 0; k < moe_k; k++) {
-            ms->expert_hb_batch[k]   = (float *)sh_arena_calloc(m->arena, c->moe_intermediate_size, sizeof(float));
-            ms->expert_hb2_batch[k]  = (float *)sh_arena_calloc(m->arena, c->moe_intermediate_size, sizeof(float));
-            ms->expert_down_batch[k] = (float *)sh_arena_calloc(m->arena, c->dim, sizeof(float));
-            if (!ms->expert_hb_batch[k] || !ms->expert_hb2_batch[k] || !ms->expert_down_batch[k]) {
-                SH_LOG_ERROR("Failed to allocate MoE batch buffers");
-                goto fail_state;
+        // Quantize F16 embeddings to INT8 for fast SDOT logits kernel
+#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__)
+        if (want_i8_emb) {
+            w->emb_out_i8 = (int8_t *)sh_arena_alloc(m->weight_arena, emb_i8_bytes);
+            w->emb_out_scales = (float *)sh_arena_alloc(m->weight_arena, emb_i8_scales_bytes);
+            if (w->emb_out_i8 && w->emb_out_scales) {
+                const uint16_t *src = (w->output_weight.data && w->output_weight.type == BN_GGUF_TENSOR_F16)
+                                      ? (const uint16_t *)w->output_weight.data
+                                      : (const uint16_t *)w->token_embedding;
+                bn_quant_f16_rows_to_i8(src, w->emb_out_i8, w->emb_out_scales,
+                                        i8_emb_rows, c->dim);
+                char i8_mb[16]; snprintf(i8_mb, sizeof(i8_mb), "%.0f", (double)emb_i8_bytes / (1024*1024));
+                SH_LOG_INFO("INT8 output embeddings ready", "MB", i8_mb);
+            } else {
+                w->emb_out_i8 = NULL;
+                w->emb_out_scales = NULL;
+                SH_LOG_DEBUG("INT8 embedding arena alloc failed, using F16 fallback");
             }
         }
-
-        // Per-expert x_q buffers for batched down projection dispatch
-        ms->down_x_q_bufs = (int8_t *)sh_arena_alloc(m->arena,
-            (size_t)moe_k * c->moe_intermediate_size);
-
-        m->moe_state = ms;
-
-        {
-            char buf_s[16];
-            snprintf(buf_s, sizeof(buf_s), "%.1f", (double)moe_expert_buf_size / (1024 * 1024));
-            SH_LOG_INFO("MoE state allocated", "expert_buf_MB", buf_s);
-        }
-    }
-
-    // Precompute RoPE frequencies: freq[i] = 1/theta^(2i/rope_dims)
-    int rope_dims = c->rope_dim_count > 0 ? c->rope_dim_count : c->head_size;
-    int half_rope = rope_dims / 2;
-    for (int i = 0; i < half_rope; i++) {
-        s->rope_freq[i] = 1.0f / powf(c->rope_theta, (float)(2 * i) / (float)rope_dims);
-    }
-    // MROPE text-only: zero out non-text section frequencies.
-    // Sections 1,2 (vision height/width) get position=0 for text tokens → no rotation.
-    if (c->rope_text_dims > 0) {
-        int text_pairs = c->rope_text_dims / 2;
-        for (int i = text_pairs; i < half_rope; i++)
-            s->rope_freq[i] = 0.0f;
-    }
-
-    // Quantize F16 embeddings to INT8 for fast SDOT logits kernel
-#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__)
-    if (want_i8_emb) {
-        w->emb_out_i8 = (int8_t *)sh_arena_alloc(m->arena, emb_i8_bytes);
-        w->emb_out_scales = (float *)sh_arena_alloc(m->arena, emb_i8_scales_bytes);
-        if (w->emb_out_i8 && w->emb_out_scales) {
-            const uint16_t *src = (w->output_weight.data && w->output_weight.type == BN_GGUF_TENSOR_F16)
-                                  ? (const uint16_t *)w->output_weight.data
-                                  : (const uint16_t *)w->token_embedding;
-            bn_quant_f16_rows_to_i8(src, w->emb_out_i8, w->emb_out_scales,
-                                    i8_emb_rows, c->dim);
-            char i8_mb[16]; snprintf(i8_mb, sizeof(i8_mb), "%.0f", (double)emb_i8_bytes / (1024*1024));
-            SH_LOG_INFO("INT8 output embeddings ready", "MB", i8_mb);
-        } else {
-            w->emb_out_i8 = NULL;
-            w->emb_out_scales = NULL;
-            SH_LOG_DEBUG("INT8 embedding arena alloc failed, using F16 fallback");
-        }
-    }
 #endif
 
-    // Repack Q4_0 weights into split scales/qs layout for NEON SDOT
+        // Repack Q4_0 weights into split scales/qs layout for NEON SDOT
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    if (q4_repack_total > 0) {
-        for (int i = 0; i < c->n_layers; i++) {
-            BnLayerWeights *lw = &w->layers[i];
-            q4_repack(&lw->wq, m->arena);
-            q4_repack(&lw->wk, m->arena);
-            q4_repack(&lw->wv, m->arena);
-            q4_repack(&lw->wo, m->arena);
-            q4_repack(&lw->wqkv, m->arena);
-            q4_repack(&lw->wz, m->arena);
-            q4_repack(&lw->ssm_out, m->arena);
-            q4_repack(&lw->ffn_gate, m->arena);
-            q4_repack(&lw->ffn_up, m->arena);
-            q4_repack(&lw->ffn_down, m->arena);
+        if (q4_repack_total > 0) {
+            for (int i = 0; i < c->n_layers; i++) {
+                BnLayerWeights *lw = &w->layers[i];
+                q4_repack(&lw->wq, m->weight_arena);
+                q4_repack(&lw->wk, m->weight_arena);
+                q4_repack(&lw->wv, m->weight_arena);
+                q4_repack(&lw->wo, m->weight_arena);
+                q4_repack(&lw->wqkv, m->weight_arena);
+                q4_repack(&lw->wz, m->weight_arena);
+                q4_repack(&lw->ssm_out, m->weight_arena);
+                q4_repack(&lw->ffn_gate, m->weight_arena);
+                q4_repack(&lw->ffn_up, m->weight_arena);
+                q4_repack(&lw->ffn_down, m->weight_arena);
+            }
+            q4_repack(&w->output_weight, m->weight_arena);
+            char rp_mb[16]; snprintf(rp_mb, sizeof(rp_mb), "%.0f", (double)q4_repack_total / (1024*1024));
+            SH_LOG_INFO("Q4_0 weights repacked", "MB", rp_mb);
         }
-        q4_repack(&w->output_weight, m->arena);
-        char rp_mb[16]; snprintf(rp_mb, sizeof(rp_mb), "%.0f", (double)q4_repack_total / (1024*1024));
-        SH_LOG_INFO("Q4_0 weights repacked", "MB", rp_mb);
-    }
 #endif
+    }
 
     return 0;
 
@@ -1017,42 +794,262 @@ fail_layers:
     return -1;
 }
 
-void bn_model_reset_state(BnModel *m) {
-    if (!m) return;
-    BnConfig *c = &m->config;
-    BnRunState *s = &m->state;
+// --- Session arena helpers ---
 
-    // KV cache
-    int n_attn = (c->full_attn_interval > 0)
+size_t bn_model_session_arena_size(const BnConfig *c, const BnWeights *w) {
+    (void)w;  // reserved for future per-session weight transforms
+
+    size_t att_size = (size_t)c->n_heads * c->seq_len;
+    int n_attn_layers = (c->full_attn_interval > 0)
         ? c->n_layers / c->full_attn_interval : c->n_layers;
-    size_t kv_size = (size_t)n_attn * c->seq_len * c->kv_dim;
-    size_t kv_elem = c->kv_f16 ? sizeof(uint16_t) : sizeof(float);
-    memset(s->key_cache, 0, kv_size * kv_elem);
-    memset(s->value_cache, 0, kv_size * kv_elem);
+    int n_ssm_layers = c->n_layers - n_attn_layers;
+    size_t kv_cache_size = (size_t)n_attn_layers * c->seq_len * c->kv_dim;
 
-    // SSM state
-    if (s->ssm_state && c->ssm_time_step_rank > 0) {
-        int n_ssm = c->n_layers - n_attn;
+    int q_dim = c->n_heads * c->head_size;
+    int xb_size = q_dim > c->dim ? q_dim : c->dim;
+    int q_size = xb_size;
+    int x_q_size = c->dim > c->hidden_dim ? c->dim : c->hidden_dim;
+    if (q_dim > x_q_size) x_q_size = q_dim;
+    int half_head = c->head_size / 2;
+
+    int hb_size = c->hidden_dim;
+    int hb2_size = c->hidden_dim;
+    int xb2_size = c->dim;
+    if (c->full_attn_interval > 0) {
+        int qkv_dim = c->ssm_group_count * c->ssm_state_size * 2 + c->ssm_inner_size;
+        if (qkv_dim > hb_size) hb_size = qkv_dim;
+        if (c->ssm_inner_size > hb2_size) hb2_size = c->ssm_inner_size;
+        if (c->ssm_inner_size > xb2_size) xb2_size = c->ssm_inner_size;
+        if (c->ssm_inner_size > x_q_size) x_q_size = c->ssm_inner_size;
+        int gq = 2 * q_dim;
+        if (gq > hb_size) hb_size = gq;
+    }
+    if (c->has_shared_expert && c->shared_expert_intermediate_size > hb_size)
+        hb_size = c->shared_expert_intermediate_size;
+    if (c->has_shared_expert && c->shared_expert_intermediate_size > hb2_size)
+        hb2_size = c->shared_expert_intermediate_size;
+    if (c->n_experts > 0 && c->moe_intermediate_size > x_q_size)
+        x_q_size = c->moe_intermediate_size;
+
+    size_t ssm_state_size_total = 0;
+    size_t ssm_conv_state_total = 0;
+    if (n_ssm_layers > 0 && c->ssm_time_step_rank > 0) {
         int head_v_dim = c->ssm_inner_size / c->ssm_time_step_rank;
-        size_t state_total = (size_t)n_ssm * c->ssm_time_step_rank *
-                             c->ssm_state_size * head_v_dim;
-        memset(s->ssm_state, 0, state_total * sizeof(float));
-    }
-    if (s->ssm_conv_state) {
-        int n_ssm = c->n_layers - n_attn;
+        size_t state_per_layer = (size_t)c->ssm_time_step_rank *
+                                  c->ssm_state_size * head_v_dim;
+        ssm_state_size_total = (size_t)n_ssm_layers * state_per_layer;
         int conv_dim = c->ssm_group_count * c->ssm_state_size * 2 + c->ssm_inner_size;
-        size_t conv_total = (size_t)n_ssm * (c->ssm_conv_kernel - 1) * conv_dim;
-        memset(s->ssm_conv_state, 0, conv_total * sizeof(float));
+        ssm_conv_state_total = (size_t)n_ssm_layers *
+                                (c->ssm_conv_kernel - 1) * conv_dim;
     }
+
+    size_t moe_arena_bytes = 0;
+    if (c->n_experts > 0 && c->n_layers > 0) {
+        // We don't have access to expert_map here, so estimate max buf size
+        // as max of gate/up/down bytes. Caller provides weights for exact sizing.
+        // Use a conservative estimate based on moe_intermediate_size.
+        size_t moe_expert_buf_size = 0;
+        if (w && w->layers) {
+            BnMoEExpertMap *em0 = &w->layers[0].expert_map;
+            moe_expert_buf_size = em0->expert_gate_bytes;
+            if (em0->expert_up_bytes > moe_expert_buf_size)
+                moe_expert_buf_size = em0->expert_up_bytes;
+            if (em0->expert_down_bytes > moe_expert_buf_size)
+                moe_expert_buf_size = em0->expert_down_bytes;
+        }
+
+        moe_arena_bytes += sizeof(BnMoEState);
+        moe_arena_bytes += (size_t)c->n_experts * sizeof(float);
+        moe_arena_bytes += (size_t)c->dim * sizeof(float);
+        moe_arena_bytes += (size_t)c->n_experts_active * sizeof(float);
+        moe_arena_bytes += (size_t)c->n_experts_active * sizeof(int);
+        moe_arena_bytes += (size_t)c->moe_intermediate_size * sizeof(float);
+        moe_arena_bytes += (size_t)c->moe_intermediate_size * sizeof(float);
+        moe_arena_bytes += 5 * moe_expert_buf_size;
+        int moe_k = c->n_experts_active;
+        if (moe_k > BN_MAX_MOE_K) moe_k = BN_MAX_MOE_K;
+        moe_arena_bytes += (size_t)moe_k * c->moe_intermediate_size * sizeof(float);
+        moe_arena_bytes += (size_t)moe_k * c->moe_intermediate_size * sizeof(float);
+        moe_arena_bytes += (size_t)moe_k * c->dim * sizeof(float);
+        moe_arena_bytes += (size_t)moe_k * c->moe_intermediate_size;
+        moe_arena_bytes += (13 + 3 * moe_k) * SH_ARENA_ALIGN;
+    }
+
+    size_t arena_size = 0;
+    arena_size += ((size_t)c->dim + (size_t)xb_size + (size_t)xb2_size + (size_t)q_size) * sizeof(float);
+    arena_size += ((size_t)hb_size + (size_t)hb2_size) * sizeof(float);
+    arena_size += att_size * sizeof(float);
+    arena_size += (size_t)c->vocab_size * sizeof(float);
+    size_t kv_elem_size = c->kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    arena_size += 2 * kv_cache_size * kv_elem_size;
+    arena_size += (size_t)x_q_size * sizeof(int8_t);
+    arena_size += (size_t)half_head * sizeof(float);
+    arena_size += (ssm_state_size_total + ssm_conv_state_total) * sizeof(float);
+    arena_size += moe_arena_bytes;
+    arena_size += 16 * SH_ARENA_ALIGN;
+
+    return arena_size;
 }
 
+// Allocate MoE pread staging buffers from arena (requires expert_map for sizing)
+static void alloc_moe_pread_bufs(BnMoEState *ms, const BnWeights *w, SHArena *arena) {
+    if (!ms || !w || !w->layers) return;
+    BnMoEExpertMap *em0 = &w->layers[0].expert_map;
+    size_t buf_size = em0->expert_gate_bytes;
+    if (em0->expert_up_bytes > buf_size) buf_size = em0->expert_up_bytes;
+    if (em0->expert_down_bytes > buf_size) buf_size = em0->expert_down_bytes;
+
+    ms->buf      = (uint8_t *)sh_arena_alloc(arena, buf_size);
+    ms->buf_size  = buf_size;
+    ms->buf2     = (uint8_t *)sh_arena_alloc(arena, buf_size);
+    ms->buf2_size = buf_size;
+    ms->buf3     = (uint8_t *)sh_arena_alloc(arena, buf_size);
+    ms->buf3_size = buf_size;
+    ms->buf4     = (uint8_t *)sh_arena_alloc(arena, buf_size);
+    ms->buf4_size = buf_size;
+    ms->buf5     = (uint8_t *)sh_arena_alloc(arena, buf_size);
+    ms->buf5_size = buf_size;
+}
+
+int bn_model_alloc_session_buffers(const BnConfig *c, const BnWeights *w,
+                                    SHArena *arena,
+                                    BnRunState *state, BnMoEState **moe_out) {
+    size_t att_size = (size_t)c->n_heads * c->seq_len;
+    if (c->n_heads > 0 && att_size / c->n_heads != (size_t)c->seq_len)
+        return -1;
+
+    int n_attn_layers = (c->full_attn_interval > 0)
+        ? c->n_layers / c->full_attn_interval : c->n_layers;
+    int n_ssm_layers = c->n_layers - n_attn_layers;
+    size_t kv_cache_size = (size_t)n_attn_layers * c->seq_len * c->kv_dim;
+    if (n_attn_layers > 0 && c->seq_len > 0 && c->kv_dim > 0 &&
+        kv_cache_size / n_attn_layers / c->seq_len != (size_t)c->kv_dim)
+        return -1;
+
+    int q_dim = c->n_heads * c->head_size;
+    int xb_size = q_dim > c->dim ? q_dim : c->dim;
+    int q_size = xb_size;
+    int x_q_size = c->dim > c->hidden_dim ? c->dim : c->hidden_dim;
+    if (q_dim > x_q_size) x_q_size = q_dim;
+    int half_head = c->head_size / 2;
+
+    int hb_size = c->hidden_dim;
+    int hb2_size = c->hidden_dim;
+    int xb2_size = c->dim;
+    if (c->full_attn_interval > 0) {
+        int qkv_dim = c->ssm_group_count * c->ssm_state_size * 2 + c->ssm_inner_size;
+        if (qkv_dim > hb_size) hb_size = qkv_dim;
+        if (c->ssm_inner_size > hb2_size) hb2_size = c->ssm_inner_size;
+        if (c->ssm_inner_size > xb2_size) xb2_size = c->ssm_inner_size;
+        if (c->ssm_inner_size > x_q_size) x_q_size = c->ssm_inner_size;
+        int gq = 2 * q_dim;
+        if (gq > hb_size) hb_size = gq;
+    }
+    if (c->has_shared_expert && c->shared_expert_intermediate_size > hb_size)
+        hb_size = c->shared_expert_intermediate_size;
+    if (c->has_shared_expert && c->shared_expert_intermediate_size > hb2_size)
+        hb2_size = c->shared_expert_intermediate_size;
+    if (c->n_experts > 0 && c->moe_intermediate_size > x_q_size)
+        x_q_size = c->moe_intermediate_size;
+
+    size_t kv_elem_size = c->kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    BnRunState *s = state;
+
+    s->x           = (float *)sh_arena_calloc(arena, c->dim, sizeof(float));
+    s->xb          = (float *)sh_arena_calloc(arena, xb_size, sizeof(float));
+    s->xb2         = (float *)sh_arena_calloc(arena, xb2_size, sizeof(float));
+    s->q           = (float *)sh_arena_calloc(arena, q_size, sizeof(float));
+    s->hb          = (float *)sh_arena_calloc(arena, hb_size, sizeof(float));
+    s->hb2         = (float *)sh_arena_calloc(arena, hb2_size, sizeof(float));
+    s->att         = (float *)sh_arena_calloc(arena, att_size, sizeof(float));
+    s->logits      = (float *)sh_arena_calloc(arena, c->vocab_size, sizeof(float));
+    s->key_cache   = (float *)sh_arena_calloc(arena, kv_cache_size, kv_elem_size);
+    s->value_cache = (float *)sh_arena_calloc(arena, kv_cache_size, kv_elem_size);
+    s->x_q         = (int8_t *)sh_arena_calloc(arena, x_q_size, sizeof(int8_t));
+    s->rope_freq   = (float *)sh_arena_alloc(arena, half_head * sizeof(float));
+
+    // SSM state buffers
+    s->ssm_state = NULL;
+    s->ssm_conv_state = NULL;
+    size_t ssm_state_size_total = 0;
+    size_t ssm_conv_state_total = 0;
+    if (n_ssm_layers > 0 && c->ssm_time_step_rank > 0) {
+        int head_v_dim = c->ssm_inner_size / c->ssm_time_step_rank;
+        size_t state_per_layer = (size_t)c->ssm_time_step_rank *
+                                  c->ssm_state_size * head_v_dim;
+        ssm_state_size_total = (size_t)n_ssm_layers * state_per_layer;
+        int conv_dim = c->ssm_group_count * c->ssm_state_size * 2 + c->ssm_inner_size;
+        ssm_conv_state_total = (size_t)n_ssm_layers *
+                                (c->ssm_conv_kernel - 1) * conv_dim;
+        s->ssm_state = (float *)sh_arena_calloc(arena, ssm_state_size_total, sizeof(float));
+        s->ssm_conv_state = (float *)sh_arena_calloc(arena, ssm_conv_state_total, sizeof(float));
+    }
+
+    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 ||
+        !s->q || !s->att || !s->logits || !s->key_cache || !s->value_cache ||
+        !s->x_q || !s->rope_freq)
+        return -1;
+    if (ssm_state_size_total > 0 && (!s->ssm_state || !s->ssm_conv_state))
+        return -1;
+
+    // Precompute RoPE frequencies
+    int rope_dims = c->rope_dim_count > 0 ? c->rope_dim_count : c->head_size;
+    int half_rope = rope_dims / 2;
+    for (int i = 0; i < half_rope; i++)
+        s->rope_freq[i] = 1.0f / powf(c->rope_theta, (float)(2 * i) / (float)rope_dims);
+    if (c->rope_text_dims > 0) {
+        int text_pairs = c->rope_text_dims / 2;
+        for (int i = text_pairs; i < half_rope; i++)
+            s->rope_freq[i] = 0.0f;
+    }
+
+    // MoE state buffers
+    *moe_out = NULL;
+    if (c->n_experts > 0) {
+        BnMoEState *ms = (BnMoEState *)sh_arena_calloc(arena, 1, sizeof(BnMoEState));
+        if (!ms) return -1;
+
+        ms->router_logits  = (float *)sh_arena_calloc(arena, c->n_experts, sizeof(float));
+        ms->expert_out     = (float *)sh_arena_calloc(arena, c->dim, sizeof(float));
+        ms->expert_weights = (float *)sh_arena_calloc(arena, c->n_experts_active, sizeof(float));
+        ms->expert_indices = (int *)sh_arena_calloc(arena, c->n_experts_active, sizeof(int));
+        ms->expert_hb      = (float *)sh_arena_calloc(arena, c->moe_intermediate_size, sizeof(float));
+        ms->expert_hb2     = (float *)sh_arena_calloc(arena, c->moe_intermediate_size, sizeof(float));
+
+        // Pread staging buffers (sized from expert_map)
+        alloc_moe_pread_bufs(ms, w, arena);
+
+        if (!ms->router_logits || !ms->expert_out || !ms->expert_weights ||
+            !ms->expert_indices || !ms->expert_hb || !ms->expert_hb2)
+            return -1;
+
+        int moe_k = c->n_experts_active;
+        if (moe_k > BN_MAX_MOE_K) moe_k = BN_MAX_MOE_K;
+        for (int k = 0; k < moe_k; k++) {
+            ms->expert_hb_batch[k]   = (float *)sh_arena_calloc(arena, c->moe_intermediate_size, sizeof(float));
+            ms->expert_hb2_batch[k]  = (float *)sh_arena_calloc(arena, c->moe_intermediate_size, sizeof(float));
+            ms->expert_down_batch[k] = (float *)sh_arena_calloc(arena, c->dim, sizeof(float));
+            if (!ms->expert_hb_batch[k] || !ms->expert_hb2_batch[k] || !ms->expert_down_batch[k])
+                return -1;
+        }
+
+        ms->down_x_q_bufs = (int8_t *)sh_arena_alloc(arena,
+            (size_t)moe_k * c->moe_intermediate_size);
+
+        *moe_out = ms;
+    }
+
+    return 0;
+}
+
+// Allocate MoE pread staging buffers from arena (requires expert_map for sizing)
 void bn_model_free(BnModel *m) {
     if (!m) return;
-    if (m->moe_state) bn_moe_prefetch_destroy(m->moe_state);
+    bn_moe_prefetch_destroy(&m->moe_io);
     bn_tp_free(m->pool);
     free(m->weights.layers);
-    sh_arena_free(m->arena);  // frees MoE state, INT8 embeddings too
-    bn_platform_unload_file(&m->file);  // safe even if file.data is NULL, also closes fd
+    sh_arena_free(m->weight_arena);
+    bn_platform_unload_file(&m->file);
     memset(m, 0, sizeof(BnModel));
 }
 

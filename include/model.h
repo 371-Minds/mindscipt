@@ -23,8 +23,7 @@ typedef struct {
 
 #define BN_MAX_MOE_K 16
 
-// Forward declaration for MoE runtime state (defined in moe.h)
-// Expert I/O control plane (mmap, pread+LRU, or madvise)
+// Shared MoE I/O control plane (lives on BnModel, shared across sessions)
 typedef struct {
     int fd;
     const uint8_t *mmap_base; // mmap'd file base pointer (NULL if using pread)
@@ -32,17 +31,6 @@ typedef struct {
     void *prefetch;           // BnMoEPrefetch* for gate+up (opaque, pread only)
     void *prefetch_down;      // BnMoEPrefetch* for down proj (opaque, pread only)
     void *cache;              // BnMoECache* for expert LRU cache (opaque, pread only)
-    // Pread staging buffers (arena-allocated)
-    uint8_t *buf;             // gate buffer
-    size_t buf_size;
-    uint8_t *buf2;            // up buffer / double-buffer
-    size_t buf2_size;
-    uint8_t *buf3;            // prefetch gate buffer
-    size_t buf3_size;
-    uint8_t *buf4;            // prefetch up buffer
-    size_t buf4_size;
-    uint8_t *buf5;            // down buffer
-    size_t buf5_size;
 } BnMoEIO;
 
 // Accumulated MoE timing and I/O stats
@@ -64,9 +52,8 @@ typedef struct {
     size_t cache_misses;      // expert cache misses (pread only)
 } BnMoEStats;
 
-// MoE runtime state (compute buffers + I/O + stats)
+// MoE per-session state (compute buffers + pread staging + stats)
 typedef struct {
-    BnMoEIO io;               // I/O control plane
     BnMoEStats stats;         // accumulated timing stats
     // Compute buffers (arena-allocated)
     float *router_logits;
@@ -80,6 +67,17 @@ typedef struct {
     float *expert_hb2_batch[BN_MAX_MOE_K];  // K up outputs [moe_hidden]
     float *expert_down_batch[BN_MAX_MOE_K]; // K down outputs [dim]
     int8_t *down_x_q_bufs;                 // [K * moe_hidden] int8 scratch for multi-dispatch down
+    // Pread staging buffers (arena-allocated, per-session)
+    uint8_t *buf;             // gate buffer
+    size_t buf_size;
+    uint8_t *buf2;            // up buffer / double-buffer
+    size_t buf2_size;
+    uint8_t *buf3;            // prefetch gate buffer
+    size_t buf3_size;
+    uint8_t *buf4;            // prefetch up buffer
+    size_t buf4_size;
+    uint8_t *buf5;            // down buffer
+    size_t buf5_size;
 } BnMoEState;
 
 #define BN_DEFAULT_ROPE_THETA  10000.0f
@@ -164,18 +162,22 @@ typedef struct {
 typedef struct {
     BnConfig config;
     BnWeights weights;
-    BnRunState state;
-    BnMappedFile file;  // keeps mmap/buffer alive
-    BnThreadPool *pool; // thread pool for parallel dispatch
-    SHArena *arena;     // arena for all RunState buffers
-    // MoE state (NULL/zero for dense models)
-    BnMoEState *moe_state;  // runtime MoE buffers (arena-allocated)
+    BnMappedFile file;       // keeps mmap/buffer alive
+    BnThreadPool *pool;      // thread pool for parallel dispatch
+    SHArena *weight_arena;   // arena for weight transforms (INT8 embeddings, Q4_0 repacking)
+    // MoE shared I/O (zero for dense models)
+    BnMoEIO moe_io;
     int expert_fd;           // file descriptor for expert pread, -1 if unused
 } BnModel;
 
 int  bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16);
 void bn_model_free(BnModel *m);
-void bn_model_reset_state(BnModel *m);
 void bn_model_embed_token(const BnModel *m, float *out, int token);
+
+// Session arena helpers (used by bn_session_create)
+size_t bn_model_session_arena_size(const BnConfig *c, const BnWeights *w);
+int    bn_model_alloc_session_buffers(const BnConfig *c, const BnWeights *w,
+                                       SHArena *arena,
+                                       BnRunState *state, BnMoEState **moe_out);
 
 #endif // BN_MODEL_H

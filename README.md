@@ -182,7 +182,8 @@ bitnet.c/
 │   ├── quant.h                 # Public quant API: block structs, matvec, dequant
 │   ├── quant_internal.h        # Quant backend context structs + range function decls
 │   ├── iq_tables.h             # IQ codebook lookup tables (shared across backends)
-│   ├── model.h                 # Config, Weights, model loading
+│   ├── model.h                 # Config, Weights, model loading, session arena helpers
+│   ├── session.h               # BnSession: per-request KV cache + activation buffers
 │   ├── transformer.h           # Forward pass public API
 │   ├── transformer_internal.h  # Transformer backend context structs + range function decls
 │   ├── tokenizer.h             # BPE tokenizer API
@@ -203,7 +204,8 @@ bitnet.c/
 │   │   ├── rmsnorm_{neon,avx2,wasm,scalar}.c
 │   │   ├── gqa_{neon,avx2,wasm,scalar}.c
 │   │   └── logits_{neon,avx2,wasm,scalar}.c
-│   ├── model.c                 # GGUF → Config/Weights mapping
+│   ├── model.c                 # GGUF → Config/Weights mapping, session arena helpers
+│   ├── session.c               # BnSession create/free/reset
 │   ├── transformer.c           # Forward pass: layer loop, FFN, dispatch
 │   ├── tokenizer.c             # BPE encode/decode from GGUF vocab
 │   ├── sampler.c               # Argmax, multinomial, top-p sampling
@@ -232,12 +234,52 @@ platform
     ↓
 tokenizer     ← depends on gguf
     ↓
-transformer   ← depends on model + quant
+ session      ← depends on model (per-request KV cache + buffers)
+    ↓
+transformer   ← depends on model + session + quant
     ↓
  sampler      ← standalone, testable in isolation
     ↓
+ generate     ← depends on model + session + transformer + tokenizer + sampler
+    ↓
   main        ← wires everything together
 ```
+
+## Library API
+
+bitnet.c can be used as a library. The model/session split enables concurrent request handling — multiple sessions share one immutable model.
+
+```c
+#include "generate.h"
+#include "session.h"
+
+// Load model (shared, immutable after load)
+BnModel model;
+bn_model_load(&model, gf, 0, 0);
+model.file = mf;
+model.pool = bn_tp_create(7);
+
+// Create independent sessions
+BnSession *s1 = bn_session_create(&model, NULL);
+BnSession *s2 = bn_session_create(&model, NULL);
+
+// Request 1
+bn_prefill(&model, s1, tokens1, n1, s1->pos, 0);
+s1->pos += n1;
+bn_generate(&model, s1, &tok, &sampler, 256, &s1->pos, cb, ud, NULL, NULL);
+
+// Request 2 (concurrent — shared weights, independent KV cache)
+bn_prefill(&model, s2, tokens2, n2, s2->pos, 0);
+s2->pos += n2;
+bn_generate(&model, s2, &tok, &sampler, 256, &s2->pos, cb, ud, NULL, NULL);
+
+// Cleanup
+bn_session_free(s1, NULL);
+bn_session_free(s2, NULL);
+bn_model_free(&model);
+```
+
+Sessions are not thread-safe individually, but different sessions can be used from different threads concurrently since they share only immutable model data.
 
 ## WASM Build
 

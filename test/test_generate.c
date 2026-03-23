@@ -2,6 +2,7 @@
 #include "sampler.h"
 #include "tokenizer.h"
 #include "model.h"
+#include "session.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -312,7 +313,9 @@ static void test_generate_eos_stop(void) {
     // but if EOS is sampled first, it should stop before that call.
     BnModel model;
     memset(&model, 0, sizeof(model));
-    model.state.logits = logits;
+    BnSession sess;
+    memset(&sess, 0, sizeof(sess));
+    sess.state.logits = logits;
 
     // Build tokenizer
     uint8_t buf[4096];
@@ -326,7 +329,7 @@ static void test_generate_eos_stop(void) {
     int pos = 0;
 
     // Generate — should immediately hit EOS and return 0
-    int n = bn_generate(&model, &tok, &sampler, 100, &pos, test_gen_callback, &cb_state, NULL, NULL);
+    int n = bn_generate(&model, &sess, &tok, &sampler, 100, &pos, test_gen_callback, &cb_state, NULL, NULL);
     assert(n == 0);  // EOS sampled first, no tokens generated
     assert(cb_state.count == 0);
 
@@ -351,7 +354,9 @@ static void test_generate_callback_cancel(void) {
 
     BnModel model;
     memset(&model, 0, sizeof(model));
-    model.state.logits = logits;
+    BnSession sess;
+    memset(&sess, 0, sizeof(sess));
+    sess.state.logits = logits;
 
     uint8_t buf[4096];
     BnGGUFFile *gf = build_test_gguf(buf, sizeof(buf));
@@ -366,7 +371,7 @@ static void test_generate_callback_cancel(void) {
 
     // bn_generate will sample token 2, call callback which returns 1 (stop).
     // It will NOT call bn_transformer_forward because it breaks before that.
-    int n = bn_generate(&model, &tok, &sampler, 100, &pos, test_gen_callback, &cb_state, NULL, NULL);
+    int n = bn_generate(&model, &sess, &tok, &sampler, 100, &pos, test_gen_callback, &cb_state, NULL, NULL);
     assert(n == 1);  // generated 1 token before callback stopped it
     assert(cb_state.count == 1);
     assert(cb_state.tokens[0] == 2);  // "hello"
@@ -382,7 +387,9 @@ static void test_generate_null_logits(void) {
 
     BnModel model;
     memset(&model, 0, sizeof(model));
-    model.state.logits = NULL;  // no logits
+    BnSession sess;
+    memset(&sess, 0, sizeof(sess));
+    sess.state.logits = NULL;  // no logits
 
     BnSampler sampler;
     int rc = bn_sampler_init(&sampler, 6, 0.0f, 0.9f, 42);
@@ -396,7 +403,7 @@ static void test_generate_null_logits(void) {
     assert(rc == 0);
 
     int pos = 0;
-    int n = bn_generate(&model, &tok, &sampler, 100, &pos, NULL, NULL, NULL, NULL);
+    int n = bn_generate(&model, &sess, &tok, &sampler, 100, &pos, NULL, NULL, NULL, NULL);
     assert(n == -2);  // error: null logits
 
     bn_tokenizer_free(&tok);
@@ -415,9 +422,11 @@ static void test_prefill_null_model(void) {
     // With a zeroed model this will return NULL.
     BnModel model;
     memset(&model, 0, sizeof(model));
+    BnSession sess;
+    memset(&sess, 0, sizeof(sess));
 
     int tokens[] = {2, 3};
-    float *logits = bn_prefill(&model, tokens, 2, 0, 1);
+    float *logits = bn_prefill(&model, &sess, tokens, 2, 0, 1);
     // transformer_forward on a zeroed model returns NULL
     assert(logits == NULL);
 
@@ -666,7 +675,9 @@ static void test_generate_stop_string(void) {
 
     BnModel model;
     memset(&model, 0, sizeof(model));
-    model.state.logits = logits;
+    BnSession sess;
+    memset(&sess, 0, sizeof(sess));
+    sess.state.logits = logits;
 
     uint8_t buf[4096];
     BnGGUFFile *gf = build_test_gguf(buf, sizeof(buf));
@@ -682,7 +693,7 @@ static void test_generate_stop_string(void) {
     int pos = 0;
 
     // Should generate token 2 ("hello"), detect stop string, return -3
-    int n = bn_generate(&model, &tok, &sampler, 100, &pos,
+    int n = bn_generate(&model, &sess, &tok, &sampler, 100, &pos,
                          test_gen_callback, &cb_state, &ss, NULL);
     assert(n == -3);  // stop string matched
     assert(cb_state.count == 1);  // callback was called once before stop detected
@@ -707,7 +718,9 @@ static void test_generate_no_stop_match(void) {
 
     BnModel model;
     memset(&model, 0, sizeof(model));
-    model.state.logits = logits;
+    BnSession sess;
+    memset(&sess, 0, sizeof(sess));
+    sess.state.logits = logits;
 
     uint8_t buf[4096];
     BnGGUFFile *gf = build_test_gguf(buf, sizeof(buf));
@@ -720,7 +733,7 @@ static void test_generate_no_stop_match(void) {
     BnStopStrings ss = { stops, 1 };
 
     int pos = 0;
-    int n = bn_generate(&model, &tok, &sampler, 100, &pos,
+    int n = bn_generate(&model, &sess, &tok, &sampler, 100, &pos,
                          NULL, NULL, &ss, NULL);
     assert(n == 0);  // EOS hit, not stop string
 
@@ -744,7 +757,9 @@ static void test_generate_stop_multiple(void) {
 
     BnModel model;
     memset(&model, 0, sizeof(model));
-    model.state.logits = logits;
+    BnSession sess;
+    memset(&sess, 0, sizeof(sess));
+    sess.state.logits = logits;
 
     uint8_t buf[4096];
     BnGGUFFile *gf = build_test_gguf(buf, sizeof(buf));
@@ -759,7 +774,7 @@ static void test_generate_stop_multiple(void) {
     GenCallbackState cb_state = {{0}, 0, -1};
     int pos = 0;
 
-    int n = bn_generate(&model, &tok, &sampler, 100, &pos,
+    int n = bn_generate(&model, &sess, &tok, &sampler, 100, &pos,
                          test_gen_callback, &cb_state, &ss, NULL);
     assert(n == -3);  // second stop string matched
 
@@ -783,7 +798,9 @@ static void test_generate_stop_empty_list(void) {
 
     BnModel model;
     memset(&model, 0, sizeof(model));
-    model.state.logits = logits;
+    BnSession sess;
+    memset(&sess, 0, sizeof(sess));
+    sess.state.logits = logits;
 
     uint8_t buf[4096];
     BnGGUFFile *gf = build_test_gguf(buf, sizeof(buf));
@@ -795,7 +812,7 @@ static void test_generate_stop_empty_list(void) {
     BnStopStrings ss = { NULL, 0 };
 
     int pos = 0;
-    int n = bn_generate(&model, &tok, &sampler, 100, &pos,
+    int n = bn_generate(&model, &sess, &tok, &sampler, 100, &pos,
                          NULL, NULL, &ss, NULL);
     assert(n == 0);  // EOS hit normally
 

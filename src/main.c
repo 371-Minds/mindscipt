@@ -7,6 +7,7 @@
 #include "tokenizer.h"
 #include "sampler.h"
 #include "threadpool.h"
+#include "session.h"
 #include "sh_log.h"
 
 #include <stdio.h>
@@ -230,42 +231,42 @@ int main(int argc, char **argv) {
     model.config.flash_attn = args.flash_attn;
 
     // Set expert I/O for MoE: prefer mmap, fallback to pread
-    if (model.moe_state) {
+    if (model.config.n_experts > 0) {
         if (!args.force_pread && mf.is_mmap == 1 && mf.data) {
-            model.moe_state->io.mmap_base = mf.data;
+            model.moe_io.mmap_base = mf.data;
         }
         if (mf.fd >= 0) {
-            model.moe_state->io.fd = mf.fd;
+            model.moe_io.fd = mf.fd;
             model.expert_fd = mf.fd;
         }
 
         // madvise-guided mmap: use WILLNEED prefetch hints
         if (args.force_madvise && args.force_pread) {
             SH_LOG_WARN("--madvise and --pread are mutually exclusive, ignoring --madvise");
-        } else if (args.force_madvise && !model.moe_state->io.mmap_base) {
+        } else if (args.force_madvise && !model.moe_io.mmap_base) {
             SH_LOG_WARN("--madvise requires mmap (file not mmap'd), falling back to pread");
-        } else if (args.force_madvise && model.moe_state->io.mmap_base) {
+        } else if (args.force_madvise && model.moe_io.mmap_base) {
 #if !defined(__EMSCRIPTEN__)
             // Only suppress readahead — don't evict. Let page cache manage eviction.
-            model.moe_state->io.madvise_mode = 1;
+            model.moe_io.madvise_mode = 1;
             SH_LOG_INFO("Expert I/O mode", "mode", "madvise");
 #endif
         } else if (args.force_pread) {
             SH_LOG_INFO("Expert I/O mode", "mode", "pread (forced)");
-        } else if (model.moe_state->io.mmap_base) {
+        } else if (model.moe_io.mmap_base) {
             SH_LOG_INFO("Expert I/O mode", "mode", "mmap");
         }
 
         // Create I/O prefetch thread for pread pipeline (not needed for madvise)
-        if (!model.moe_state->io.madvise_mode)
-            bn_moe_prefetch_create(model.moe_state);
+        if (!model.moe_io.madvise_mode)
+            bn_moe_prefetch_create(&model.moe_io);
 
         // Create expert LRU cache (pread only, not needed for madvise)
-        if (!model.moe_state->io.madvise_mode &&
-            args.cache_mb > 0 && !model.moe_state->io.mmap_base && model.moe_state->io.fd >= 0
+        if (!model.moe_io.madvise_mode &&
+            args.cache_mb > 0 && !model.moe_io.mmap_base && model.moe_io.fd >= 0
             && model.config.n_layers > 0) {
             BnMoEExpertMap *em = &model.weights.layers[0].expert_map;
-            model.moe_state->io.cache = bn_moe_cache_create(
+            model.moe_io.cache = bn_moe_cache_create(
                 (size_t)args.cache_mb * 1024 * 1024,
                 em->expert_gate_bytes, em->expert_up_bytes, em->expert_down_bytes);
         }
@@ -279,6 +280,15 @@ int main(int argc, char **argv) {
         SH_LOG_INFO("Thread pool created", "threads", nt);
     } else if (n_workers > 0) {
         SH_LOG_WARN("Failed to create thread pool, running single-threaded");
+    }
+
+    BnSession *session = bn_session_create(&model, NULL);
+    if (!session) {
+        SH_LOG_ERROR("Failed to create session");
+        bn_model_free(&model);
+        bn_gguf_free(gf);
+        bn_platform_unload_file(&mf);
+        return 1;
     }
 
     BnConfig *cfg = &model.config;
@@ -388,6 +398,23 @@ int main(int argc, char **argv) {
         }
     }
 
+    BnSession *draft_session = NULL;
+    if (has_draft) {
+        draft_session = bn_session_create(&draft_model, NULL);
+        if (!draft_session) {
+            SH_LOG_ERROR("Failed to create draft session");
+            draft_model.pool = NULL;
+            bn_model_free(&draft_model);
+            bn_gguf_free(draft_gf);
+            bn_session_free(session, NULL);
+            bn_sampler_free(&sampler);
+            bn_tokenizer_free(&tokenizer);
+            bn_model_free(&model);
+            bn_gguf_free(gf);
+            return 1;
+        }
+    }
+
     if (args.chat) {
         // --- Chat REPL mode ---
         int max_tokens = 4096 + 64;  // generous buffer for encoded turns
@@ -406,7 +433,7 @@ int main(int argc, char **argv) {
 
         // Feed BOS at pos=0 (skip if model says not to)
         if (tokenizer.add_bos) {
-            bn_transformer_forward(&model, tokenizer.bos_id, pos);
+            bn_transformer_forward(&model, session, tokenizer.bos_id, pos);
             pos++;
         }
 
@@ -426,7 +453,7 @@ int main(int argc, char **argv) {
             if (strcmp(line, "/reset") == 0) {
                 pos = 0;
                 if (tokenizer.add_bos) {
-                    bn_transformer_forward(&model, tokenizer.bos_id, pos);
+                    bn_transformer_forward(&model, session, tokenizer.bos_id, pos);
                     pos++;
                 }
                 bn_sampler_reset_recent(&sampler);
@@ -442,14 +469,14 @@ int main(int argc, char **argv) {
                 printf("[context full — resetting]\n");
                 pos = 0;
                 if (tokenizer.add_bos) {
-                    bn_transformer_forward(&model, tokenizer.bos_id, pos);
+                    bn_transformer_forward(&model, session, tokenizer.bos_id, pos);
                     pos++;
                 }
                 bn_sampler_reset_recent(&sampler);
             }
 
             // Feed prompt tokens through forward pass
-            float *logits = bn_prefill(&model, tokens, n, pos, args.no_prefill);
+            float *logits = bn_prefill(&model, session, tokens, n, pos, args.no_prefill);
             pos += n;
 
             if (!logits) {
@@ -463,14 +490,14 @@ int main(int argc, char **argv) {
             if (remaining < max_gen) max_gen = remaining;
             if (max_gen < 1) max_gen = 1;
 
-            int gen_count = bn_generate(&model, &tokenizer, &sampler,
+            int gen_count = bn_generate(&model, session, &tokenizer, &sampler,
                                          max_gen, &pos,
                                          print_token, NULL, NULL, NULL);
 
             // Feed end-of-turn token into KV cache to close the assistant turn
             int turn_end_id = bn_chat_turn_end_id(&tokenizer, BN_CHAT_AUTO);
             if (turn_end_id >= 0 && pos < seq_len) {
-                bn_transformer_forward(&model, turn_end_id, pos);
+                bn_transformer_forward(&model, session, turn_end_id, pos);
                 pos++;
             }
 
@@ -521,12 +548,12 @@ int main(int argc, char **argv) {
         int n_generated = 0;
 
         // Prefill prompt tokens
-        float *logits = bn_prefill(&model, prompt_tokens, n_prompt, 0, args.no_prefill);
+        float *logits = bn_prefill(&model, session, prompt_tokens, n_prompt, 0, args.no_prefill);
         pos = n_prompt;
 
         // Also prefill draft model if speculative decoding
         if (has_draft && logits) {
-            bn_prefill(&draft_model, prompt_tokens, n_prompt, 0, args.no_prefill);
+            bn_prefill(&draft_model, draft_session, prompt_tokens, n_prompt, 0, args.no_prefill);
         }
 
         if (!logits) {
@@ -554,13 +581,13 @@ int main(int argc, char **argv) {
             // Generate tokens — speculative or standard
             if (has_draft) {
                 n_generated = bn_generate_speculative(
-                    &model, &draft_model, args.draft_k,
+                    &model, session, &draft_model, draft_session, args.draft_k,
                     &tokenizer, &sampler, args.n_tokens, &pos,
                     print_token, NULL, NULL);
                 if (n_generated < 0)
                     SH_LOG_ERROR("Speculative generation failed");
             } else {
-                n_generated = bn_generate(&model, &tokenizer, &sampler,
+                n_generated = bn_generate(&model, session, &tokenizer, &sampler,
                                            args.n_tokens, &pos,
                                            print_token, NULL, NULL, NULL);
             }
@@ -584,22 +611,24 @@ int main(int argc, char **argv) {
         }
 
         // Print MoE stats if applicable
-        if (model.moe_state)
-            bn_moe_print_stats(model.moe_state, n_generated + n_prompt);
+        if (session->moe_state)
+            bn_moe_print_stats(session->moe_state, n_generated + n_prompt);
 
         free(prompt_tokens);
     }
 
     // Cleanup
     if (has_draft) {
+        bn_session_free(draft_session, NULL);
         draft_model.pool = NULL;  // shared, don't double-free
         bn_model_free(&draft_model);
         bn_gguf_free(draft_gf);
     }
-    if (model.moe_state && model.moe_state->io.cache) {
-        bn_moe_cache_free(model.moe_state->io.cache);
-        model.moe_state->io.cache = NULL;
+    if (model.moe_io.cache) {
+        bn_moe_cache_free(model.moe_io.cache);
+        model.moe_io.cache = NULL;
     }
+    bn_session_free(session, NULL);
     bn_sampler_free(&sampler);
     bn_tokenizer_free(&tokenizer);
     bn_model_free(&model);  // also unloads mmap'd file

@@ -6,6 +6,9 @@
 #include "sampler.h"
 #include "bn_alloc.h"
 
+// Forward declaration — full definition in session.h
+typedef struct BnSession BnSession;
+
 // Callback for streaming token output. Return non-zero to stop generation.
 typedef int (*bn_token_callback)(const char *piece, int token_id, void *user_data);
 
@@ -45,7 +48,7 @@ typedef struct {
 // alloc is used for internal scratch buffers (NULL = stdlib default).
 // Returns: number of tokens generated, -1 on loop detected, -2 on error,
 //          -3 on stop string match.
-int bn_generate(BnModel *model, BnTokenizer *tok, BnSampler *sampler,
+int bn_generate(BnModel *model, BnSession *s, BnTokenizer *tok, BnSampler *sampler,
                 int max_tokens, int *pos,
                 bn_token_callback cb, void *user_data,
                 const BnStopStrings *stop,
@@ -55,7 +58,8 @@ int bn_generate(BnModel *model, BnTokenizer *tok, BnSampler *sampler,
 // Both models must have logits ready from prefill. Greedy only (temperature=0).
 // alloc is used for verify_logits buffer (NULL = stdlib default).
 // pos is updated. Returns: n_generated, -1 on loop, -2 on error.
-int bn_generate_speculative(BnModel *target, BnModel *draft, int draft_k,
+int bn_generate_speculative(BnModel *target, BnSession *ts,
+                            BnModel *draft, BnSession *ds, int draft_k,
                             BnTokenizer *tok, BnSampler *sampler,
                             int max_tokens, int *pos,
                             bn_token_callback cb, void *user_data,
@@ -64,7 +68,7 @@ int bn_generate_speculative(BnModel *target, BnModel *draft, int draft_k,
 // Prefill prompt tokens through the model. Returns logits for the last token,
 // or NULL on error. pos is set to pos0 + n_tokens after return.
 // If no_prefill is set, runs tokens one at a time (for debugging).
-float *bn_prefill(BnModel *model, const int *tokens, int n_tokens,
+float *bn_prefill(BnModel *model, BnSession *s, const int *tokens, int n_tokens,
                   int pos0, int no_prefill);
 
 // Encode text into tokens. Returns number of tokens written.

@@ -1,6 +1,7 @@
 #include "transformer_internal.h"
 #include "quant_internal.h"
 #include "moe.h"
+#include "session.h"
 #include "platform.h"
 #include "sh_log.h"
 #include <stdio.h>
@@ -159,9 +160,9 @@ static inline void apply_rope_heads(float *buf, int n_heads, int head_size,
 #endif
 
 // SSM block: Gated DeltaNet recurrence. Reads s->x, writes s->xb (result for residual).
-static void forward_ssm_block(BnModel *m, BnLayerWeights *lw, int l) {
+static void forward_ssm_block(BnModel *m, BnSession *sess, BnLayerWeights *lw, int l) {
     BnConfig *c = &m->config;
-    BnRunState *s = &m->state;
+    BnRunState *s = &sess->state;
     int dim = c->dim;
     int num_k_heads = c->ssm_group_count;           // 16
     int head_k_dim  = c->ssm_state_size;            // 128
@@ -271,9 +272,9 @@ static void forward_ssm_block(BnModel *m, BnLayerWeights *lw, int l) {
 
 // FFN block: shared by both attention and SSM layers.
 // Reads s->x, uses s->xb/hb/hb2/x_q as scratch. Adds result to s->x.
-static void forward_ffn_block(BnModel *m, BnLayerWeights *lw) {
+static void forward_ffn_block(BnModel *m, BnSession *sess, BnLayerWeights *lw) {
     BnConfig *c = &m->config;
-    BnRunState *s = &m->state;
+    BnRunState *s = &sess->state;
     int dim = c->dim;
     int hidden_dim = c->hidden_dim;
 
@@ -366,12 +367,12 @@ static void forward_ffn_block(BnModel *m, BnLayerWeights *lw) {
 
 // Process a single layer (attention/SSM block + FFN). Reads/writes s->x.
 // Returns 0 on success.
-static int forward_single_layer(BnModel *m, int l, int pos, int cache_pos,
+static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int cache_pos,
                                 int rope_dims, const float *rope_cos,
                                 const float *rope_sin) {
     BnConfig *c = &m->config;
     BnWeights *w = &m->weights;
-    BnRunState *s = &m->state;
+    BnRunState *s = &sess->state;
     int dim = c->dim;
     int kv_dim = c->kv_dim;
     int kv_mul = c->kv_mul;
@@ -717,7 +718,7 @@ static int forward_single_layer(BnModel *m, int l, int pos, int cache_pos,
 
     } else {
         // ---- SSM block ----
-        forward_ssm_block(m, lw, l);
+        forward_ssm_block(m, sess, lw, l);
         residual_add(s->x, s->xb, dim);
         BL_ACC(bl_residual_us);
     }
@@ -725,10 +726,10 @@ static int forward_single_layer(BnModel *m, int l, int pos, int cache_pos,
     // ---- FFN block ---- (shared by both layer types)
     if (lw->router_weight) {
         // MoE FFN — route, pread, compute, combine
-        bn_moe_forward(m, lw, l);
+        bn_moe_forward(m, sess, lw, l);
     } else {
         // Dense FFN
-        forward_ffn_block(m, lw);
+        forward_ffn_block(m, sess, lw);
     }
     BL_ACC(bl_ffn_us);
 
@@ -743,9 +744,9 @@ static int forward_single_layer(BnModel *m, int l, int pos, int cache_pos,
 
 // Embed + all layers (attention + FFN). Populates KV cache at `pos`.
 // Leaves final activation in s->x. Returns 0 on success, -1 on error.
-static int forward_layers(BnModel *m, int token, int pos) {
+static int forward_layers(BnModel *m, BnSession *sess, int token, int pos) {
     BnConfig *c = &m->config;
-    BnRunState *s = &m->state;
+    BnRunState *s = &sess->state;
     int head_size = c->head_size;
 
     // Guard against stack overflow from VLAs sized by model config
@@ -782,7 +783,7 @@ static int forward_layers(BnModel *m, int token, int pos) {
     // Process each layer
     int cache_pos = pos % c->seq_len;
     for (int l = 0; l < c->n_layers; l++) {
-        if (forward_single_layer(m, l, pos, cache_pos, rope_dims,
+        if (forward_single_layer(m, sess, l, pos, cache_pos, rope_dims,
                                  rope_cos, rope_sin) != 0)
             return -1;
     }
@@ -792,10 +793,10 @@ static int forward_layers(BnModel *m, int token, int pos) {
 
 // Final RMSNorm + logits computation. Reads s->x, writes s->logits.
 // Returns s->logits.
-static float *forward_logits(BnModel *m) {
+static float *forward_logits(BnModel *m, BnSession *sess) {
     BnConfig *c = &m->config;
     BnWeights *w = &m->weights;
-    BnRunState *s = &m->state;
+    BnRunState *s = &sess->state;
     int dim = c->dim;
 
     if (dim > BN_MAX_VLA_ELEMS) {
@@ -933,22 +934,22 @@ static float *forward_logits(BnModel *m) {
     return s->logits;
 }
 
-float *bn_transformer_forward(BnModel *m, int token, int pos) {
-    if (forward_layers(m, token, pos) != 0) return NULL;
-    return forward_logits(m);
+float *bn_transformer_forward(BnModel *m, BnSession *s, int token, int pos) {
+    if (forward_layers(m, s, token, pos) != 0) return NULL;
+    return forward_logits(m, s);
 }
 
 // Internal prefill: if all_logits is non-NULL, compute logits at every position.
-static float *prefill_internal(BnModel *m, const int *tokens, int n_tokens,
+static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens, int n_tokens,
                                 int pos0, float *all_logits) {
     if (n_tokens <= 0) return NULL;
-    if (n_tokens == 1) return bn_transformer_forward(m, tokens[0], pos0);
+    if (n_tokens == 1) return bn_transformer_forward(m, sess, tokens[0], pos0);
 
     BnConfig *c = &m->config;
 
     // MoE models use batch MoE prefill (token-expert grouping + per-expert matmul)
     // Falls through to the batched layer loop which calls bn_moe_forward_batch
-    BnRunState *s = &m->state;
+    BnRunState *s = &sess->state;
     int dim = c->dim;
     int head_size = c->head_size;
 
@@ -1163,7 +1164,7 @@ static float *prefill_internal(BnModel *m, const int *tokens, int n_tokens,
                     rope_sin_t[i] = sinf(angle);
                 }
                 int cache_pos = pos % c->seq_len;
-                if (forward_single_layer(m, l, pos, cache_pos, rope_dims,
+                if (forward_single_layer(m, sess, l, pos, cache_pos, rope_dims,
                                          rope_cos_t, rope_sin_t) != 0) {
                     free(batch_buf); free(act); return NULL;
                 }
@@ -1175,7 +1176,7 @@ static float *prefill_internal(BnModel *m, const int *tokens, int n_tokens,
         // --- FFN block ---
         if (lw->router_weight) {
             // Batch MoE: route all tokens, group by expert, batch matmul
-            if (bn_moe_forward_batch(m, lw, l, act, Xb, n_tokens) != 0) {
+            if (bn_moe_forward_batch(m, sess, lw, l, act, Xb, n_tokens) != 0) {
                 free(batch_buf); free(act); return NULL;
             }
         } else if (lw->ffn_up.data) {
@@ -1241,7 +1242,7 @@ static float *prefill_internal(BnModel *m, const int *tokens, int n_tokens,
         int vocab_size = c->vocab_size;
         for (int t = 0; t < n_tokens; t++) {
             memcpy(s->x, act + (size_t)t * dim, dim * sizeof(float));
-            float *lg = forward_logits(m);
+            float *lg = forward_logits(m, sess);
             if (!lg) { free(batch_buf); free(act); return NULL; }
             memcpy(all_logits + (size_t)t * vocab_size, lg, vocab_size * sizeof(float));
         }
@@ -1254,25 +1255,25 @@ static float *prefill_internal(BnModel *m, const int *tokens, int n_tokens,
     memcpy(s->x, act + (size_t)(n_tokens - 1) * dim, dim * sizeof(float));
     free(batch_buf);
     free(act);
-    return forward_logits(m);
+    return forward_logits(m, sess);
 }
 
-float *bn_transformer_prefill(BnModel *m, const int *tokens, int n_tokens, int pos0) {
-    return prefill_internal(m, tokens, n_tokens, pos0, NULL);
+float *bn_transformer_prefill(BnModel *m, BnSession *s, const int *tokens, int n_tokens, int pos0) {
+    return prefill_internal(m, s, tokens, n_tokens, pos0, NULL);
 }
 
-int bn_transformer_prefill_all(BnModel *m, const int *tokens, int n_tokens,
+int bn_transformer_prefill_all(BnModel *m, BnSession *s, const int *tokens, int n_tokens,
                                 int pos0, float *all_logits) {
     if (!all_logits || n_tokens <= 0) return -1;
 
     // Single token: just forward
     if (n_tokens == 1) {
-        float *logits = bn_transformer_forward(m, tokens[0], pos0);
+        float *logits = bn_transformer_forward(m, s, tokens[0], pos0);
         if (!logits) return -1;
         memcpy(all_logits, logits, m->config.vocab_size * sizeof(float));
         return 0;
     }
 
-    float *result = prefill_internal(m, tokens, n_tokens, pos0, all_logits);
+    float *result = prefill_internal(m, s, tokens, n_tokens, pos0, all_logits);
     return result ? 0 : -1;
 }
