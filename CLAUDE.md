@@ -15,7 +15,7 @@ make clean    # remove artifacts
 make test     # run all unit tests
 ```
 
-Individual test targets: `make test_gguf`, `make test_quant`, `make test_tokenizer`, `make test_transformer`, `make test_generate`, `make test_session`.
+Individual test targets: `make test_gguf`, `make test_quant`, `make test_tokenizer`, `make test_transformer`, `make test_generate`, `make test_session`, `make test_prompt_cache`.
 
 ## Architecture
 
@@ -33,7 +33,8 @@ Modules are organized in strict dependency order — each depends only on those 
 10. `bn_alloc` — vtable allocator interface (standalone, keel-compatible)
 11. `session` — per-request mutable state: KV cache, activation buffers, MoE compute buffers (depends on model + bn_alloc)
 12. `generate` — library API: generation, prefill, chat formatting, stop strings (depends on model + session + tokenizer + sampler + transformer + bn_alloc)
-13. `main` — CLI wiring (depends on generate + all above)
+13. `prompt_cache` — shared KV prefix cache: longest-prefix matching, FIFO eviction, thread-safe (depends on model + session + bn_alloc)
+14. `main` — CLI wiring (depends on generate + all above)
 
 Headers live in `include/`, implementations in `src/`, tests in `test/`.
 
@@ -58,6 +59,8 @@ Headers live in `include/`, implementations in `src/`, tests in `test/`.
 - `BnSession` — per-request mutable state: KV cache, activation buffers, MoE compute buffers, position
 - `BnMoEIO` — shared MoE I/O control plane (fd, mmap_base, prefetch threads, LRU cache) on BnModel
 - `BnMoEState` — per-session MoE compute buffers + pread staging + stats
+- `BnPromptCache` — shared KV prefix cache with longest-prefix matching and FIFO eviction
+- `BnPromptCacheEntry` — cached KV snapshot: token sequence + compact KV data
 - `BnMoEExpertMap` — file offsets for gate/up/down expert tensors per layer
 - `BnTokenizer` — BPE vocab + sorted index for encoding
 - `BnSampler` — sampling parameters + RNG state
