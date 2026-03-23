@@ -898,9 +898,9 @@ void bn_quant_matvec_multi(const BnMatvecMultiTask *tasks, int n_tasks,
         && n_tasks <= BN_MAX_BATCH) {
         int n_bpr = cols / BN_QK_K;
         if (n_bpr >= 1 && n_bpr <= BN_MAX_SCALE_BLOCKS / 8) {
-            // Stack VLAs for per-task Q8_K scales + bsums
-            float q8k_d[BN_MAX_BATCH * (BN_MAX_SCALE_BLOCKS / 8)];
-            int16_t q8k_bsums[BN_MAX_BATCH * (BN_MAX_SCALE_BLOCKS / 8) * 16];
+            // VLAs sized by actual n_bpr (not worst-case BN_MAX_SCALE_BLOCKS)
+            float q8k_d[n_tasks * n_bpr];
+            int16_t q8k_bsums[n_tasks * n_bpr * 16];
             for (int t = 0; t < n_tasks; t++)
                 bn_quant_x_to_q8k(tasks[t].x, x_q_bufs + (size_t)t * cols,
                                    q8k_d + t * n_bpr, q8k_bsums + t * n_bpr * 16, cols);
@@ -929,7 +929,7 @@ void bn_quant_matvec_multi(const BnMatvecMultiTask *tasks, int n_tasks,
         && n_tasks <= BN_MAX_BATCH) {
         int n_blocks = cols / 32;
         if (n_blocks <= BN_MAX_SCALE_BLOCKS) {
-            float x_scales_all[BN_MAX_BATCH * BN_MAX_SCALE_BLOCKS];
+            float x_scales_all[n_tasks * n_blocks];  // VLA sized by actual dims
             for (int t = 0; t < n_tasks; t++)
                 bn_quant_x_to_q8_blocks(tasks[t].x, x_q_bufs + (size_t)t * cols,
                                          x_scales_all + t * n_blocks, cols);
@@ -993,8 +993,9 @@ void bn_quant_matmul(float *out, const BnQWeight *W, const float *X,
     if (W->type == BN_GGUF_TENSOR_Q4_K) {
         int n_bpr = cols / BN_QK_K;
         if (n_bpr < 1 || n_bpr > BN_MAX_SCALE_BLOCKS / 8) goto fallback_loop;
-        // Quantize all tokens to Q8_K
+        // Quantize all tokens to Q8_K (overflow check)
         size_t xq_size = (size_t)n_tokens * cols;
+        if (n_tokens > 0 && xq_size / n_tokens != (size_t)cols) goto fallback_loop;
         int8_t *xq_all = (int8_t *)malloc(xq_size);
         float *xd_all = (float *)malloc((size_t)n_tokens * n_bpr * sizeof(float));
         int16_t *xbs_all = (int16_t *)malloc((size_t)n_tokens * n_bpr * 16 * sizeof(int16_t));

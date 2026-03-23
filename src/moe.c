@@ -1263,7 +1263,7 @@ int bn_moe_forward_batch(BnModel *m, BnLayerWeights *lw, int l,
     float *down_buf   = (float *)malloc((size_t)T_max * dim * sizeof(float));
     float *moe_out    = (float *)calloc((size_t)n_tokens * dim, sizeof(float));
     int8_t *x_q_scratch = (int8_t *)malloc((size_t)T_max *
-        (dim > moe_hidden ? dim : moe_hidden));
+        (size_t)(dim > moe_hidden ? dim : moe_hidden));
     if (!gather_buf || !gate_buf || !up_buf || !down_buf || !moe_out || !x_q_scratch) {
         free(gather_buf); free(gate_buf); free(up_buf); free(down_buf);
         free(moe_out); free(x_q_scratch);
@@ -1311,9 +1311,12 @@ int bn_moe_forward_batch(BnModel *m, BnLayerWeights *lw, int l,
         }
 
         // SwiGLU activation across T * moe_hidden
-        for (int i = 0; i < T * moe_hidden; i++) {
-            float g = gate_buf[i];
-            gate_buf[i] = (g / (1.0f + expf(-g))) * up_buf[i];
+        {
+            size_t swiglu_n = (size_t)T * moe_hidden;
+            for (size_t i = 0; i < swiglu_n; i++) {
+                float g = gate_buf[i];
+                gate_buf[i] = (g / (1.0f + expf(-g))) * up_buf[i];
+            }
         }
 
         // Down matmul
@@ -1353,16 +1356,31 @@ int bn_moe_forward_batch(BnModel *m, BnLayerWeights *lw, int l,
             bn_quant_matmul(sh_g, &lw->shared_gate, Xb, n_tokens, x_q_scratch, m->pool);
             bn_quant_matmul(sh_u, &lw->shared_up, Xb, n_tokens, x_q_scratch, m->pool);
 
-            for (int i = 0; i < n_tokens * shared_hidden; i++) {
+            size_t sh_total = (size_t)n_tokens * shared_hidden;
+            for (size_t i = 0; i < sh_total; i++) {
                 float g = sh_g[i];
                 sh_g[i] = (g / (1.0f + expf(-g))) * sh_u[i];
             }
 
             bn_quant_matmul(sh_d, &lw->shared_down, sh_g, n_tokens, x_q_scratch, m->pool);
 
-            for (int t = 0; t < n_tokens; t++)
-                for (int d = 0; d < dim; d++)
-                    moe_out[(size_t)t * dim + d] += sh_d[(size_t)t * dim + d];
+            // Apply shared expert sigmoid gate if present (Qwen3.5 MoE)
+            if (lw->shared_expert_gate) {
+                for (int t = 0; t < n_tokens; t++) {
+                    float gate_dot = 0.0f;
+                    for (int d = 0; d < dim; d++)
+                        gate_dot += Xb[(size_t)t * dim + d] * lw->shared_expert_gate[d];
+                    float gate = 1.0f / (1.0f + expf(-gate_dot));
+                    for (int d = 0; d < dim; d++)
+                        moe_out[(size_t)t * dim + d] += gate * sh_d[(size_t)t * dim + d];
+                }
+            } else {
+                for (int t = 0; t < n_tokens; t++)
+                    for (int d = 0; d < dim; d++)
+                        moe_out[(size_t)t * dim + d] += sh_d[(size_t)t * dim + d];
+            }
+        } else if (need_sh) {
+            SH_LOG_ERROR("Failed to allocate shared expert batch buffers");
         }
 
         if (need_sh) { free(sh_g); free(sh_u); free(sh_d); }

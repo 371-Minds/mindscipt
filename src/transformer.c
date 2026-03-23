@@ -1245,10 +1245,13 @@ static float *prefill_internal(BnModel *m, const int *tokens, int n_tokens,
             if (!lg) { free(batch_buf); free(act); return NULL; }
             memcpy(all_logits + (size_t)t * vocab_size, lg, vocab_size * sizeof(float));
         }
-    } else {
-        memcpy(s->x, act + (size_t)(n_tokens - 1) * dim, dim * sizeof(float));
+        // Last token's logits already computed and in s->logits
+        free(batch_buf);
+        free(act);
+        return s->logits;
     }
 
+    memcpy(s->x, act + (size_t)(n_tokens - 1) * dim, dim * sizeof(float));
     free(batch_buf);
     free(act);
     return forward_logits(m);

@@ -224,9 +224,10 @@ static int generate_response_speculative(
     int max_tokens, int *pos,
     bn_token_callback cb, void *user_data)
 {
+    #define MAX_DRAFT_K 20
     int gen_count = 0;
-    int draft_tokens[20];  // max draft_k = 20
-    if (draft_k > 20) draft_k = 20;
+    int draft_tokens[MAX_DRAFT_K];
+    if (draft_k > MAX_DRAFT_K) draft_k = MAX_DRAFT_K;
     int n_accepted_total = 0, n_drafted_total = 0;
 
     // Both models should have logits ready from the last prompt token
@@ -350,7 +351,7 @@ static int generate_response_speculative(
             }
         }
 
-        n_accepted_total += n_accepted + (corrected >= 0 ? 1 : 1); // +1 for corrected or bonus
+        n_accepted_total += n_accepted + 1; // +1 for corrected token or bonus token
     }
 
 done:
