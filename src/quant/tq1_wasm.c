@@ -155,11 +155,16 @@ void bn_quant_tq1_wasm_sdot_range(void *ctx, int row_start, int row_end) {
                 xsum_hi = wasm_i16x8_add(xsum_hi, wasm_i16x8_extend_high_i8x16(xv));
             }
 
-            // Horizontal sum of xsum accumulators
+            // Horizontal sum of xsum accumulators (lane index must be constant)
             v128_t xsum_all = wasm_i16x8_add(xsum_lo, xsum_hi);
-            int32_t x_sum = 0;
-            for (int lane = 0; lane < 8; lane++)
-                x_sum += (int16_t)wasm_i16x8_extract_lane(xsum_all, lane);
+            int32_t x_sum = (int16_t)wasm_i16x8_extract_lane(xsum_all, 0)
+                          + (int16_t)wasm_i16x8_extract_lane(xsum_all, 1)
+                          + (int16_t)wasm_i16x8_extract_lane(xsum_all, 2)
+                          + (int16_t)wasm_i16x8_extract_lane(xsum_all, 3)
+                          + (int16_t)wasm_i16x8_extract_lane(xsum_all, 4)
+                          + (int16_t)wasm_i16x8_extract_lane(xsum_all, 5)
+                          + (int16_t)wasm_i16x8_extract_lane(xsum_all, 6)
+                          + (int16_t)wasm_i16x8_extract_lane(xsum_all, 7);
 
             // Section 3: qh[0..3] → 16 values (scalar, same as NEON)
             int32_t qh_dot = 0, qh_xsum = 0;
