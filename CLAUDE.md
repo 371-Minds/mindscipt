@@ -15,7 +15,7 @@ make clean    # remove artifacts
 make test     # run all unit tests
 ```
 
-Individual test targets: `make test_gguf`, `make test_quant`, `make test_tokenizer`, `make test_transformer`.
+Individual test targets: `make test_gguf`, `make test_quant`, `make test_tokenizer`, `make test_transformer`, `make test_generate`.
 
 ## Architecture
 
@@ -30,7 +30,9 @@ Modules are organized in strict dependency order — each depends only on those 
 7. `transformer` — forward pass (depends on model + quant + moe)
 8. `sampler` — sampling strategies (standalone)
 9. `threadpool` — persistent pthread pool with atomic work-stealing
-10. `main` — CLI wiring
+10. `bn_alloc` — vtable allocator interface (standalone, keel-compatible)
+11. `generate` — library API: generation, prefill, chat formatting, stop strings (depends on model + tokenizer + sampler + transformer + bn_alloc)
+12. `main` — CLI wiring (depends on generate + all above)
 
 Headers live in `include/`, implementations in `src/`, tests in `test/`.
 
@@ -56,6 +58,9 @@ Headers live in `include/`, implementations in `src/`, tests in `test/`.
 - `BnMoEExpertMap` — file offsets for gate/up/down expert tensors per layer
 - `BnTokenizer` — BPE vocab + sorted index for encoding
 - `BnSampler` — sampling parameters + RNG state
+- `BnAllocator` — vtable allocator (malloc/realloc/free + ctx), compatible with keel's `KlAllocator`
+- `BnChatMessage` — `{role, content}` for multi-turn chat formatting
+- `BnStopStrings` — stop string array for generation halting
 
 ## MoE (Mixture of Experts)
 
@@ -123,4 +128,6 @@ WASM build requires Emscripten. Run `./wasm/build.sh`. The API wrapper in `wasm/
 - **Add a new sampling strategy**: extend `sampler_sample()` in `src/sampler.c`
 - **Add a new MoE I/O mode**: add flag in `src/main.c`, branch in `bn_moe_forward()` in `src/moe.c`
 - **Export a new function to WASM**: add `EMSCRIPTEN_KEEPALIVE` wrapper in `wasm/api.c`, update `build.sh` exported functions list
+- **Integrate as a library**: `#include "generate.h"` — use `bn_prefill`, `bn_generate`, `bn_chat_format_messages`. Pass custom `BnAllocator` or NULL for stdlib.
+- **Add a chat template**: add case to `BnChatFormat` enum, implement in `encode_*_turn` in `src/generate.c`
 
