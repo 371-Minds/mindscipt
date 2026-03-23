@@ -133,7 +133,7 @@ void bn_transformer_flash_gqa_scalar_range(void *ctx, int h_start, int h_end) {
 
         // Finalize: output = out_buf / running_sum
         float *xb_h = s->xb + h * head_size;
-        float inv_sum = 1.0f / running_sum;
+        float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
         for (int d = 0; d < head_size; d++) xb_h[d] = out_buf[d] * inv_sum;
     }
 }

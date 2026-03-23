@@ -805,6 +805,9 @@ size_t bn_model_session_arena_size(const BnConfig *c, const BnWeights *w) {
     int n_ssm_layers = c->n_layers - n_attn_layers;
     size_t kv_cache_size = (size_t)n_attn_layers * c->seq_len * c->kv_dim;
 
+    // #14: Validate q_dim won't overflow int (n_heads * head_size)
+    if (c->n_heads > 0 && c->head_size > 0 &&
+        c->n_heads > INT_MAX / c->head_size) return 0;  // overflow
     int q_dim = c->n_heads * c->head_size;
     int xb_size = q_dim > c->dim ? q_dim : c->dim;
     int q_size = xb_size;
@@ -926,6 +929,8 @@ int bn_model_alloc_session_buffers(const BnConfig *c, const BnWeights *w,
         kv_cache_size / n_attn_layers / c->seq_len != (size_t)c->kv_dim)
         return -1;
 
+    if (c->n_heads > 0 && c->head_size > 0 &&
+        c->n_heads > INT_MAX / c->head_size) return -1;
     int q_dim = c->n_heads * c->head_size;
     int xb_size = q_dim > c->dim ? q_dim : c->dim;
     int q_size = xb_size;

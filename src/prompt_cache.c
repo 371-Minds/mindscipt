@@ -127,7 +127,7 @@ int bn_prompt_cache_store(BnPromptCache *cache, const BnModel *model,
     int n_attn = config_n_attn(cfg);
     int kv_dim = cfg->kv_dim;
     size_t elem_size = cfg->kv_f16 ? sizeof(uint16_t) : sizeof(float);
-    size_t kv_bytes = (size_t)n_attn * n_tokens * kv_dim * elem_size;
+    size_t kv_bytes = (size_t)n_attn * (size_t)n_tokens * (size_t)kv_dim * elem_size;
     size_t tok_bytes = (size_t)n_tokens * sizeof(int);
     size_t entry_total = kv_bytes * 2 + tok_bytes;
 

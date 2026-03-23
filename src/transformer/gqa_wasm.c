@@ -169,7 +169,7 @@ void bn_transformer_flash_gqa_wasm_range(void *ctx, int h_start, int h_end) {
 
         // Finalize: output = out_buf / running_sum
         float *xb_h = s->xb + h * head_size;
-        float inv_sum = 1.0f / running_sum;
+        float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
         v128_t is = wasm_f32x4_splat(inv_sum);
         for (int d = 0; d < head_size; d += 4)
             wasm_v128_store(xb_h + d, wasm_f32x4_mul(wasm_v128_load(out_buf + d), is));

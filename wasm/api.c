@@ -45,12 +45,15 @@ int bitnet_init(const uint8_t *data, size_t size) {
     }
 
     if (bn_tokenizer_init(&g_tokenizer, g_gguf) != 0) {
+        bn_session_free(g_session, NULL); g_session = NULL;
         bn_model_free(&g_model);
         bn_gguf_free(g_gguf);
         return -1;
     }
 
     if (bn_sampler_init(&g_sampler, g_model.config.vocab_size, 0.0f, 0.9f, 42) != 0) {
+        bn_session_free(g_session, NULL); g_session = NULL;
+        bn_tokenizer_free(&g_tokenizer);
         bn_model_free(&g_model);
         bn_gguf_free(g_gguf);
         return -1;

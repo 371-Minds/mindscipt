@@ -179,7 +179,7 @@ void bn_transformer_flash_gqa_neon_range(void *ctx, int h_start, int h_end) {
 
         // Finalize: output = out_buf / running_sum
         float *xb_h = s->xb + h * head_size;
-        float inv_sum = 1.0f / running_sum;
+        float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
         float32x4_t is = vdupq_n_f32(inv_sum);
         for (int d = 0; d < head_size; d += 4)
             vst1q_f32(xb_h + d, vmulq_f32(vld1q_f32(out_buf + d), is));

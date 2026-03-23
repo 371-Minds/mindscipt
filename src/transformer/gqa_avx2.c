@@ -208,7 +208,7 @@ void bn_transformer_flash_gqa_avx2_range(void *ctx, int h_start, int h_end) {
 
         // Finalize: output = out_buf / running_sum
         float *xb_h = s->xb + h * head_size;
-        float inv_sum = 1.0f / running_sum;
+        float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
         __m256 is = _mm256_set1_ps(inv_sum);
         for (int d = 0; d < head_size; d += 8)
             _mm256_storeu_ps(xb_h + d, _mm256_mul_ps(_mm256_loadu_ps(out_buf + d), is));
