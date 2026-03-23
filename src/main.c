@@ -2,6 +2,7 @@
 #include "gguf.h"
 #include "model.h"
 #include "moe.h"
+#include "generate.h"
 #include "transformer.h"
 #include "tokenizer.h"
 #include "sampler.h"
@@ -13,18 +14,11 @@
 #include <string.h>
 #include <limits.h>
 
-// Callback for streaming token output. Return non-zero to stop generation.
-typedef int (*bn_token_callback)(const char *piece, int token_id, void *user_data);
-
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <pthread/qos.h>
 #else
 #include <unistd.h>
-#endif
-
-#if !defined(__EMSCRIPTEN__)
-#include <sys/mman.h>
 #endif
 
 typedef struct {
@@ -160,209 +154,6 @@ static CLIArgs parse_args(int argc, char **argv) {
     }
 
     return args;
-}
-
-// Loop detection constants
-#define LOOP_BUF_SIZE 32
-#define LOOP_NGRAM    4
-
-// Generate tokens with callback-based streaming.
-// Returns: n_generated, -1 on loop, -2 on error.
-static int generate_response(BnModel *model, BnTokenizer *tok, BnSampler *sampler,
-                              int max_tokens, int *pos,
-                              bn_token_callback cb, void *user_data) {
-    int loop_buf[LOOP_BUF_SIZE];
-    int loop_idx = 0, gen_count = 0;
-    memset(loop_buf, -1, sizeof(loop_buf));
-
-    float *logits = model->state.logits;
-    if (!logits) return -2;
-
-    for (int i = 0; i < max_tokens; i++) {
-        int next = bn_sampler_sample(sampler, logits);
-
-        if (next == tok->eot_id || next == tok->eos_id ||
-            next == tok->im_end_id)
-            break;
-
-        // Ring buffer loop detection
-        loop_buf[loop_idx] = next;
-        loop_idx = (loop_idx + 1) % LOOP_BUF_SIZE;
-        gen_count++;
-
-        if (gen_count >= 2 * LOOP_NGRAM) {
-            int looping = 1;
-            for (int k = 0; k < LOOP_NGRAM; k++) {
-                int a = loop_buf[((loop_idx - 1 - k) % LOOP_BUF_SIZE + LOOP_BUF_SIZE) % LOOP_BUF_SIZE];
-                int b = loop_buf[((loop_idx - 1 - k - LOOP_NGRAM) % LOOP_BUF_SIZE + LOOP_BUF_SIZE) % LOOP_BUF_SIZE];
-                if (a != b) { looping = 0; break; }
-            }
-            if (looping) return -1;
-        }
-
-        bn_sampler_accept(sampler, next);
-
-        const char *piece = bn_tokenizer_decode(tok, next);
-        if (piece && cb) {
-            if (cb(piece, next, user_data))
-                break;
-        }
-
-        logits = bn_transformer_forward(model, next, *pos);
-        (*pos)++;
-        if (!logits) return -2;
-    }
-
-    return gen_count;
-}
-
-// Speculative decoding: draft K tokens with small model, verify with target.
-// Greedy only (temperature=0). Returns n_generated, -1 on loop, -2 on error.
-static int generate_response_speculative(
-    BnModel *target, BnModel *draft, int draft_k,
-    BnTokenizer *tok, BnSampler *sampler,
-    int max_tokens, int *pos,
-    bn_token_callback cb, void *user_data)
-{
-    #define MAX_DRAFT_K 20
-    int gen_count = 0;
-    int draft_tokens[MAX_DRAFT_K];
-    if (draft_k > MAX_DRAFT_K) draft_k = MAX_DRAFT_K;
-    int n_accepted_total = 0, n_drafted_total = 0;
-
-    // Both models should have logits ready from the last prompt token
-    float *target_logits = target->state.logits;
-    float *draft_logits = draft->state.logits;
-    if (!target_logits || !draft_logits) return -2;
-
-    while (gen_count < max_tokens) {
-        // --- Draft phase: generate K tokens with draft model ---
-        int k_actual = 0;
-        for (int i = 0; i < draft_k && gen_count + i < max_tokens; i++) {
-            int d = bn_sampler_sample(sampler, draft_logits);  // greedy argmax
-            if (d == tok->eot_id || d == tok->eos_id || d == tok->im_end_id)
-                break;
-            draft_tokens[k_actual++] = d;
-            draft_logits = bn_transformer_forward(draft, d, *pos + k_actual - 1);
-            if (!draft_logits) return -2;
-        }
-
-        if (k_actual == 0) {
-            // Draft immediately hit EOS — sample from target instead
-            int t = bn_sampler_sample(sampler, target_logits);
-            if (t == tok->eot_id || t == tok->eos_id || t == tok->im_end_id)
-                break;
-            bn_sampler_accept(sampler, t);
-            const char *piece = bn_tokenizer_decode(tok, t);
-            if (piece && cb && cb(piece, t, user_data)) break;
-            target_logits = bn_transformer_forward(target, t, *pos);
-            draft_logits = bn_transformer_forward(draft, t, *pos);
-            (*pos)++;
-            gen_count++;
-            if (!target_logits || !draft_logits) return -2;
-            continue;
-        }
-
-        n_drafted_total += k_actual;
-
-        // --- Verify phase: batch prefill all draft tokens through target ---
-        // prefill_all runs all k_actual tokens in one pass, returns logits at every position.
-        // Logits at position i tell us the target's prediction AFTER seeing draft_tokens[0..i-1].
-        // We compare argmax(logits[i]) with draft_tokens[i].
-        int vocab_size = target->config.vocab_size;
-        float *verify_logits = (float *)malloc((size_t)(k_actual + 1) * vocab_size * sizeof(float));
-        if (!verify_logits) return -2;
-
-        // First position: we already have target_logits from the previous iteration
-        memcpy(verify_logits, target_logits, vocab_size * sizeof(float));
-
-        // Batch the k_actual draft tokens through target (fills KV cache for all positions)
-        if (bn_transformer_prefill_all(target, draft_tokens, k_actual, *pos,
-                                        verify_logits + vocab_size) != 0) {
-            free(verify_logits);
-            return -2;
-        }
-        // Now verify_logits[0] = logits before draft_tokens[0] (= previous target_logits)
-        // verify_logits[(i+1)*vocab] = logits after processing draft_tokens[0..i]
-
-        int n_accepted = 0;
-        int corrected = -1;
-        for (int i = 0; i < k_actual; i++) {
-            float *lg = verify_logits + (size_t)i * vocab_size;
-            int t_i = bn_sampler_sample(sampler, lg);  // target's greedy choice at position i
-            if (t_i == draft_tokens[i]) {
-                n_accepted++;
-            } else {
-                corrected = t_i;
-                break;
-            }
-        }
-        // target_logits now points to logits after last accepted token
-        target_logits = target->state.logits;  // prefill_all left last logits here
-        free(verify_logits);
-
-        // Stream accepted draft tokens
-        for (int i = 0; i < n_accepted; i++) {
-            bn_sampler_accept(sampler, draft_tokens[i]);
-            const char *piece = bn_tokenizer_decode(tok, draft_tokens[i]);
-            if (piece && cb && cb(piece, draft_tokens[i], user_data)) goto done;
-            gen_count++;
-        }
-
-        if (corrected >= 0) {
-            // Stream the corrected token
-            if (corrected != tok->eot_id && corrected != tok->eos_id &&
-                corrected != tok->im_end_id) {
-                bn_sampler_accept(sampler, corrected);
-                const char *piece = bn_tokenizer_decode(tok, corrected);
-                if (piece && cb && cb(piece, corrected, user_data)) goto done;
-                gen_count++;
-            } else {
-                // Target says stop
-                *pos += n_accepted;
-                break;
-            }
-            *pos += n_accepted + 1;
-
-            // Re-sync target: prefill filled KV with wrong token at rejection pos.
-            // Overwrite by running corrected token through target at that position.
-            target_logits = bn_transformer_forward(target, corrected, *pos - 1);
-            if (!target_logits) return -2;
-
-            // Re-sync draft model
-            draft_logits = bn_transformer_forward(draft, corrected, *pos - 1);
-            if (!draft_logits) return -2;
-        } else {
-            // All K accepted — bonus token from target's last logits
-            *pos += n_accepted;
-            int bonus = bn_sampler_sample(sampler, target_logits);
-            if (bonus != tok->eot_id && bonus != tok->eos_id &&
-                bonus != tok->im_end_id) {
-                bn_sampler_accept(sampler, bonus);
-                const char *piece = bn_tokenizer_decode(tok, bonus);
-                if (piece && cb && cb(piece, bonus, user_data)) goto done;
-                gen_count++;
-                target_logits = bn_transformer_forward(target, bonus, *pos);
-                draft_logits = bn_transformer_forward(draft, bonus, *pos);
-                (*pos)++;
-                if (!target_logits || !draft_logits) return -2;
-            } else {
-                break;  // target says stop
-            }
-        }
-
-        n_accepted_total += n_accepted + 1; // +1 for corrected token or bonus token
-    }
-
-done:
-    if (n_drafted_total > 0) {
-        char acc_s[32], rate_s[32];
-        snprintf(acc_s, sizeof(acc_s), "%d/%d", n_accepted_total, n_drafted_total);
-        snprintf(rate_s, sizeof(rate_s), "%.1f%%",
-                 100.0 * n_accepted_total / n_drafted_total);
-        SH_LOG_INFO("Speculative decoding", "accepted", acc_s, "rate", rate_s);
-    }
-    return gen_count;
 }
 
 static int print_token(const char *piece, int token_id, void *user_data) {
@@ -643,33 +434,8 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            int n = 0;
-            if (tokenizer.chatml) {
-                // ChatML: <|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n
-                if (n < max_tokens) tokens[n++] = tokenizer.im_start_id;
-                char user_buf[4096 + 16];
-                snprintf(user_buf, sizeof(user_buf), "user\n%s", line);
-                n += bn_tokenizer_encode(&tokenizer, user_buf, 0,
-                                         tokens + n, max_tokens - n);
-                if (n < max_tokens) tokens[n++] = tokenizer.im_end_id;
-                int n2 = bn_tokenizer_encode(&tokenizer, "\n", 0,
-                                             tokens + n, max_tokens - n);
-                n += n2;
-                if (n < max_tokens) tokens[n++] = tokenizer.im_start_id;
-                n2 = bn_tokenizer_encode(&tokenizer, "assistant\n", 0,
-                                         tokens + n, max_tokens - n);
-                n += n2;
-            } else {
-                // LLaMA/BitNet: User: {msg}<|eot_id|>Assistant:
-                char user_buf[4096 + 16];
-                snprintf(user_buf, sizeof(user_buf), "User: %s", line);
-                n = bn_tokenizer_encode(&tokenizer, user_buf, 0, tokens, max_tokens);
-                if (n < max_tokens && tokenizer.eot_id >= 0)
-                    tokens[n++] = tokenizer.eot_id;
-                int n2 = bn_tokenizer_encode(&tokenizer, "Assistant: ", 0,
-                                             tokens + n, max_tokens - n);
-                n += n2;
-            }
+            // Format user message into chat turn tokens
+            int n = bn_chat_format_turn(&tokenizer, BN_CHAT_AUTO, line, tokens, max_tokens, NULL);
 
             // Context overflow: reset if prompt won't fit
             if (pos + n > seq_len) {
@@ -683,16 +449,8 @@ int main(int argc, char **argv) {
             }
 
             // Feed prompt tokens through forward pass
-            float *logits = NULL;
-            if (!args.no_prefill && n > 1) {
-                logits = bn_transformer_prefill(&model, tokens, n, pos);
-                pos += n;
-            } else {
-                for (int i = 0; i < n; i++) {
-                    logits = bn_transformer_forward(&model, tokens[i], pos);
-                    pos++;
-                }
-            }
+            float *logits = bn_prefill(&model, tokens, n, pos, args.no_prefill);
+            pos += n;
 
             if (!logits) {
                 SH_LOG_ERROR("Forward pass returned NULL during prompt");
@@ -705,12 +463,12 @@ int main(int argc, char **argv) {
             if (remaining < max_gen) max_gen = remaining;
             if (max_gen < 1) max_gen = 1;
 
-            int gen_count = generate_response(&model, &tokenizer, &sampler,
-                                               max_gen, &pos,
-                                               print_token, NULL);
+            int gen_count = bn_generate(&model, &tokenizer, &sampler,
+                                         max_gen, &pos,
+                                         print_token, NULL, NULL, NULL);
 
             // Feed end-of-turn token into KV cache to close the assistant turn
-            int turn_end_id = tokenizer.chatml ? tokenizer.im_end_id : tokenizer.eot_id;
+            int turn_end_id = bn_chat_turn_end_id(&tokenizer, BN_CHAT_AUTO);
             if (turn_end_id >= 0 && pos < seq_len) {
                 bn_transformer_forward(&model, turn_end_id, pos);
                 pos++;
@@ -731,7 +489,6 @@ int main(int argc, char **argv) {
         free(tokens);
     } else {
         // --- Single-shot generation ---
-        // #30: Encode prompt -- upper bound is 1 token per byte + BOS + margin
         int max_prompt_tokens = (int)strlen(args.prompt) + 3;
         int *prompt_tokens = (int *)malloc(max_prompt_tokens * sizeof(int));
         if (!prompt_tokens) {
@@ -762,27 +519,14 @@ int main(int argc, char **argv) {
         double gen_start = bn_platform_time_ms();
         int pos = 0;
         int n_generated = 0;
-        float *logits;
 
-        // Prefill prompt tokens (skip logits for intermediate tokens)
-        if (!args.no_prefill && n_prompt > 1) {
-            logits = bn_transformer_prefill(&model, prompt_tokens, n_prompt, 0);
-            pos = n_prompt;
-        } else {
-            logits = NULL;
-            for (int i = 0; i < n_prompt; i++) {
-                logits = bn_transformer_forward(&model, prompt_tokens[i], i);
-            }
-            pos = n_prompt;
-        }
+        // Prefill prompt tokens
+        float *logits = bn_prefill(&model, prompt_tokens, n_prompt, 0, args.no_prefill);
+        pos = n_prompt;
+
         // Also prefill draft model if speculative decoding
         if (has_draft && logits) {
-            if (!args.no_prefill && n_prompt > 1) {
-                bn_transformer_prefill(&draft_model, prompt_tokens, n_prompt, 0);
-            } else {
-                for (int i = 0; i < n_prompt; i++)
-                    bn_transformer_forward(&draft_model, prompt_tokens[i], i);
-            }
+            bn_prefill(&draft_model, prompt_tokens, n_prompt, 0, args.no_prefill);
         }
 
         if (!logits) {
@@ -809,53 +553,16 @@ int main(int argc, char **argv) {
 #endif
             // Generate tokens — speculative or standard
             if (has_draft) {
-                n_generated = generate_response_speculative(
+                n_generated = bn_generate_speculative(
                     &model, &draft_model, args.draft_k,
                     &tokenizer, &sampler, args.n_tokens, &pos,
-                    print_token, NULL);
+                    print_token, NULL, NULL);
                 if (n_generated < 0)
                     SH_LOG_ERROR("Speculative generation failed");
-            } else
-            for (int i = 0; i < args.n_tokens; i++) {
-                int next = bn_sampler_sample(&sampler, logits);
-                n_generated++;
-
-                // Check for EOS/EOT
-                if (next == tokenizer.eos_id || next == tokenizer.eot_id) {
-                    break;
-                }
-
-                bn_sampler_accept(&sampler, next);
-
-                const char *piece = bn_tokenizer_decode(&tokenizer, next);
-                if (!piece) piece = "";
-                printf("%s", piece);
-                fflush(stdout);
-
-                logits = bn_transformer_forward(&model, next, pos);
-                pos++;
-                if (!logits) {
-                    SH_LOG_ERROR("Forward pass returned NULL");
-                    break;
-                }
-#ifdef DEBUG
-                {
-                    int top5[5] = {0};
-                    for (int v = 0; v < cfg->vocab_size; v++) {
-                        for (int k = 0; k < 5; k++) {
-                            if (logits[v] > logits[top5[k]]) {
-                                for (int j = 4; j > k; j--) top5[j] = top5[j-1];
-                                top5[k] = v;
-                                break;
-                            }
-                        }
-                    }
-                    fprintf(stderr, "DBG gen %d (token %d, pos %d) top5:", i, next, pos);
-                    for (int k = 0; k < 5; k++)
-                        fprintf(stderr, " %d(%.3f)", top5[k], logits[top5[k]]);
-                    fprintf(stderr, "\n");
-                }
-#endif
+            } else {
+                n_generated = bn_generate(&model, &tokenizer, &sampler,
+                                           args.n_tokens, &pos,
+                                           print_token, NULL, NULL, NULL);
             }
         }
 
