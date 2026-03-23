@@ -943,14 +943,21 @@ void bn_quant_matvec_multi(const BnMatvecMultiTask *tasks, int n_tasks,
                         x_q_bufs + (size_t)t * cols,
                         x_scales_all + t * n_blocks
                     };
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
                     void (*fn)(void *, int, int) = tasks[t].W->rp_scales
                         ? bn_quant_q4_repacked_neon_sdot_range
                         : bn_quant_q4_neon_sdot_range;
+#elif defined(__AVX2__)
+                    void (*fn)(void *, int, int) = bn_quant_q4_avx2_range;
+#else
+                    void (*fn)(void *, int, int) = bn_quant_q4_wasm_sdot_range;
+#endif
                     tp_tasks[t] = (BnTPTask){ fn, &ctxs[t], tasks[t].W->rows };
                 }
                 bn_tp_dispatch(pool, tp_tasks, n_tasks);
                 return;
             }
+#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || defined(__AVX2__)
             if (type0 == BN_GGUF_TENSOR_Q8_0) {
                 BnQ8SdotCtx ctxs[BN_MAX_BATCH];
                 BnTPTask tp_tasks[BN_MAX_BATCH];
@@ -960,11 +967,16 @@ void bn_quant_matvec_multi(const BnMatvecMultiTask *tasks, int n_tasks,
                         x_q_bufs + (size_t)t * cols,
                         x_scales_all + t * n_blocks
                     };
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
                     tp_tasks[t] = (BnTPTask){ bn_quant_q8_neon_sdot_range, &ctxs[t], tasks[t].W->rows };
+#else
+                    tp_tasks[t] = (BnTPTask){ bn_quant_q8_avx2_range, &ctxs[t], tasks[t].W->rows };
+#endif
                 }
                 bn_tp_dispatch(pool, tp_tasks, n_tasks);
                 return;
             }
+#endif
         }
     }
 #endif
@@ -1044,7 +1056,9 @@ void bn_quant_matmul(float *out, const BnQWeight *W, const float *X,
     }
 #endif
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 fallback_loop:
+#endif
     // Generic fallback: loop over tokens
     for (int t = 0; t < n_tokens; t++) {
         bn_quant_matvec(out + (size_t)t * rows, W, X + (size_t)t * cols,
