@@ -190,33 +190,33 @@ WGPUBuffer x_buf, out_buf, uniform_buf, staging_buf;
 
 **Expected impact:** ~40% overhead reduction (25ms → 15ms per token).
 
-| Status | Not started |
+| Status | **Done** — persistent x/out/uniform/staging buffers, lazy grow-only reallocation |
 
 #### 4b.2: Batched Command Encoding (MEDIUM EFFORT)
 
 Encode multiple matvecs into one command buffer, one submit, one readback. Maps directly to Hull's `hl_cap_gpu_pipeline()`.
 
 ```c
-// New vtable function
+// Implemented vtable function
 typedef struct {
     float *out;
     void  *W_buf;
-    const float *x;
     int rows, cols, type;
 } BnGPUMatvecOp;
 
-int (*matvec_batch)(void *ctx, const BnGPUMatvecOp *ops, int n_ops);
+int (*matvec_batch)(void *ctx, const BnGPUMatvecOp *ops, int n_ops,
+                    const float *x, int x_cols);
 ```
 
-**Hull mapping:** `matvec_batch` → `hl_cap_gpu_pipeline(stages, ...)` with shared buffers across stages. Each `BnGPUMatvecOp` becomes an `HlGpuPipelineStage`. Shared `x` buffer maps to Hull's named cross-stage buffer.
+**Hull mapping:** `matvec_batch` → `hl_cap_gpu_pipeline(stages, ...)` with shared buffers across stages.
 
-**Expected impact:** Reduces 150 submits to ~50 (one per batch group: QKV, gate+up, down). Combined with 4b.1: overhead drops to ~6-9ms.
+**Expected impact:** Reduces submits per token from 150 to ~50. Combined with 4b.1: 2.6x faster (1.55 → 4.0 tok/s).
 
-| Status | Not started |
+| Status | **Done** — single x upload, single command encoder, staging offset partitioning |
 
 #### 4b.3: GPU-Resident Forward Pass (HIGH EFFORT, TRANSFORMATIVE)
 
-Keep all activations on GPU. RMSNorm, RoPE, attention, activations, residuals all run as GPU compute. Only read back logits at the end. One GPU submission per token.
+Keep ALL activations on GPU. One command buffer submission per token. Only read back logits. Eliminates the remaining 12x gap vs CPU.
 
 ```c
 // GPU operation descriptor
@@ -256,6 +256,58 @@ shaders/
 - Prefill: massive parallelism across tokens
 
 | Status | Not started |
+
+**Implementation plan:**
+
+**New WGSL shaders (8 files):**
+
+| Shader | Algorithm | Dispatch |
+|--------|-----------|----------|
+| `rmsnorm.wgsl` | Parallel sum-of-squares → workgroup reduce → normalize | (1, 1, 1) — 256 threads, dim/256 elements each |
+| `rope.wgsl` | Per-head pair rotation using precomputed freq × pos | (n_heads, 1, 1) |
+| `gqa_scores.wgsl` | Q·K dot products for all KV positions per head | (n_heads, 1, 1) |
+| `softmax.wgsl` | Three-phase: max-reduce, exp+sum-reduce, normalize | (n_heads, 1, 1) |
+| `gqa_combine.wgsl` | Weighted V sum using softmax attention weights | (n_heads, 1, 1) |
+| `silu_gate.wgsl` | `gate[i] = silu(gate[i]) * up[i]` | (ceil(hidden/256), 1, 1) |
+| `relu2_gate.wgsl` | `gate[i] = relu(gate[i])² * up[i]` | (ceil(hidden/256), 1, 1) |
+| `residual_add.wgsl` | `x[i] += r[i]` | (ceil(dim/256), 1, 1) |
+
+**GPU-resident activation buffers** (created at model load, persist for session lifetime):
+
+| Buffer | Size |
+|--------|------|
+| `x`, `xb`, `xb2`, `q` | dim × 4 bytes each |
+| `hb`, `hb2` | hidden_dim × 4 bytes each |
+| `key_cache`, `value_cache` | n_layers × seq_len × kv_dim × 4 bytes each |
+| `att` | n_heads × seq_len × 4 bytes |
+| `logits` | vocab_size × 4 bytes |
+| `rope_freq` | head_size/2 × 4 bytes (uploaded once) |
+
+**New vtable function:**
+```c
+int (*execute)(void *ctx, const BnGPUOp *ops, int n_ops,
+               int readback_buf, float *out_host, int out_len);
+```
+
+**Forward pass → op list:** `transformer.c` builds an array of ~450 `BnGPUOp` descriptors (15 per layer × 30 layers + logits). The `execute()` function encodes all into one command buffer, submits once, reads back logits only.
+
+**KV cache writes:** K/V matvec outputs go to a scratch buffer, then `copyBufferToBuffer` moves them to the correct cache offset. No shader modification needed.
+
+**Embedding upload:** `wgpuQueueWriteBuffer(x_buf, embedding, dim*4)` before command encoding.
+
+**Uniform ring buffer:** Pre-compute all ~450 uniforms, upload once, each bind group references its own offset.
+
+**v1 scope:** Standard dense transformer only (no MoE, no SSM, no gated-Q, FP32 KV cache). Falls back to CPU for unsupported architectures.
+
+**Build order:**
+1. Element-wise shaders: residual_add, silu_gate, relu2_gate
+2. RMSNorm shader (workgroup reduction)
+3. RoPE shader (per-head trig)
+4. Test FFN block only (rmsnorm + matvecs + activation + residual)
+5. GQA attention (3 shaders — scores, softmax, combine)
+6. Full forward pass + end-to-end test
+
+**Expected performance:** 1 submit + 1 readback per token → ~80μs overhead. On M1 Max GPU (~200 GB/s bandwidth vs CPU's ~55 GB/s), estimate **30-80 tok/s** for BitNet 2B. In browser (WebGPU), GPU would be the fastest path since WASM SIMD128 is 5-10x slower than native NEON.
 
 #### 4b.4: Prefill Batch
 
@@ -363,9 +415,9 @@ end)
 | 1 | SSE chunk formatter | Small | Nothing | **Done** |
 | 3 | GPU backend vtable | Medium | Nothing | **Done** |
 | 4a | WGSL compute shaders + wgpu runtime | Large | Phase 3 | **Done** (22 shaders, all validated) |
-| 4b.1 | Persistent GPU buffers | Small | Phase 4a | Not started |
-| 4b.2 | Batched command encoding | Medium | Phase 4b.1 | Not started |
-| 4b.3 | GPU-resident forward pass | Large | Phase 4b.2 | Not started |
+| 4b.1 | Persistent GPU buffers | Small | Phase 4a | **Done** |
+| 4b.2 | Batched command encoding | Medium | Phase 4b.1 | **Done** |
+| 4b.3 | GPU-resident forward pass | Large | Phase 4b.2 | Not started (planned) |
 
 ### In Hull
 
@@ -385,11 +437,10 @@ Measured on Apple M1 Max, bitnet-b1.58-2B-4T (I2_S, 1.1GB):
 
 | Backend | tok/s | Notes |
 |---------|-------|-------|
-| CPU ARM NEON | **50.6** | 8 P-cores, SDOT int8 accumulation |
-| GPU WebGPU (current) | **1.55** | Per-matvec dispatch, 33x overhead |
-| GPU + persistent bufs (est.) | ~3-4 | Phase 4b.1 |
-| GPU + batched encoding (est.) | ~8-15 | Phase 4b.2 |
-| GPU-resident forward (est.) | ~50-100+ | Phase 4b.3, especially on dedicated GPUs |
+| CPU ARM NEON | **48.2** | 8 P-cores, SDOT int8 accumulation |
+| GPU naive (per-matvec dispatch) | **1.55** | 33x overhead |
+| GPU + 4b.1 + 4b.2 | **4.0** | 2.6x over naive (persistent bufs + batch encoding) |
+| GPU-resident forward (est.) | **30-80** | Phase 4b.3, one submit/token, GPU bandwidth-bound |
 
 ## What Exists Today
 
@@ -412,9 +463,9 @@ Measured on Apple M1 Max, bitnet-b1.58-2B-4T (I2_S, 1.1GB):
 | wgpu-native runtime (`gpu_wgpu.c`) | Done |
 | GPU validation benchmark | Done (20/20 matvec, 3/3 matmul pass) |
 | `--gpu` CLI flag | Done |
-| Persistent GPU buffers (4b.1) | Not started |
-| Batched command encoding (4b.2) | Not started |
-| GPU-resident forward pass (4b.3) | Not started |
+| Persistent GPU buffers (4b.1) | Done |
+| Batched command encoding (4b.2) | Done (2.6x speedup over naive) |
+| GPU-resident forward pass (4b.3) | Not started (planned — 8 new shaders + execute() vtable) |
 
 ### Hull (server + adapter — not started)
 
