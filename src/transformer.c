@@ -1070,7 +1070,7 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
         };
 
         // ---- 4. RoPE on scratch (K) ----
-        // ROPE shader params: p[0]=n_kv_heads, p[1]=head_size, p[2]=rope_dims, p[3]=pos
+        // ROPE shader params: p[0]=n_heads, p[1]=head_size, p[2]=pos, p[3]=rope_dims
         ops[n++] = (BnGPUOp){
             .shader = BN_GPU_SHADER_ROPE,
             .type = -1,
@@ -1080,7 +1080,7 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
             .buf_aux = -1,
             .rows = 0, .cols = 0,
             .p = { (uint32_t)c->n_kv_heads, (uint32_t)head_size,
-                   (uint32_t)rope_dims, (uint32_t)pos, 0, 0, 0, 0 }
+                   (uint32_t)pos, (uint32_t)rope_dims, 0, 0, 0, 0 }
         };
 
         // ---- 5. COPY scratch -> key_cache[loff + cache_pos * kv_dim] ----
@@ -1131,29 +1131,32 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
             .buf_aux = -1,
             .rows = 0, .cols = 0,
             .p = { (uint32_t)n_heads, (uint32_t)head_size,
-                   (uint32_t)rope_dims, (uint32_t)pos, 0, 0, 0, 0 }
+                   (uint32_t)pos, (uint32_t)rope_dims, 0, 0, 0, 0 }
         };
 
         // ---- 9. GQA scores: q + key_cache -> att ----
-        // p[0]=n_heads, p[1]=head_size, p[2]=kv_dim, p[3]=kv_mul,
-        // p[4]=n_kv, p[5]=seq_len, p[6]=loff_lo, p[7]=loff_hi
-        uint32_t loff_lo = (uint32_t)(loff & 0xFFFFFFFF);
-        uint32_t loff_hi = (uint32_t)(loff >> 32);
-        ops[n++] = (BnGPUOp){
-            .shader = BN_GPU_SHADER_GQA_SCORES,
-            .type = -1,
-            .W_buf = NULL,
-            .buf_in = BN_GPU_BUF_Q,
-            .buf_out = -1,
-            .buf_aux = -1,
-            .rows = 0, .cols = 0,
-            .p = { (uint32_t)n_heads, (uint32_t)head_size, (uint32_t)kv_dim,
-                   (uint32_t)c->kv_mul, (uint32_t)n_kv, (uint32_t)c->seq_len,
-                   loff_lo, loff_hi }
-        };
+        // Shader expects: p0=n_heads, p1=head_size, p2=n_kv, p3=kv_mul,
+        //                 p4=kv_dim, p5=seq_len, p6=loff, p7=inv_sqrt_hs (bitcast f32)
+        {
+            float inv_sqrt_hs = 1.0f / sqrtf((float)head_size);
+            uint32_t u_inv_sqrt_hs;
+            memcpy(&u_inv_sqrt_hs, &inv_sqrt_hs, 4);
+            ops[n++] = (BnGPUOp){
+                .shader = BN_GPU_SHADER_GQA_SCORES,
+                .type = -1,
+                .W_buf = NULL,
+                .buf_in = BN_GPU_BUF_Q,
+                .buf_out = -1,
+                .buf_aux = -1,
+                .rows = 0, .cols = 0,
+                .p = { (uint32_t)n_heads, (uint32_t)head_size, (uint32_t)n_kv,
+                       (uint32_t)c->kv_mul, (uint32_t)kv_dim, (uint32_t)c->seq_len,
+                       (uint32_t)loff, u_inv_sqrt_hs }
+            };
+        }
 
         // ---- 10. Softmax on att ----
-        // p[0]=n_heads, p[1]=n_kv (number of valid entries per head)
+        // Shader expects: p0=n_heads, p1=n_kv, p2=seq_len
         ops[n++] = (BnGPUOp){
             .shader = BN_GPU_SHADER_SOFTMAX,
             .type = -1,
@@ -1162,12 +1165,13 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
             .buf_out = -1,
             .buf_aux = -1,
             .rows = 0, .cols = 0,
-            .p = { (uint32_t)n_heads, (uint32_t)n_kv, 0, 0, 0, 0, 0, 0 }
+            .p = { (uint32_t)n_heads, (uint32_t)n_kv, (uint32_t)c->seq_len,
+                   0, 0, 0, 0, 0 }
         };
 
         // ---- 11. GQA combine: att + value_cache -> xb ----
-        // p[0]=n_heads, p[1]=head_size, p[2]=kv_dim, p[3]=kv_mul,
-        // p[4]=n_kv, p[5]=seq_len, p[6]=loff_lo, p[7]=loff_hi
+        // Shader expects: p0=n_heads, p1=head_size, p2=n_kv, p3=kv_mul,
+        //                 p4=kv_dim, p5=seq_len, p6=loff
         ops[n++] = (BnGPUOp){
             .shader = BN_GPU_SHADER_GQA_COMBINE,
             .type = -1,
@@ -1176,9 +1180,9 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
             .buf_out = BN_GPU_BUF_XB,
             .buf_aux = -1,
             .rows = 0, .cols = 0,
-            .p = { (uint32_t)n_heads, (uint32_t)head_size, (uint32_t)kv_dim,
-                   (uint32_t)c->kv_mul, (uint32_t)n_kv, (uint32_t)c->seq_len,
-                   loff_lo, loff_hi }
+            .p = { (uint32_t)n_heads, (uint32_t)head_size, (uint32_t)n_kv,
+                   (uint32_t)c->kv_mul, (uint32_t)kv_dim, (uint32_t)c->seq_len,
+                   (uint32_t)loff, 0 }
         };
 
         // ---- 12. Wo matvec: xb -> xb2 ----

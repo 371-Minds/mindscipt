@@ -83,14 +83,16 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         let elem_offset = block_idx * 32u;
 
         // 16 bytes of packed nibbles → 32 elements
+        // Layout: low nibble of qs[i] → element i (0..15)
+        //         high nibble of qs[i] → element i+16 (16..31)
         for (var i = 0u; i < 16u; i++) {
             let byte_val = read_byte(qs_byte_start + i);
 
             let lo = d * f32(byte_val & 0xFu) + m;
             let hi = d * f32((byte_val >> 4u) & 0xFu) + m;
 
-            sum += lo * x[x_offset + elem_offset + i * 2u];
-            sum += hi * x[x_offset + elem_offset + i * 2u + 1u];
+            sum += lo * x[x_offset + elem_offset + i];
+            sum += hi * x[x_offset + elem_offset + i + 16u];
         }
 
         block_idx += 256u;

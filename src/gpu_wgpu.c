@@ -132,9 +132,10 @@ static int ensure_scratch(BnWgpuCtx *ctx, size_t x_need, size_t out_need,
         ctx->out_buf_size = out_need;
     }
 
-    /* uniform_buf: 16 bytes, create once */
+    /* uniform_buf: 256-byte aligned per batch op (for minUniformBufferOffsetAlignment).
+     * 16 batch ops × 256 bytes = 4096 bytes. */
     if (!ctx->uniform_buf) {
-        size_t uni_size = (sizeof(BnWgpuUniforms) + 15) & ~(size_t)15;
+        size_t uni_size = 16 * 256;  /* BN_WGPU_MAX_BATCH_OPS * 256 */
         WGPUBufferDescriptor desc = {
             .label = sv("bn_uni_persist"),
             .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
@@ -821,22 +822,24 @@ static int wgpu_matvec_batch(void *vctx, const BnGPUMatvecOp *ops, int n_ops,
         op_offsets[i] = staging_offset;
         op_sizes[i] = out_size;
 
-        /* Write uniforms for this op */
+        /* Write uniforms for this op at its own 256-byte aligned slot */
+        size_t uni_offset = (size_t)i * 256;
         BnWgpuUniforms uniforms = {
             .rows = (uint32_t)op->rows,
             .cols = (uint32_t)op->cols,
             .n_tokens = 1,
             .extra = 0,
         };
-        wgpuQueueWriteBuffer(ctx->queue, ctx->uniform_buf, 0,
+        wgpuQueueWriteBuffer(ctx->queue, ctx->uniform_buf, uni_offset,
                               &uniforms, sizeof(uniforms));
 
-        /* Create bind group: W varies per op, x/out/uniform are persistent */
+        /* Create bind group: W varies per op, x/out/uniform are persistent.
+         * Each op reads from its own uniform slot at uni_offset. */
         WGPUBindGroupEntry entries[4] = {
             { .binding = 0, .buffer = wbuf->buf,       .offset = 0, .size = wbuf->size },
             { .binding = 1, .buffer = ctx->x_buf,      .offset = 0, .size = x_aligned },
             { .binding = 2, .buffer = ctx->out_buf,    .offset = 0, .size = out_aligned },
-            { .binding = 3, .buffer = ctx->uniform_buf, .offset = 0,
+            { .binding = 3, .buffer = ctx->uniform_buf, .offset = uni_offset,
               .size = (sizeof(BnWgpuUniforms) + 15) & ~(size_t)15 },
         };
         WGPUBindGroupDescriptor bg_desc = {
