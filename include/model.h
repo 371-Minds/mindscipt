@@ -6,6 +6,7 @@
 #include "quant.h"
 #include "threadpool.h"
 #include "sh_arena.h"
+#include "gpu_backend.h"
 
 // Forward declaration for MoE expert map (defined in moe.h)
 typedef struct {
@@ -168,11 +169,19 @@ typedef struct {
     // MoE shared I/O (zero for dense models)
     BnMoEIO moe_io;
     int expert_fd;           // file descriptor for expert pread, -1 if unused
+    BnGPUBackend *gpu;       // GPU compute backend (NULL = CPU only)
 } BnModel;
 
 int  bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16);
 void bn_model_free(BnModel *m);
 void bn_model_embed_token(const BnModel *m, float *out, int token);
+
+// Upload all model weights to GPU. Sets gpu_buf on each BnQWeight.
+// Returns 0 on success. On failure, releases partially uploaded buffers.
+int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu);
+
+// Release all GPU weight buffers. Safe to call if gpu is NULL.
+void bn_model_release_gpu(BnModel *model);
 
 // Session arena helpers (used by bn_session_create)
 size_t bn_model_session_arena_size(const BnConfig *c, const BnWeights *w);

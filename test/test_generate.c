@@ -948,6 +948,95 @@ static void test_logprobs_text(void) {
 }
 
 // ===================================================================
+// Test SSE chunk formatting
+// ===================================================================
+
+static void test_sse_chunk_basic(void) {
+    printf("test_sse_chunk_basic... ");
+
+    char buf[1024];
+    int n = bn_format_sse_chunk(buf, sizeof(buf), "Hello", "chatcmpl-abc",
+                                 "bitnet-2b", NULL, 1700000000LL);
+    assert(n > 0);
+    assert(strncmp(buf, "data: ", 6) == 0);
+    assert(strstr(buf, "\"content\":\"Hello\"") != NULL);
+    assert(strstr(buf, "\"finish_reason\":null") != NULL);
+    assert(strstr(buf, "\"id\":\"chatcmpl-abc\"") != NULL);
+    assert(strstr(buf, "\"model\":\"bitnet-2b\"") != NULL);
+    assert(strstr(buf, "\"created\":1700000000") != NULL);
+    // Must end with \n\n
+    assert(n >= 2 && buf[n - 1] == '\n' && buf[n - 2] == '\n');
+
+    printf("PASSED\n");
+}
+
+static void test_sse_chunk_finish(void) {
+    printf("test_sse_chunk_finish... ");
+
+    char buf[1024];
+    int n = bn_format_sse_chunk(buf, sizeof(buf), NULL, "chatcmpl-abc",
+                                 "bitnet-2b", "stop", 1700000000LL);
+    assert(n > 0);
+    assert(strstr(buf, "\"delta\":{}") != NULL);
+    assert(strstr(buf, "\"finish_reason\":\"stop\"") != NULL);
+
+    printf("PASSED\n");
+}
+
+static void test_sse_chunk_escape(void) {
+    printf("test_sse_chunk_escape... ");
+
+    char buf[1024];
+    // piece with ", \, \n, and control char \x01
+    int n = bn_format_sse_chunk(buf, sizeof(buf), "a\"b\\c\nd\x01" "e",
+                                 "id1", "m1", NULL, 0);
+    assert(n > 0);
+    // Check escaped characters appear in output
+    assert(strstr(buf, "a\\\"b\\\\c\\nd\\u0001e") != NULL);
+
+    printf("PASSED\n");
+}
+
+static void test_sse_chunk_defaults(void) {
+    printf("test_sse_chunk_defaults... ");
+
+    char buf[1024];
+    int n = bn_format_sse_chunk(buf, sizeof(buf), "Hi", NULL, NULL, NULL, 0);
+    assert(n > 0);
+    assert(strstr(buf, "\"id\":\"chatcmpl-0\"") != NULL);
+    assert(strstr(buf, "\"model\":\"bitnet\"") != NULL);
+    // created=0 should be omitted
+    assert(strstr(buf, "created") == NULL);
+
+    printf("PASSED\n");
+}
+
+static void test_sse_chunk_overflow(void) {
+    printf("test_sse_chunk_overflow... ");
+
+    char buf[16];
+    int n = bn_format_sse_chunk(buf, sizeof(buf), "Hello", "id", "m", NULL, 0);
+    assert(n == -1);
+
+    printf("PASSED\n");
+}
+
+static void test_sse_done(void) {
+    printf("test_sse_done... ");
+
+    char buf[64];
+    int n = bn_format_sse_done(buf, sizeof(buf));
+    assert(n > 0);
+    assert(strcmp(buf, "data: [DONE]\n\n") == 0);
+
+    // Overflow
+    char tiny[5];
+    assert(bn_format_sse_done(tiny, sizeof(tiny)) == -1);
+
+    printf("PASSED\n");
+}
+
+// ===================================================================
 // Main
 // ===================================================================
 
@@ -978,6 +1067,12 @@ int main(void) {
     test_logprobs_zero_topk();
     test_logprobs_uniform();
     test_logprobs_text();
+    test_sse_chunk_basic();
+    test_sse_chunk_finish();
+    test_sse_chunk_escape();
+    test_sse_chunk_defaults();
+    test_sse_chunk_overflow();
+    test_sse_done();
     printf("All generate API tests passed!\n");
     return 0;
 }

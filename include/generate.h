@@ -132,4 +132,23 @@ void bn_logprobs_compute(const float *logits, int vocab_size,
                          const BnTokenizer *tok,
                          BnLogprobs *result);
 
+// --- SSE streaming format (OpenAI-compatible) ---
+
+// Format a token piece into an OpenAI-compatible SSE "data:" line.
+// Writes to buf (including trailing \n\n). Returns bytes written (excluding NUL).
+// piece: token text (NULL for finish chunks with empty delta).
+// id: request ID string (NULL -> "chatcmpl-0").
+// model: model name (NULL -> "bitnet").
+// finish_reason: NULL for normal chunks, "stop"/"length" for final chunk.
+// created: unix timestamp (0 to omit from output).
+// Returns -1 if buf_size is insufficient.
+int bn_format_sse_chunk(char *buf, int buf_size,
+                        const char *piece, const char *id,
+                        const char *model, const char *finish_reason,
+                        long long created);
+
+// Format the SSE stream terminator: "data: [DONE]\n\n"
+// Returns bytes written (excluding NUL), or -1 on insufficient buffer.
+int bn_format_sse_done(char *buf, int buf_size);
+
 #endif // BN_GENERATE_H

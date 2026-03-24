@@ -2,6 +2,7 @@
 #define BN_QUANT_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "threadpool.h"
 
 #define BN_QK_K 256
@@ -176,7 +177,11 @@ typedef struct {
     float scale;        // per-tensor scale (from .scale tensor or embedded in data)
     float *rp_scales;   // repacked: pre-converted FP32 per-block scales (NULL if not repacked)
     uint8_t *rp_qs;     // repacked: contiguous quant data (NULL if not repacked)
+    void *gpu_buf;      // GPU buffer handle (NULL = CPU only)
 } BnQWeight;
+
+// Compute raw data size in bytes for a quantized weight tensor.
+size_t bn_qweight_data_size(const BnQWeight *w);
 
 float    bn_fp16_to_fp32(uint16_t h);
 uint16_t bn_fp32_to_fp16(float f);
@@ -247,5 +252,15 @@ void bn_quant_x_to_q8k(const float *x, int8_t *x_q, float *x_d,
 void bn_quant_f16_rows_to_i8(const uint16_t *f16, int8_t *i8_out,
                               float *scales_out, int n_rows, int dim);
 #endif
+
+// GPU-accelerated matvec with CPU fallback
+#include "gpu_backend.h"
+
+void bn_quant_matvec_gpu(float *out, const BnQWeight *W, const float *x,
+                         int8_t *x_q_buf, BnThreadPool *pool,
+                         BnGPUBackend *gpu);
+void bn_quant_matvec_batch_gpu(const BnMatvecTask *tasks, int n_tasks,
+                                const float *x, int8_t *x_q_buf,
+                                BnThreadPool *pool, BnGPUBackend *gpu);
 
 #endif // BN_QUANT_H

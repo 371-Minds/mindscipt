@@ -1,5 +1,7 @@
 #include "quant_internal.h"
+#include "gpu_backend.h"
 #include "threadpool.h"
+#include "gguf.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -1183,4 +1185,75 @@ fallback_loop:
         bn_quant_matvec(out + (size_t)t * rows, W, X + (size_t)t * cols,
                         x_q_buf, pool);
     }
+}
+
+// --- Data size computation ---
+
+size_t bn_qweight_data_size(const BnQWeight *w) {
+    if (!w || !w->data) return 0;
+    size_t nelements = (size_t)w->rows * w->cols;
+    switch (w->type) {
+        case BN_GGUF_TENSOR_F32:      return nelements * 4;
+        case BN_GGUF_TENSOR_F16:      return nelements * 2;
+        case BN_GGUF_TENSOR_BF16:     return nelements * 2;
+        case BN_GGUF_TENSOR_Q4_0:     return (nelements / 32) * 18;
+        case BN_GGUF_TENSOR_Q4_1:     return (nelements / 32) * 20;
+        case BN_GGUF_TENSOR_Q8_0:     return (nelements / 32) * 34;
+        case BN_GGUF_TENSOR_I2_S:     return (nelements / 4) + 4;
+        case BN_GGUF_TENSOR_TQ1_0:    return (nelements / 256) * 54;
+        case BN_GGUF_TENSOR_TQ2_0:    return (nelements / 256) * 66;
+        case BN_GGUF_TENSOR_Q2_K:     return (nelements / 256) * 84;
+        case BN_GGUF_TENSOR_Q3_K:     return (nelements / 256) * 110;
+        case BN_GGUF_TENSOR_Q4_K:     return (nelements / 256) * 144;
+        case BN_GGUF_TENSOR_Q5_K:     return (nelements / 256) * 176;
+        case BN_GGUF_TENSOR_Q6_K:     return (nelements / 256) * 210;
+        case BN_GGUF_TENSOR_Q8_K:     return (nelements / 256) * 292;
+        case BN_GGUF_TENSOR_IQ4_NL:   return (nelements / 32) * 18;
+        case BN_GGUF_TENSOR_IQ4_XS:   return (nelements / 256) * 136;
+        case BN_GGUF_TENSOR_IQ3_XXS:  return (nelements / 256) * 98;
+        case BN_GGUF_TENSOR_IQ3_S:    return (nelements / 256) * 114;
+        case BN_GGUF_TENSOR_IQ2_XXS:  return (nelements / 256) * 66;
+        case BN_GGUF_TENSOR_IQ2_XS:   return (nelements / 256) * 74;
+        case BN_GGUF_TENSOR_IQ2_S:    return (nelements / 256) * 82;
+        default: return 0;
+    }
+}
+
+// --- GPU-accelerated matvec with CPU fallback ---
+
+void bn_quant_matvec_gpu(float *out, const BnQWeight *W, const float *x,
+                         int8_t *x_q_buf, BnThreadPool *pool,
+                         BnGPUBackend *gpu) {
+    // GPU fast path
+    if (gpu && W->gpu_buf && gpu->matvec) {
+        if (gpu->matvec(gpu->ctx, out, W->gpu_buf, x, W->rows, W->cols, W->type) == 0)
+            return;
+        // GPU failed, fall through to CPU
+    }
+    bn_quant_matvec(out, W, x, x_q_buf, pool);
+}
+
+void bn_quant_matvec_batch_gpu(const BnMatvecTask *tasks, int n_tasks,
+                                const float *x, int8_t *x_q_buf,
+                                BnThreadPool *pool, BnGPUBackend *gpu) {
+    if (gpu) {
+        // Try GPU for each task individually
+        int all_gpu = 1;
+        for (int t = 0; t < n_tasks; t++) {
+            if (!tasks[t].W->gpu_buf) { all_gpu = 0; break; }
+        }
+        if (all_gpu && gpu->matvec) {
+            for (int t = 0; t < n_tasks; t++) {
+                const BnQWeight *W = tasks[t].W;
+                if (gpu->matvec(gpu->ctx, tasks[t].out, W->gpu_buf, x,
+                                W->rows, W->cols, W->type) != 0) {
+                    // GPU failed on one task, fall back to CPU for all
+                    bn_quant_matvec_batch(tasks, n_tasks, x, x_q_buf, pool);
+                    return;
+                }
+            }
+            return;
+        }
+    }
+    bn_quant_matvec_batch(tasks, n_tasks, x, x_q_buf, pool);
 }

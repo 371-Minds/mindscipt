@@ -445,6 +445,78 @@ int bn_chat_turn_end_id(const BnTokenizer *tok, BnChatFormat fmt) {
     }
 }
 
+// --- SSE streaming format ---
+
+static int json_escape(char *dst, int dst_size, const char *src) {
+    int w = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        int need;
+        if (*p == '"' || *p == '\\') need = 2;
+        else if (*p == '\n' || *p == '\r' || *p == '\t') need = 2;
+        else if (*p < 0x20) need = 6;  // \u00XX
+        else need = 1;
+
+        if (w + need >= dst_size) return -1;
+
+        if (*p == '"')       { dst[w++] = '\\'; dst[w++] = '"'; }
+        else if (*p == '\\') { dst[w++] = '\\'; dst[w++] = '\\'; }
+        else if (*p == '\n') { dst[w++] = '\\'; dst[w++] = 'n'; }
+        else if (*p == '\r') { dst[w++] = '\\'; dst[w++] = 'r'; }
+        else if (*p == '\t') { dst[w++] = '\\'; dst[w++] = 't'; }
+        else if (*p < 0x20)  { w += snprintf(dst + w, dst_size - w, "\\u%04x", *p); }
+        else                 { dst[w++] = *p; }
+    }
+    if (w < dst_size) dst[w] = '\0';
+    return w;
+}
+
+int bn_format_sse_chunk(char *buf, int buf_size,
+                        const char *piece, const char *id,
+                        const char *model, const char *finish_reason,
+                        long long created) {
+    if (!id) id = "chatcmpl-0";
+    if (!model) model = "bitnet";
+
+    char escaped[1024];
+    if (piece) {
+        if (json_escape(escaped, (int)sizeof(escaped), piece) < 0)
+            return -1;
+    }
+
+    // Build the created field
+    char created_field[64];
+    if (created != 0)
+        snprintf(created_field, sizeof(created_field), "\"created\":%lld,", created);
+    else
+        created_field[0] = '\0';
+
+    int n;
+    if (finish_reason) {
+        // Finish chunk: empty delta, finish_reason set
+        n = snprintf(buf, buf_size,
+            "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",%s"
+            "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},"
+            "\"finish_reason\":\"%s\"}]}\n\n",
+            id, created_field, model, finish_reason);
+    } else {
+        // Normal chunk: delta with content
+        n = snprintf(buf, buf_size,
+            "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",%s"
+            "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":"
+            "{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+            id, created_field, model, escaped);
+    }
+
+    if (n < 0 || n >= buf_size) return -1;
+    return n;
+}
+
+int bn_format_sse_done(char *buf, int buf_size) {
+    int n = snprintf(buf, buf_size, "data: [DONE]\n\n");
+    if (n < 0 || n >= buf_size) return -1;
+    return n;
+}
+
 // --- Logprobs ---
 
 void bn_logprobs_compute(const float *logits, int vocab_size,

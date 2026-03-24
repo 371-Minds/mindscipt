@@ -134,11 +134,11 @@ bench_layers: CFLAGS += -DBN_BENCH_LAYERS
 bench_layers: $(BENCH_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-.PHONY: debug asan bench bench_scalar bench_avx2 bench_layers test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 test_q2k test_ssm test_gguf_fuzz test_moe test_generate test_session test_prompt_cache pgo avx2-check clean
+.PHONY: debug asan bench bench_scalar bench_avx2 bench_layers test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 test_q2k test_ssm test_gguf_fuzz test_moe test_generate test_session test_prompt_cache test_gpu_backend pgo avx2-check clean
 
 bench: bench_kernels
 
-test: test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_ssm test_gguf_fuzz test_moe test_generate test_session test_prompt_cache
+test: test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_ssm test_gguf_fuzz test_moe test_generate test_session test_prompt_cache test_gpu_backend
 
 test_gguf: test/test_gguf.c src/gguf.c src/platform.c src/sh_log.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
@@ -193,6 +193,12 @@ test_session: test/test_session.c src/session.c src/bn_alloc.c src/model.c src/m
 test_prompt_cache: test/test_prompt_cache.c src/prompt_cache.c src/session.c src/bn_alloc.c src/model.c src/moe.c \
                    src/gguf.c $(QUANT_SRCS) src/platform.c src/tokenizer.c src/threadpool.c \
                    src/transformer.c $(TRANSFORMER_BACKEND) src/sh_arena.c src/sh_log.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
+
+test_gpu_backend: test/test_gpu_backend.c $(QUANT_SRCS) src/model.c src/moe.c \
+                  src/gguf.c src/platform.c src/tokenizer.c src/threadpool.c \
+                  src/transformer.c $(TRANSFORMER_BACKEND) src/sh_arena.c src/sh_log.c \
+                  src/session.c src/bn_alloc.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
 
 test_e2e: test/test_e2e.c src/platform.c src/gguf.c $(QUANT_SRCS) src/model.c src/moe.c \
@@ -287,4 +293,4 @@ else
 endif
 
 clean:
-	rm -f bitnet bench_kernels bench_scalar bench_avx2 bench_layers src/*.o src/quant/*.o src/transformer/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_q2k test_ssm test_gguf_fuzz test_moe test_generate test_session test_prompt_cache test_e2e test_prefill test_kv_f16 default.profraw default.profdata src/*.gcda src/quant/*.gcda src/transformer/*.gcda
+	rm -f bitnet bench_kernels bench_scalar bench_avx2 bench_layers src/*.o src/quant/*.o src/transformer/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_q2k test_ssm test_gguf_fuzz test_moe test_generate test_session test_prompt_cache test_gpu_backend test_e2e test_prefill test_kv_f16 default.profraw default.profdata src/*.gcda src/quant/*.gcda src/transformer/*.gcda

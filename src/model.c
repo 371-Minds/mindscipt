@@ -1050,12 +1050,95 @@ int bn_model_alloc_session_buffers(const BnConfig *c, const BnWeights *w,
 // Allocate MoE pread staging buffers from arena (requires expert_map for sizing)
 void bn_model_free(BnModel *m) {
     if (!m) return;
+    bn_model_release_gpu(m);
     bn_moe_prefetch_destroy(&m->moe_io);
     bn_tp_free(m->pool);
     free(m->weights.layers);
     sh_arena_free(m->weight_arena);
     bn_platform_unload_file(&m->file);
     memset(m, 0, sizeof(BnModel));
+}
+
+// --- GPU weight upload/release ---
+
+// Helper: try to upload a single BnQWeight to GPU. Returns 0 on success.
+static int upload_qweight(BnGPUBackend *gpu, BnQWeight *w) {
+    if (!w->data) return 0;  // skip empty weights
+    size_t sz = bn_qweight_data_size(w);
+    if (sz == 0) return 0;   // unknown type, skip
+    w->gpu_buf = gpu->buffer_create(gpu->ctx, w->data, sz, w->type, w->rows, w->cols);
+    if (!w->gpu_buf) return -1;
+    return 0;
+}
+
+// Helper: release GPU buffer for a single BnQWeight.
+static void release_qweight(BnGPUBackend *gpu, BnQWeight *w) {
+    if (w->gpu_buf) {
+        gpu->buffer_destroy(gpu->ctx, w->gpu_buf);
+        w->gpu_buf = NULL;
+    }
+}
+
+int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
+    if (!model || !gpu || !gpu->buffer_create) return -1;
+    model->gpu = gpu;
+
+    BnWeights *w = &model->weights;
+    int n_layers = model->config.n_layers;
+
+    // Upload output weight
+    if (upload_qweight(gpu, &w->output_weight) != 0) {
+        bn_model_release_gpu(model);
+        return -1;
+    }
+
+    // Upload per-layer weights
+    for (int l = 0; l < n_layers; l++) {
+        BnLayerWeights *lw = &w->layers[l];
+        BnQWeight *weights[] = {
+            &lw->wq, &lw->wk, &lw->wv, &lw->wo,
+            &lw->ffn_gate, &lw->ffn_up, &lw->ffn_down,
+            &lw->wqkv, &lw->wz,
+            &lw->ssm_alpha, &lw->ssm_beta, &lw->ssm_out,
+            &lw->shared_gate, &lw->shared_up, &lw->shared_down,
+        };
+        int n_weights = (int)(sizeof(weights) / sizeof(weights[0]));
+        for (int i = 0; i < n_weights; i++) {
+            if (upload_qweight(gpu, weights[i]) != 0) {
+                bn_model_release_gpu(model);
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+void bn_model_release_gpu(BnModel *model) {
+    if (!model || !model->gpu) return;
+    BnGPUBackend *gpu = model->gpu;
+    BnWeights *w = &model->weights;
+    int n_layers = model->config.n_layers;
+
+    release_qweight(gpu, &w->output_weight);
+
+    if (w->layers) {
+        for (int l = 0; l < n_layers; l++) {
+            BnLayerWeights *lw = &w->layers[l];
+            BnQWeight *weights[] = {
+                &lw->wq, &lw->wk, &lw->wv, &lw->wo,
+                &lw->ffn_gate, &lw->ffn_up, &lw->ffn_down,
+                &lw->wqkv, &lw->wz,
+                &lw->ssm_alpha, &lw->ssm_beta, &lw->ssm_out,
+                &lw->shared_gate, &lw->shared_up, &lw->shared_down,
+            };
+            int n_weights = (int)(sizeof(weights) / sizeof(weights[0]));
+            for (int i = 0; i < n_weights; i++)
+                release_qweight(gpu, weights[i]);
+        }
+    }
+
+    model->gpu = NULL;
 }
 
 // #8: Bounds-check token before accessing embedding table

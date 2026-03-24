@@ -1,5 +1,6 @@
 #include "transformer_internal.h"
 #include "quant_internal.h"
+#include "gpu_backend.h"
 #include "moe.h"
 #include "session.h"
 #include "platform.h"
@@ -194,7 +195,7 @@ static void forward_ssm_block(BnModel *m, BnSession *sess, BnLayerWeights *lw, i
             { qkv, &lw->wqkv },
             { z,   &lw->wz   },
         };
-        bn_quant_matvec_batch(tasks, 2, s->xb, s->x_q, m->pool);
+        bn_quant_matvec_batch_gpu(tasks, 2, s->xb, s->x_q, m->pool, m->gpu);
     }
     BL_ACC(bl_matvec_qkv_us);
 
@@ -230,7 +231,7 @@ static void forward_ssm_block(BnModel *m, BnSession *sess, BnLayerWeights *lw, i
             { alpha_arr, &lw->ssm_alpha },
             { beta_arr,  &lw->ssm_beta  },
         };
-        bn_quant_matvec_batch(ab, 2, s->xb, s->x_q, m->pool);
+        bn_quant_matvec_batch_gpu(ab, 2, s->xb, s->x_q, m->pool, m->gpu);
     }
     for (int h = 0; h < num_v_heads; h++) {
         float dt = alpha_arr[h] + lw->ssm_dt_bias[h];
@@ -265,7 +266,7 @@ static void forward_ssm_block(BnModel *m, BnSession *sess, BnLayerWeights *lw, i
     // 10. Output projection: out[value_dim] → xb[dim]
     {
         BnMatvecTask proj[1] = {{ s->xb, &lw->ssm_out }};
-        bn_quant_matvec_batch(proj, 1, out, s->x_q, m->pool);
+        bn_quant_matvec_batch_gpu(proj, 1, out, s->x_q, m->pool, m->gpu);
     }
     BL_ACC(bl_matvec_qkv_us);
 }
@@ -286,7 +287,7 @@ static void forward_ffn_block(BnModel *m, BnSession *sess, BnLayerWeights *lw) {
                 { s->hb,  &lw->ffn_gate },
                 { s->hb2, &lw->ffn_up   },
             };
-            bn_quant_matvec_batch(ffn, 2, s->xb, s->x_q, m->pool);
+            bn_quant_matvec_batch_gpu(ffn, 2, s->xb, s->x_q, m->pool, m->gpu);
         }
 
         if (c->act_type == 1) {
@@ -331,7 +332,7 @@ static void forward_ffn_block(BnModel *m, BnSession *sess, BnLayerWeights *lw) {
     } else {
         {
             BnMatvecTask ffn[1] = {{ s->hb, &lw->ffn_up }};
-            bn_quant_matvec_batch(ffn, 1, s->xb, s->x_q, m->pool);
+            bn_quant_matvec_batch_gpu(ffn, 1, s->xb, s->x_q, m->pool, m->gpu);
         }
 
         if (c->act_type == 1) {
@@ -359,7 +360,7 @@ static void forward_ffn_block(BnModel *m, BnSession *sess, BnLayerWeights *lw) {
 
     {
         BnMatvecTask down[1] = {{ s->xb, &lw->ffn_down }};
-        bn_quant_matvec_batch(down, 1, s->hb, s->x_q, m->pool);
+        bn_quant_matvec_batch_gpu(down, 1, s->hb, s->x_q, m->pool, m->gpu);
     }
 
     residual_add(s->x, s->xb, dim);
@@ -414,12 +415,12 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                 float *k_tmp = s->hb2;
                 float *v_tmp = s->hb2 + kv_dim;
                 BnMatvecTask q_task[1] = {{ q_full, &lw->wq }};
-                bn_quant_matvec_batch(q_task, 1, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch_gpu(q_task, 1, s->xb, s->x_q, m->pool, m->gpu);
                 BnMatvecTask kv[2] = {
                     { k_tmp, &lw->wk },
                     { v_tmp, &lw->wv },
                 };
-                bn_quant_matvec_batch(kv, 2, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
                 BL_ACC(bl_matvec_qkv_us);
 
                 for (int h = 0; h < n_heads; h++)
@@ -464,12 +465,12 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                 float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
                 float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
                 BnMatvecTask q_task[1] = {{ q_full, &lw->wq }};
-                bn_quant_matvec_batch(q_task, 1, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch_gpu(q_task, 1, s->xb, s->x_q, m->pool, m->gpu);
                 BnMatvecTask kv[2] = {
                     { key_cache_row,   &lw->wk },
                     { value_cache_row, &lw->wv },
                 };
-                bn_quant_matvec_batch(kv, 2, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
 
                 for (int h = 0; h < n_heads; h++)
                     memcpy(s->q + h * head_size,
@@ -532,7 +533,7 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                 rmsnorm(s->xb, s->xb, lw->attn_sub_norm, dim, c->norm_eps);
             {
                 BnMatvecTask wo[1] = {{ s->xb2, &lw->wo }};
-                bn_quant_matvec_batch(wo, 1, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch_gpu(wo, 1, s->xb, s->x_q, m->pool, m->gpu);
             }
             BL_ACC(bl_matvec_qkv_us);
             residual_add(s->x, s->xb2, dim);
@@ -548,7 +549,7 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
             // Q matvec: xb[dim] → q[q_dim]
             {
                 BnMatvecTask q_task[1] = {{ s->q, &lw->wq }};
-                bn_quant_matvec_batch(q_task, 1, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch_gpu(q_task, 1, s->xb, s->x_q, m->pool, m->gpu);
             }
             // K/V matvec: xb[dim] → kv_dim
             {
@@ -556,7 +557,7 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                     { key_cache_row,   &lw->wk },
                     { value_cache_row, &lw->wv },
                 };
-                bn_quant_matvec_batch(kv, 2, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
             }
 
             if (lw->q_norm)
@@ -597,7 +598,7 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                 rmsnorm(s->xb, s->xb, lw->attn_sub_norm, q_dim, c->norm_eps);
             {
                 BnMatvecTask wo[1] = {{ s->xb2, &lw->wo }};
-                bn_quant_matvec_batch(wo, 1, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch_gpu(wo, 1, s->xb, s->x_q, m->pool, m->gpu);
             }
             residual_add(s->x, s->xb2, dim);
 
@@ -613,7 +614,7 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                     { k_tmp, &lw->wk },
                     { v_tmp, &lw->wv },
                 };
-                bn_quant_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch_gpu(qkv, 3, s->xb, s->x_q, m->pool, m->gpu);
                 BL_ACC(bl_matvec_qkv_us);
 
                 if (lw->q_bias) for (int i = 0; i < dim; i++) s->q[i] += lw->q_bias[i];
@@ -663,7 +664,7 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                     { key_cache_row,   &lw->wk },
                     { value_cache_row, &lw->wv },
                 };
-                bn_quant_matvec_batch(qkv, 3, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch_gpu(qkv, 3, s->xb, s->x_q, m->pool, m->gpu);
                 BL_ACC(bl_matvec_qkv_us);
 
                 if (lw->q_bias) for (int i = 0; i < dim; i++) s->q[i] += lw->q_bias[i];
@@ -709,7 +710,7 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                 rmsnorm(s->xb, s->xb, lw->attn_sub_norm, dim, c->norm_eps);
             {
                 BnMatvecTask wo[1] = {{ s->xb2, &lw->wo }};
-                bn_quant_matvec_batch(wo, 1, s->xb, s->x_q, m->pool);
+                bn_quant_matvec_batch_gpu(wo, 1, s->xb, s->x_q, m->pool, m->gpu);
             }
             BL_ACC(bl_matvec_qkv_us);
             residual_add(s->x, s->xb2, dim);
@@ -869,13 +870,13 @@ static float *forward_logits(BnModel *m, BnSession *sess) {
         }
     }
     else if (w->output_weight.data) {
-        bn_quant_matvec(s->logits, &w->output_weight, s->x, s->x_q, m->pool);
+        bn_quant_matvec_gpu(s->logits, &w->output_weight, s->x, s->x_q, m->pool, m->gpu);
     }
     // Tied Q4_0/Q8_0/Q6_K embeddings: use quant matvec
     else if (w->emb_type == BN_GGUF_TENSOR_Q4_0 || w->emb_type == BN_GGUF_TENSOR_Q8_0 ||
              w->emb_type == BN_GGUF_TENSOR_Q6_K) {
-        BnQWeight tied = { w->token_embedding, w->emb_type, c->vocab_size, dim, 1.0f, NULL, NULL };
-        bn_quant_matvec(s->logits, &tied, s->x, s->x_q, m->pool);
+        BnQWeight tied = { w->token_embedding, w->emb_type, c->vocab_size, dim, 1.0f, NULL, NULL, NULL };
+        bn_quant_matvec_gpu(s->logits, &tied, s->x, s->x_q, m->pool, m->gpu);
     }
     // Tied F16 embeddings: logits = token_embedding^T @ x
     else if (w->emb_type == BN_GGUF_TENSOR_F16) {
