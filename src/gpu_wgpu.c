@@ -688,10 +688,21 @@ BnGPUBackend *bn_gpu_wgpu_create(const char *shader_dir)
     }
     ctx->adapter = areq.adapter;
 
-    /* Request device (default limits — wgpu-native v27 provides large buffers by default) */
+    /* Request device with adapter's limits + increased buffer sizes */
     DeviceReq dreq = {0};
+    WGPULimits limits = {0};
+    WGPUStatus lim_status = wgpuAdapterGetLimits(ctx->adapter, &limits);
+    if (lim_status != WGPUStatus_Success) {
+        fprintf(stderr, "[bn:gpu:wgpu] failed to get adapter limits\n");
+    }
+    /* Override buffer sizes to allow large weight tensors (up to 2GB) */
+    if (limits.maxStorageBufferBindingSize < (uint64_t)2u * 1024 * 1024 * 1024)
+        limits.maxStorageBufferBindingSize = (uint64_t)2u * 1024 * 1024 * 1024;
+    if (limits.maxBufferSize < (uint64_t)2u * 1024 * 1024 * 1024)
+        limits.maxBufferSize = (uint64_t)2u * 1024 * 1024 * 1024;
     WGPUDeviceDescriptor dev_desc = {
         .label = sv("bn_device"),
+        .requiredLimits = &limits,
         .uncapturedErrorCallbackInfo = { .callback = on_uncaptured_error },
         .deviceLostCallbackInfo = { .callback = on_device_lost },
     };

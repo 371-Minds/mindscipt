@@ -10,6 +10,9 @@
 #include "session.h"
 #include "prompt_cache.h"
 #include "sh_log.h"
+#ifdef BN_ENABLE_GPU
+#include "gpu_wgpu.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +48,8 @@ typedef struct {
     const char *draft_path; // --draft <model.gguf> for speculative decoding
     int draft_k;        // --draft-k: number of draft tokens (default 5)
     int threads;        // 0 = auto-detect
+    int gpu;            // use GPU backend for matvec (requires BN_ENABLE_GPU)
+    const char *shader_dir; // --shader-dir for GPU WGSL shaders
 } CLIArgs;
 
 static void print_usage(const char *prog) {
@@ -148,6 +153,10 @@ static CLIArgs parse_args(int argc, char **argv) {
         } else if (strcmp(argv[i], "--repeat-penalty") == 0 && i + 1 < argc) {
             args.repeat_penalty = parse_float(argv[++i], "--repeat-penalty");
             args.repeat_set = 1;
+        } else if (strcmp(argv[i], "--gpu") == 0) {
+            args.gpu = 1;
+        } else if (strcmp(argv[i], "--shader-dir") == 0 && i + 1 < argc) {
+            args.shader_dir = argv[++i];
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -282,6 +291,31 @@ int main(int argc, char **argv) {
     } else if (n_workers > 0) {
         SH_LOG_WARN("Failed to create thread pool, running single-threaded");
     }
+
+    // GPU backend (optional)
+#ifdef BN_ENABLE_GPU
+    if (args.gpu) {
+        const char *sd = args.shader_dir ? args.shader_dir : "shaders/";
+        BnGPUBackend *gpu = bn_gpu_wgpu_create(sd);
+        if (gpu) {
+            double gpu_t0 = bn_platform_time_ms();
+            if (bn_model_upload_weights(&model, gpu) == 0) {
+                char ms[16];
+                snprintf(ms, sizeof(ms), "%.0f", bn_platform_time_ms() - gpu_t0);
+                SH_LOG_INFO("GPU weights uploaded", "ms", ms);
+            } else {
+                SH_LOG_WARN("GPU weight upload failed, falling back to CPU");
+                bn_gpu_wgpu_destroy(gpu);
+            }
+        } else {
+            SH_LOG_WARN("No GPU available, falling back to CPU");
+        }
+    }
+#else
+    if (args.gpu) {
+        SH_LOG_WARN("--gpu requires BN_ENABLE_GPU=1 build, falling back to CPU");
+    }
+#endif
 
     BnSession *session = bn_session_create(&model, NULL);
     if (!session) {
