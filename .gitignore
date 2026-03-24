@@ -4,6 +4,8 @@ src/*.o
 src/quant/*.o
 src/transformer/*.o
 *.dSYM/
+
+# Test binaries
 test_gguf
 test_quant
 test_tokenizer
@@ -15,16 +17,45 @@ test_arena
 test_q2k
 test_prefill
 test_kv_f16
-dump_model
+test_ssm
+test_gguf_fuzz
+test_moe
+test_generate
+test_session
+test_prompt_cache
+test_gpu_backend
+test_gpu_wgpu
+test_gpu_validate
+bitnet_test_*
+test_*
+
+# Bench binaries
 bench_kernels
+bench_scalar
+bench_avx2
+bench_layers
 bench/*.wasm
 bench/*.js
+
+# PGO artifacts
 bitnet_prof*
-__pycache__/
+default.profraw
+default.profdata
+src/*.gcda
+src/quant/*.gcda
+src/transformer/*.gcda
 
 # WASM build output
 wasm/bitnet.js
 wasm/bitnet.wasm
+
+# Vendor dependencies
+vendor/
+
+# Model files (large)
+*.gguf
+model/
+models/
 
 # OS files
 .DS_Store
@@ -37,8 +68,5 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Model files (large)
-*.gguf
-model/
-models/
-vendor/
+# Python
+__pycache__/

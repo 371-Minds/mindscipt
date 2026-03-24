@@ -15,12 +15,16 @@ Zero dependencies beyond libc and libm, four SIMD backends, compiles to WASM, an
 - **Hybrid SSM + Attention** — Gated DeltaNet SSM layers (conv1d, SiLU, delta rule recurrence) alongside standard GQA attention layers
 - **Flash GQA attention** — online softmax with KV-head grouping, single-pass over KV cache
 - **Optional F16 KV cache** — `--kv16` halves attention DRAM bandwidth with minimal precision loss
-- **4 SIMD backends** — ARM NEON/SDOT, AVX2, WASM SIMD128, scalar fallback (auto-selected at compile time)
+- **5 SIMD backends** — ARM NEON/SDOT, AVX2, WASM SIMD128, scalar fallback (auto-selected at compile time), plus optional WebGPU
 - **Mixture of Experts (MoE)** — sparse MoE with top-K routing, batched expert dispatch, 3 I/O modes (mmap, pread+LRU cache, madvise)
 - **Pthread thread pool** — persistent workers with atomic work-stealing dispatch
 - **BPE tokenizer** — loaded directly from GGUF metadata
 - **Sampling** — greedy (argmax), multinomial, and nucleus (top-p)
 - **Native mmap** — zero-copy model loading on macOS/Linux
+- **Optional GPU backend** — WebGPU via wgpu-native, 31 WGSL shaders, single-submit forward pass
+- **Prompt caching** — shared KV prefix cache with longest-prefix matching and FIFO eviction
+- **SSE streaming** — OpenAI-compatible server-sent events formatter
+- **Logprobs API** — top-K log probabilities from logits
 - **WASM build** — runs in the browser via Emscripten with Web Worker streaming
 
 ## Quantization Formats
@@ -73,16 +77,21 @@ Zero dependencies beyond libc and libm, four SIMD backends, compiles to WASM, an
 |---------|----------|-------|
 | ARM NEON/SDOT | Apple Silicon, ARMv8 | SDOT int8 matvec, native FP16 logits |
 | AVX2 | x86-64 (Haswell+) | DPBUSD int8 matvec, F16C conversion |
-| WASM SIMD128 | Browser (Emscripten) | 128-bit vector ops |
+| WASM SIMD128 | Browser (Emscripten) | Relaxed SIMD SDOT for all types |
 | Scalar | Any C11 compiler | Portable fallback |
+| WebGPU | GPU (wgpu-native) | 31 WGSL shaders, optional `BN_ENABLE_GPU=1` |
 
-Auto-selected at compile time based on target architecture.
+CPU backends auto-selected at compile time based on target architecture. GPU backend is opt-in.
 
 ## Quick Start
 
 ```bash
-# Build
+# Build (CPU)
 make
+
+# Build with GPU backend (optional)
+make fetch-wgpu
+make BN_ENABLE_GPU=1
 
 # Run inference
 ./bitnet model.gguf -p "Hello" -n 256
@@ -117,6 +126,7 @@ Usage: ./bitnet <model.gguf> [options]
   --madvise       madvise-guided mmap for MoE (experimental)
   --draft <path>  Draft model for speculative decoding (greedy, same tokenizer required)
   --draft-k <int> Draft tokens per iteration (default: 5)
+  --gpu           Enable GPU inference (requires BN_ENABLE_GPU=1 build)
   -t <int>        Number of threads (default: auto-detect)
 ```
 
@@ -184,10 +194,15 @@ bitnet.c/
 │   ├── iq_tables.h             # IQ codebook lookup tables (shared across backends)
 │   ├── model.h                 # Config, Weights, model loading, session arena helpers
 │   ├── session.h               # BnSession: per-request KV cache + activation buffers
+│   ├── prompt_cache.h          # BnPromptCache: shared KV prefix cache
+│   ├── gpu_backend.h           # BnGPUBackend: GPU compute vtable
+│   ├── gpu_wgpu.h              # wgpu-native WebGPU backend API
 │   ├── transformer.h           # Forward pass public API
 │   ├── transformer_internal.h  # Transformer backend context structs + range function decls
 │   ├── tokenizer.h             # BPE tokenizer API
 │   ├── sampler.h               # Sampling strategies
+│   ├── generate.h              # Library API: generate, prefill, chat, SSE, logprobs
+│   ├── bn_alloc.h              # Vtable allocator (Hull-compatible)
 │   ├── threadpool.h            # Persistent pthread thread pool
 │   ├── simd_helpers.h          # Shared AVX2/WASM SIMD inline helpers
 │   ├── sh_arena.h              # Arena allocator
@@ -204,13 +219,27 @@ bitnet.c/
 │   │   ├── rmsnorm_{neon,avx2,wasm,scalar}.c
 │   │   ├── gqa_{neon,avx2,wasm,scalar}.c
 │   │   └── logits_{neon,avx2,wasm,scalar}.c
-│   ├── model.c                 # GGUF → Config/Weights mapping, session arena helpers
+│   ├── model.c                 # GGUF → Config/Weights mapping, GPU weight upload
 │   ├── session.c               # BnSession create/free/reset
+│   ├── prompt_cache.c          # Shared KV prefix cache with FIFO eviction
+│   ├── gpu_wgpu.c              # wgpu-native WebGPU backend (optional)
+│   ├── generate.c              # Library API: generate, prefill, chat, SSE, logprobs
 │   ├── transformer.c           # Forward pass: layer loop, FFN, dispatch
 │   ├── tokenizer.c             # BPE encode/decode from GGUF vocab
 │   ├── sampler.c               # Argmax, multinomial, top-p sampling
 │   ├── threadpool.c            # Thread pool with condvar dispatch
 │   └── main.c                  # CLI entry point
+├── shaders/                    # WGSL shaders for WebGPU backend
+│   ├── {format}_matvec.wgsl    # 23 matvec shaders (all quant types)
+│   ├── rmsnorm.wgsl            # Forward-pass shaders
+│   ├── rope.wgsl
+│   ├── gqa_scores.wgsl
+│   ├── gqa_combine.wgsl
+│   ├── silu_gate.wgsl
+│   ├── relu2_gate.wgsl
+│   ├── residual_add.wgsl
+│   ├── softmax.wgsl
+│   └── bias_add.wgsl
 ├── test/                       # Assert-based unit tests (synthetic data, no model needed)
 ├── wasm/                       # Emscripten WASM build + browser demo
 ├── docs/
@@ -226,23 +255,27 @@ Each module depends only on those above it:
 ```
 platform
     ↓
-  gguf        ← standalone, testable in isolation
+  gguf           ← standalone, testable in isolation
     ↓
-  quant       ← standalone, testable with synthetic data
+  quant          ← standalone, testable with synthetic data
     ↓
-  model       ← depends on gguf + quant
+  model          ← depends on gguf + quant
     ↓
-tokenizer     ← depends on gguf
+tokenizer        ← depends on gguf
     ↓
- session      ← depends on model (per-request KV cache + buffers)
+ session         ← depends on model (per-request KV cache + buffers)
     ↓
-transformer   ← depends on model + session + quant
+transformer      ← depends on model + session + quant
     ↓
- sampler      ← standalone, testable in isolation
+ sampler         ← standalone, testable in isolation
     ↓
- generate     ← depends on model + session + transformer + tokenizer + sampler
+prompt_cache     ← depends on model + session
     ↓
-  main        ← wires everything together
+ generate        ← depends on model + session + transformer + tokenizer + sampler
+    ↓
+gpu_wgpu         ← optional GPU backend (BN_ENABLE_GPU=1)
+    ↓
+  main           ← wires everything together
 ```
 
 ## Library API
@@ -281,6 +314,14 @@ bn_model_free(&model);
 
 Sessions are not thread-safe individually, but different sessions can be used from different threads concurrently since they share only immutable model data.
 
+### Prompt Caching
+
+`BnPromptCache` stores KV prefixes with longest-prefix matching and FIFO eviction, enabling fast warm-start for repeated prompt prefixes across sessions.
+
+### SSE Streaming & Logprobs
+
+`bn_format_sse_chunk` / `bn_format_sse_done` format tokens as OpenAI-compatible server-sent events. `bn_logprobs_compute` returns top-K log probabilities from logits.
+
 ## WASM Build
 
 Requires [Emscripten](https://emscripten.org/):
@@ -290,6 +331,20 @@ Requires [Emscripten](https://emscripten.org/):
 # Produces wasm/bitnet.js + wasm/bitnet.wasm
 # Open wasm/index.html in a browser
 ```
+
+## GPU Backend (WebGPU)
+
+Optional GPU inference via [wgpu-native](https://github.com/gfx-rs/wgpu-native). Requires `BN_ENABLE_GPU=1` at build time.
+
+```bash
+make fetch-wgpu                          # download wgpu-native v27
+make BN_ENABLE_GPU=1                     # build with GPU support
+./bitnet model.gguf -p "Hello" --gpu     # run on GPU
+```
+
+The GPU backend uses 31 WGSL shaders (23 matvec covering all quantization formats + 8 forward-pass operations) with a single-submit forward pass — one command buffer per token. The `BnGPUBackend` vtable in `include/gpu_backend.h` abstracts GPU compute, with the wgpu-native implementation in `src/gpu_wgpu.c`.
+
+For Hull integration, set `WGPU_LIB_DIR` to avoid double-vendoring the wgpu-native library.
 
 ## Model Support
 
@@ -324,7 +379,7 @@ Measured on Apple M1 Max (8 P-cores, 32 GB), PGO build, greedy decoding, 8 threa
 | Qwen2.5-3B-Instruct | 1.7 GB | Q4_0 | **30 tok/s** | 40 tok/s | 84 tok/s |
 | Llama3-8B-1.58 | 3.4 GB | TQ1_0 (ternary) | **14.5 tok/s** | 19 tok/s | — |
 
-bitnet.c is a pure CPU engine with no GPU backend. On ternary models (TQ1_0) it reaches **76% of llama.cpp CPU** — close to parity. On standard quants (Q4_0) it reaches **75% of llama.cpp CPU** using multi-row interleaved kernels (4 output rows per pass, amortizing activation loads). llama.cpp does not support TQ1_0 on Metal.
+CPU performance: on ternary models (TQ1_0) it reaches **76% of llama.cpp CPU** — close to parity. On standard quants (Q4_0) it reaches **75% of llama.cpp CPU** using multi-row interleaved kernels (4 output rows per pass, amortizing activation loads). llama.cpp does not support TQ1_0 on Metal. An optional WebGPU backend (`--gpu`) is available for GPU-accelerated inference.
 
 ## Design Decisions
 
@@ -335,11 +390,11 @@ llama.cpp supports dozens of quantization formats, model architectures, GPU back
 bitnet.c exists as the opposite tradeoff:
 
 - **Embeddable.** ~8,000 lines of C11, zero dependencies. Compiles to WASM and runs in a browser. Link it into your app as a static library.
-- **No GPU backend.** For models that fit in RAM, CPU inference with good SIMD kernels is fast enough and avoids GPU dispatch overhead, driver dependencies, and framework complexity.
+- **Optional GPU, no framework lock-in.** An optional WebGPU backend via wgpu-native provides GPU acceleration without CUDA/Metal/Vulkan SDK dependencies. CPU inference with SIMD kernels remains the default and is fast enough for models that fit in RAM.
 - **No abstraction layers.** llama.cpp routes tensor operations through GGML's graph-based backend abstraction. bitnet.c calls the matvec kernel directly — the forward pass is a flat loop over layers with inline SIMD.
 - **Fast builds.** Clean build under 3 seconds. No CMake, no Python, no package managers.
 
-**When to use llama.cpp/Ollama instead:** GPU inference, models too large for CPU, OpenAI-compatible API serving, or multi-model management.
+**When to use llama.cpp/Ollama instead:** Models too large for RAM, CUDA/Metal-specific optimizations, OpenAI-compatible API serving, or multi-model management.
 
 ### Why C
 

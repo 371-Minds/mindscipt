@@ -147,22 +147,35 @@ Only **reducing data volume** helps at this point:
 - [x] AVX2 Q4_K/Q6_K fused matmul (batch prefill)
 - [x] VLA guards + SIMD alignment guards in all GQA backends
 
-## Future Work
+## Phase 11: GPU Compute Backend (WebGPU) — Done
 
-### GPU Compute Backend
-- [ ] `BnGPUBackend` vtable (matvec, matmul, buffer upload/download)
-- [ ] GPU dispatch integration in `quant/dispatch.c`
-- [ ] WGSL compute shaders for I2_S, Q4_0, Q4_K, Q6_K matvec
-- [ ] `bn_model_upload_weights` for GPU buffer management
-- See [docs/hull-integration.md](hull-integration.md) for the full design
+- [x] `BnGPUBackend` vtable (matvec, matmul, matvec_batch, execute, init_activations)
+- [x] GPU dispatch integration in `quant/dispatch.c` (`bn_quant_matvec_gpu`, `bn_quant_matvec_batch_gpu`)
+- [x] 22 WGSL matvec shaders for all quant types (I2_S through IQ2_S + F16/F32)
+- [x] 9 WGSL forward-pass shaders (rmsnorm, rope, gqa_scores, softmax, gqa_combine, silu_gate, relu2_gate, residual_add, bias_add)
+- [x] `bn_model_upload_weights` / `bn_model_release_gpu` for GPU buffer management
+- [x] Norm weight + bias + tied embedding GPU upload
+- [x] Persistent scratch buffers + batched command encoding
+- [x] Single-submit GPU-resident forward pass (one command buffer per token)
+- [x] `--gpu` CLI flag, `make BN_ENABLE_GPU=1`, `make fetch-wgpu`
+- [x] GPU validation benchmark (20/20 matvec pass, 3/3 matmul pass)
+- [x] wgpu-native vendoring with SHA-256 verification
+- See [docs/hull-integration.md](hull-integration.md) for the Hull integration design
 
-### Library API
-- [ ] SSE chunk formatter (`bn_format_sse_chunk` for OpenAI-compatible streaming)
-- [ ] Hull WASM AoT adapter (`hull_process` entry point)
+### Library API — Done
+- [x] SSE chunk formatter (`bn_format_sse_chunk`, `bn_format_sse_done`)
 - [x] Logprobs API (`bn_logprobs_compute`)
 - [x] Multi-turn chat formatting (`bn_chat_format_messages`)
 - [x] Stop strings (`BnStopStrings`)
 - [x] Allocator vtable (`BnAllocator`, compatible with Keel's `KlAllocator`)
+
+## Future Work
+
+### GPU Optimization
+- [ ] Improve GPU forward-pass shader precision (match CPU output beyond first token)
+- [ ] FP16 KV cache on GPU
+- [ ] Sub-norms, Q/K norms, gated-Q support in GPU forward path
+- [ ] MoE expert dispatch on GPU
 
 ### Extended Model Support
 - [ ] LoRA adapter loading

@@ -16,7 +16,7 @@ docs/      — documentation and roadmap
 
 Modules have strict, one-directional dependencies. When modifying a module, only its own files and downstream consumers should be affected. Never introduce circular dependencies.
 
-**Dependency order**: platform → gguf → quant → model → tokenizer → moe → session → transformer → sampler → threadpool → generate → main
+**Dependency order**: platform → gguf → quant → model → tokenizer → moe → session → transformer → sampler → threadpool → bn_alloc → prompt_cache → generate → gpu_wgpu (optional) → main
 
 ## Agent Workflow
 
@@ -59,12 +59,13 @@ Modules have strict, one-directional dependencies. When modifying a module, only
 - Memory management: `_init`/`_free` pairs; caller owns the struct, module fills it. Exception: `BnSession` is heap-allocated via `bn_session_create`/`bn_session_free`.
 - Error handling: return -1 or NULL on failure, print to stderr
 - No global mutable state in library modules (only in main.c and wasm/api.c)
-- **Model/Session split**: `BnModel` is shared and immutable after load (config, weights, file, pool, MoE I/O). `BnSession` holds per-request mutable state (KV cache, activation buffers, MoE compute buffers, pos). All forward pass and generation functions take both `BnModel *` and `BnSession *`.
+- **Model/Session split**: `BnModel` is shared and immutable after load (config, weights, file, pool, MoE I/O, GPU backend). `BnSession` holds per-request mutable state (KV cache, activation buffers, MoE compute buffers, pos). All forward pass and generation functions take both `BnModel *` and `BnSession *`.
+- **GPU vtable**: `BnGPUBackend` in `include/gpu_backend.h` abstracts GPU compute (buffer ops, matvec, matmul, execute). The wgpu-native implementation is in `src/gpu_wgpu.c`. GPU code is gated by `BN_ENABLE_GPU`.
 - Platform-specific code gated by `#ifdef __EMSCRIPTEN__`
 
 ## Performance Considerations
 
-- 4 SIMD backends: NEON SDOT, AVX2, WASM SIMD128, scalar fallback (auto-selected at compile time)
+- 5 SIMD backends: NEON SDOT, AVX2, WASM SIMD128, scalar fallback (auto-selected at compile time), WebGPU (optional)
 - Q8_K x quantization for Q4_K/Q6_K: integer accumulation, unsigned nibbles, bsums correction
 - MoE expert LRU cache with open-addressing hash + intrusive LRU list (pread mode)
 - Atomic work-stealing thread dispatch for load balancing
@@ -81,6 +82,7 @@ Modules have strict, one-directional dependencies. When modifying a module, only
 - `--flash` — flash attention (online softmax)
 - `--kv16` — FP16 KV cache
 - `--no-prefill` — disable batch prefill
+- `--gpu` — enable GPU inference (requires `BN_ENABLE_GPU=1` build)
 - `-t N` — thread count
 
 ## WASM Specifics
