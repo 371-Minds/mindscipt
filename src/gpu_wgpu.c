@@ -585,7 +585,7 @@ static int wgpu_matvec(void *vctx, float *out, void *W_buf, const float *x,
 
         wgpuComputePassEncoderSetPipeline(pass, ctx->pipelines[type]);
         wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, (uint32_t)rows, 1, 1);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, ((uint32_t)rows + 31u) / 32u, 1, 1);
         wgpuComputePassEncoderEnd(pass);
 
         /* Copy out_buf → staging_buf in the same command buffer */
@@ -705,7 +705,7 @@ static int wgpu_matmul(void *vctx, float *out, void *W_buf, const float *X,
         wgpuComputePassEncoderSetPipeline(pass, ctx->pipelines[type]);
         wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
         wgpuComputePassEncoderDispatchWorkgroups(
-            pass, (uint32_t)rows, (uint32_t)n_tokens, 1);
+            pass, ((uint32_t)rows + 31u) / 32u, (uint32_t)n_tokens, 1);
         wgpuComputePassEncoderEnd(pass);
 
         /* Copy out_buf → staging_buf in the same command buffer */
@@ -862,7 +862,7 @@ static int wgpu_matvec_batch(void *vctx, const BnGPUMatvecOp *ops, int n_ops,
 
         wgpuComputePassEncoderSetPipeline(pass, ctx->pipelines[op->type]);
         wgpuComputePassEncoderSetBindGroup(pass, 0, bind_groups[i], 0, NULL);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, (uint32_t)op->rows, 1, 1);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, ((uint32_t)op->rows + 31u) / 32u, 1, 1);
         wgpuComputePassEncoderEnd(pass);
 
         /* Copy out_buf[0..out_size] → staging[staging_offset..] */
@@ -1349,17 +1349,21 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
         /* Compute workgroup count */
         uint32_t wg_x = 1, wg_y = 1;
         switch (op->shader) {
-        case BN_GPU_SHADER_MATVEC:
+        case BN_GPU_SHADER_MATVEC: {
+            /* Tiled dispatch: TILE_ROWS=32 rows per workgroup */
+            uint32_t tile_rows = 32;
             if (op->p[3] > 0) {
-                /* Row tiling: extra = wg_x per slice, rows split across Y */
+                /* Large-vocab tiling: extra = wg_x per slice, rows split across Y */
+                uint32_t tiled_rows = ((uint32_t)op->rows + tile_rows - 1) / tile_rows;
                 wg_x = op->p[3];
-                wg_y = ((uint32_t)op->rows + op->p[3] - 1) / op->p[3];
+                wg_y = (tiled_rows + op->p[3] - 1) / op->p[3];
             } else {
-                wg_x = (uint32_t)op->rows;
+                wg_x = ((uint32_t)op->rows + tile_rows - 1) / tile_rows;
                 wg_y = op->p[2];  /* n_tokens */
                 if (wg_y == 0) wg_y = 1;
             }
             break;
+        }
         case BN_GPU_SHADER_RMSNORM:
             wg_x = 1;  /* single workgroup */
             break;

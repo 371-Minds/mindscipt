@@ -1,5 +1,14 @@
-// Q3_K matvec — 3-bit k-quant, 256 elements per block, 110 bytes/block
+// Q3_K TILED matvec — 3-bit k-quant, 256 elements per block, 110 bytes/block
 // Layout: hmask[32] (bytes 0-31), qs[64] (bytes 32-95), scales[12] (bytes 96-107), d FP16 (bytes 108-109)
+//
+// Tiled: TILE_ROWS=32, 8 threads per row, synchronous block iteration with shared x_cache.
+// Dispatch: (ceil(rows / TILE_ROWS), n_tokens, 1)
+
+const TILE_ROWS: u32 = 32u;
+const WG_SIZE: u32 = 256u;
+const THREADS_PER_ROW: u32 = 8u;
+const QK_K: u32 = 256u;
+const BLOCK_BYTES: u32 = 110u;
 
 struct Uniforms { rows: u32, cols: u32, n_tokens: u32, extra: u32 }
 
@@ -7,6 +16,9 @@ struct Uniforms { rows: u32, cols: u32, n_tokens: u32, extra: u32 }
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> u: Uniforms;
+
+var<workgroup> x_cache: array<f32, 256>;
+var<workgroup> reduce_buf: array<f32, 256>;
 
 fn fp16_to_f32(bits: u32) -> f32 {
     let sign = (bits >> 15u) & 1u;
@@ -16,18 +28,6 @@ fn fp16_to_f32(bits: u32) -> f32 {
     let f_exp = f32(i32(exp) - 15 + 127);
     let f_bits = (sign << 31u) | (u32(f_exp) << 23u) | (mant << 13u);
     return bitcast<f32>(f_bits);
-}
-
-var<workgroup> shared_data: array<f32, 256>;
-
-fn workgroup_reduce(lid: u32, val: f32) -> f32 {
-    shared_data[lid] = val;
-    workgroupBarrier();
-    for (var s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) { shared_data[lid] += shared_data[lid + s]; }
-        workgroupBarrier();
-    }
-    return shared_data[0];
 }
 
 fn read_u8(offset: u32) -> u32 {
@@ -41,23 +41,7 @@ fn read_u16(offset: u32) -> u32 {
     return (word >> shift) & 0xFFFFu;
 }
 
-fn read_u32(offset: u32) -> u32 {
-    // Assumes 4-byte aligned offset
-    return weights[offset >> 2u];
-}
-
-const BLOCK_BYTES: u32 = 110u;
-const QK_K: u32 = 256u;
-
-// Unpack 12 bytes of packed scales into 16 6-bit values.
-// Mirrors bn_q3k_unpack_scales from quant_internal.h:
-//   aux[2] = ((aux[0] >> 4) & 0x0f0f0f0f) | (((tmp >> 4) & 0x03030303) << 4)
-//   aux[3] = ((aux[1] >> 4) & 0x0f0f0f0f) | (((tmp >> 6) & 0x03030303) << 4)
-//   aux[0] = (aux[0] & 0x0f0f0f0f)         | (((tmp >> 0) & 0x03030303) << 4)
-//   aux[1] = (aux[1] & 0x0f0f0f0f)         | (((tmp >> 2) & 0x03030303) << 4)
-// Result is 16 bytes (aux[0..3]), each byte is a 6-bit scale.
 fn unpack_q3k_scale(scales_base: u32, idx: u32) -> u32 {
-    // Read 12 bytes as 3 u32s (byte-aligned reads)
     let b0 = read_u8(scales_base + 0u);
     let b1 = read_u8(scales_base + 1u);
     let b2 = read_u8(scales_base + 2u);
@@ -82,7 +66,6 @@ fn unpack_q3k_scale(scales_base: u32, idx: u32) -> u32 {
     r[0] = (aux0 & 0x0F0F0F0Fu)          | (((tmp >> 0u) & 0x03030303u) << 4u);
     r[1] = (aux1 & 0x0F0F0F0Fu)          | (((tmp >> 2u) & 0x03030303u) << 4u);
 
-    // Extract byte at position idx from the 16-byte result
     let word_idx = idx / 4u;
     let byte_idx = idx % 4u;
     return (r[word_idx] >> (byte_idx * 8u)) & 0x3Fu;
@@ -91,74 +74,81 @@ fn unpack_q3k_scale(scales_base: u32, idx: u32) -> u32 {
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = select(wid.x, wid.x + wid.y * u.extra, u.extra > 0u);
+    let tile_start = select(wid.x * TILE_ROWS, (wid.x + wid.y * u.extra) * TILE_ROWS, u.extra > 0u);
     let token = select(wid.y, 0u, u.extra > 0u);
     let tid = lid.x;
 
-    if (row >= u.rows) { return; }
+    let local_row = tid / THREADS_PER_ROW;
+    let local_elem = tid % THREADS_PER_ROW;
+    let global_row = tile_start + local_row;
 
     let cols = u.cols;
     let n_blocks = cols / QK_K;
-    let row_byte = row * n_blocks * BLOCK_BYTES;
-    let x_off = token * cols;
+    let x_base = token * cols;
+    let row_byte = global_row * n_blocks * BLOCK_BYTES;
 
-    var sum = 0.0f;
+    var acc: f32 = 0.0;
 
-    var bi = tid;
-    while (bi < n_blocks) {
-        let base = row_byte + bi * BLOCK_BYTES;
+    for (var bi = 0u; bi < n_blocks; bi++) {
+        x_cache[tid] = x[x_base + bi * QK_K + tid];
+        workgroupBarrier();
 
-        let hmask_base  = base;         // bytes 0-31
-        let qs_base     = base + 32u;   // bytes 32-95
-        let scales_base = base + 96u;   // bytes 96-107
-        let d = fp16_to_f32(read_u16(base + 108u));
+        if (global_row < u.rows) {
+            let base = row_byte + bi * BLOCK_BYTES;
+            let hmask_base  = base;
+            let qs_base     = base + 32u;
+            let scales_base = base + 96u;
+            let d = fp16_to_f32(read_u16(base + 108u));
 
-        let elem_off = bi * QK_K;
+            // Each thread handles 32 elements (256 / 8)
+            let my_start = local_elem * 32u;
 
-        var is_idx = 0u;
-        var m = 1u; // hmask bit position
-        var out_idx = 0u;
+            for (var i = 0u; i < 32u; i++) {
+                let elem = my_start + i;
+                // Determine half (0 or 1), sub-block position
+                let half = elem / 128u;
+                let in_half = elem % 128u;
+                let sub_block = in_half / 16u; // 0..7
+                let pos = in_half % 16u;
 
-        for (var n = 0u; n < QK_K; n += 128u) {
-            var shift = 0u;
-            let q_start = qs_base + n / 4u;
-            for (var j = 0u; j < 4u; j++) {
-                // First sub-block of 16
-                let sc0 = unpack_q3k_scale(scales_base, is_idx);
-                is_idx++;
-                let dl0 = d * f32(i32(sc0) - 32);
-                for (var l = 0u; l < 16u; l++) {
-                    let low2 = (read_u8(q_start + l) >> shift) & 3u;
-                    let hbit = read_u8(hmask_base + l) & m;
-                    var q3 = i32(low2);
-                    if (hbit == 0u) { q3 -= 4; }
-                    sum += dl0 * f32(q3) * x[x_off + elem_off + out_idx];
-                    out_idx++;
-                }
+                // Scale index
+                let is_idx = half * 8u + sub_block;
+                let sc = unpack_q3k_scale(scales_base, is_idx);
+                let dl = d * f32(i32(sc) - 32);
 
-                // Second sub-block of 16
-                let sc1 = unpack_q3k_scale(scales_base, is_idx);
-                is_idx++;
-                let dl1 = d * f32(i32(sc1) - 32);
-                for (var l = 0u; l < 16u; l++) {
-                    let low2 = (read_u8(q_start + l + 16u) >> shift) & 3u;
-                    let hbit = read_u8(hmask_base + l + 16u) & m;
-                    var q3 = i32(low2);
-                    if (hbit == 0u) { q3 -= 4; }
-                    sum += dl1 * f32(q3) * x[x_off + elem_off + out_idx];
-                    out_idx++;
-                }
+                // 2-bit shift
+                let shift = (sub_block / 2u) * 2u;
 
-                shift += 2u;
-                m <<= 1u;
+                // qs position
+                let q_off = qs_base + half * 32u + (sub_block & 1u) * 16u + pos;
+                let low2 = (read_u8(q_off) >> shift) & 3u;
+
+                // hmask bit: which bit within the byte
+                let hmask_byte_pos = (sub_block & 1u) * 16u + pos;
+                let m = 1u << (half * 4u + sub_block / 2u);
+                let hbit = read_u8(hmask_base + hmask_byte_pos) & m;
+
+                var q3 = i32(low2);
+                if (hbit == 0u) { q3 -= 4; }
+
+                acc += dl * f32(q3) * x_cache[elem];
             }
         }
-
-        bi += 256u;
+        workgroupBarrier();
     }
 
-    let result = workgroup_reduce(tid, sum);
-    if (tid == 0u) {
-        out[token * u.rows + row] = result;
+    reduce_buf[tid] = acc;
+    workgroupBarrier();
+
+    let row_base = local_row * THREADS_PER_ROW;
+    if (local_elem < 4u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 4u]; }
+    workgroupBarrier();
+    if (local_elem < 2u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 2u]; }
+    workgroupBarrier();
+    if (local_elem < 1u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 1u]; }
+    workgroupBarrier();
+
+    if (local_elem == 0u && global_row < u.rows) {
+        out[token * u.rows + global_row] = reduce_buf[row_base];
     }
 }

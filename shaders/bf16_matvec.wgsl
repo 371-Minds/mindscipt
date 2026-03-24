@@ -1,5 +1,13 @@
-// BF16 matvec/matmul — bfloat16 (no block structure)
-// 2 bytes per element, decode: f32 = bitcast<f32>(u32(bf16_bits) << 16u)
+// BF16 TILED matvec — bfloat16 (no block structure)
+// Process in tiles of 256 elements. x_cache is 256 floats.
+//
+// Tiled: TILE_ROWS=32, 8 threads per row, synchronous block iteration with shared x_cache.
+// Dispatch: (ceil(rows / TILE_ROWS), n_tokens, 1)
+
+const TILE_ROWS: u32 = 32u;
+const WG_SIZE: u32 = 256u;
+const THREADS_PER_ROW: u32 = 8u;
+const BLOCK_SIZE: u32 = 256u;
 
 struct Uniforms {
     rows: u32,
@@ -13,19 +21,8 @@ struct Uniforms {
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 
-var<workgroup> shared_data: array<f32, 256>;
-
-fn workgroup_reduce(lid: u32, val: f32) -> f32 {
-    shared_data[lid] = val;
-    workgroupBarrier();
-    for (var s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) {
-            shared_data[lid] += shared_data[lid + s];
-        }
-        workgroupBarrier();
-    }
-    return shared_data[0];
-}
+var<workgroup> x_cache: array<f32, 256>;
+var<workgroup> reduce_buf: array<f32, 256>;
 
 fn bf16_to_f32(bits: u32) -> f32 {
     return bitcast<f32>(bits << 16u);
@@ -34,45 +31,57 @@ fn bf16_to_f32(bits: u32) -> f32 {
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = select(wid.x, wid.x + wid.y * uniforms.extra, uniforms.extra > 0u);
+    let tile_start = select(wid.x * TILE_ROWS, (wid.x + wid.y * uniforms.extra) * TILE_ROWS, uniforms.extra > 0u);
     let token = select(wid.y, 0u, uniforms.extra > 0u);
     let tid = lid.x;
 
-    if (row >= uniforms.rows) {
-        return;
-    }
+    let local_row = tid / THREADS_PER_ROW;
+    let local_elem = tid % THREADS_PER_ROW;
+    let global_row = tile_start + local_row;
 
     let cols = uniforms.cols;
-    // BF16: 2 bytes per element, so each u32 holds 2 elements
+    let blocks_per_row = cols / BLOCK_SIZE;
+    let x_base = token * cols;
+
+    // BF16: 2 bytes per element, packed as u32 (2 values per word)
     // Row offset in u32s: row * cols / 2
-    let row_u32_offset = row * (cols / 2u);
-    let x_offset = token * cols;
+    let row_u32_offset = global_row * (cols / 2u);
 
-    var sum = 0.0f;
+    var acc: f32 = 0.0;
 
-    // Each thread processes elements starting at tid, stepping by 256
-    // Process 2 elements per u32 read
-    var pair_idx = tid;
-    let pairs_per_row = cols / 2u;
-    while (pair_idx < pairs_per_row) {
-        let word = weights[row_u32_offset + pair_idx];
+    for (var b = 0u; b < blocks_per_row; b++) {
+        // All 256 threads load x_cache
+        x_cache[tid] = x[x_base + b * BLOCK_SIZE + tid];
+        workgroupBarrier();
 
-        let lo_bits = word & 0xFFFFu;
-        let hi_bits = (word >> 16u) & 0xFFFFu;
-
-        let v0 = bf16_to_f32(lo_bits);
-        let v1 = bf16_to_f32(hi_bits);
-
-        let elem_idx = pair_idx * 2u;
-        sum += v0 * x[x_offset + elem_idx];
-        sum += v1 * x[x_offset + elem_idx + 1u];
-
-        pair_idx += 256u;
+        if (global_row < uniforms.rows) {
+            // Each thread handles 32 elements (256 / 8)
+            let my_start = local_elem * 32u;
+            for (var i = 0u; i < 32u; i += 2u) {
+                let elem = my_start + i;
+                let pair_idx = (b * BLOCK_SIZE + elem) / 2u;
+                let word = weights[row_u32_offset + pair_idx];
+                let v0 = bf16_to_f32(word & 0xFFFFu);
+                let v1 = bf16_to_f32((word >> 16u) & 0xFFFFu);
+                acc += v0 * x_cache[elem];
+                acc += v1 * x_cache[elem + 1u];
+            }
+        }
+        workgroupBarrier();
     }
 
-    let result = workgroup_reduce(tid, sum);
+    reduce_buf[tid] = acc;
+    workgroupBarrier();
 
-    if (tid == 0u) {
-        out[token * uniforms.rows + row] = result;
+    let row_base = local_row * THREADS_PER_ROW;
+    if (local_elem < 4u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 4u]; }
+    workgroupBarrier();
+    if (local_elem < 2u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 2u]; }
+    workgroupBarrier();
+    if (local_elem < 1u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 1u]; }
+    workgroupBarrier();
+
+    if (local_elem == 0u && global_row < uniforms.rows) {
+        out[token * uniforms.rows + global_row] = reduce_buf[row_base];
     }
 }

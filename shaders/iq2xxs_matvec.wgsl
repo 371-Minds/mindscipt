@@ -1,15 +1,13 @@
-// IQ2_XXS matvec — 2-bit codebook quantization
-// 256-element blocks, 66 bytes each:
-//   d: FP16 (bytes 0-1)
-//   qs[64]: packed grid indices + signs/scales (bytes 2-65), read as 16 uint32
-// Layout: qs is processed as uint32[16]. For each pair of 32-element sub-blocks (ib32 += 2):
-//   q32[0..3] = 4 uint32 values covering 2 sub-blocks
-//   q32[1] >> 28 = scale for first sub-block, q32[3] >> 28 = scale for second
-//   Each q32[l]: bits[0:7] = grid index 1, bits[8:15] = grid index 2,
-//                bits[16:22] = sign index, bits[24:27] = (unused or scale)
-//   grid1 = iq2xxs_grid[q32[l] & 0xFF] -> 8 weight values (as uint64 = 2 x u32)
-//   grid2 = iq2xxs_grid[(q32[l] >> 8) & 0xFF] -> 8 weight values
-//   signs applied to grid1 only (8 bits from ksigns_iq2xs)
+// IQ2_XXS TILED matvec — 2-bit codebook quantization
+// 256-element blocks, 66 bytes each
+//
+// Tiled: TILE_ROWS=32, 8 threads per row, synchronous block iteration with shared x_cache.
+// Dispatch: (ceil(rows / TILE_ROWS), n_tokens, 1)
+
+const TILE_ROWS: u32 = 32u;
+const WG_SIZE: u32 = 256u;
+const THREADS_PER_ROW: u32 = 8u;
+const BLOCK_SIZE: u32 = 256u;
 
 struct Uniforms {
     rows: u32,
@@ -23,7 +21,8 @@ struct Uniforms {
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 
-var<workgroup> shared_data: array<f32, 256>;
+var<workgroup> x_cache: array<f32, 256>;
+var<workgroup> reduce_buf: array<f32, 256>;
 
 fn fp16_to_f32(bits: u32) -> f32 {
     let sign = (bits >> 15u) & 1u;
@@ -32,21 +31,8 @@ fn fp16_to_f32(bits: u32) -> f32 {
     if (exp == 0u && mant == 0u) {
         return select(0.0, -0.0, sign == 1u);
     }
-    let f_exp = f32(i32(exp) - 15 + 127);
-    let f_bits = (sign << 31u) | (u32(f_exp) << 23u) | (mant << 13u);
+    let f_bits = (sign << 31u) | ((exp + 112u) << 23u) | (mant << 13u);
     return bitcast<f32>(f_bits);
-}
-
-fn workgroup_reduce(lid: u32, val: f32) -> f32 {
-    shared_data[lid] = val;
-    workgroupBarrier();
-    for (var s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) {
-            shared_data[lid] += shared_data[lid + s];
-        }
-        workgroupBarrier();
-    }
-    return shared_data[0];
 }
 
 fn read_u8(base: u32, offset: u32) -> u32 {
@@ -63,7 +49,6 @@ fn read_u16(base: u32, offset: u32) -> u32 {
 }
 
 fn read_u32_raw(base: u32, offset: u32) -> u32 {
-    // Unaligned u32 read: handles any byte alignment
     let addr = base + offset;
     let align = addr & 3u;
     if (align == 0u) {
@@ -75,7 +60,6 @@ fn read_u32_raw(base: u32, offset: u32) -> u32 {
     return (lo_word >> shift) | (hi_word << (32u - shift));
 }
 
-// Sign lookup: 7-bit index -> 8-bit sign mask
 const KSIGNS_IQ2XS: array<u32, 128> = array<u32, 128>(
       0u, 129u, 130u,   3u, 132u,   5u,   6u, 135u, 136u,   9u,  10u, 139u,  12u, 141u, 142u,  15u,
     144u,  17u,  18u, 147u,  20u, 149u, 150u,  23u,  24u, 153u, 154u,  27u, 156u,  29u,  30u, 159u,
@@ -87,8 +71,6 @@ const KSIGNS_IQ2XS: array<u32, 128> = array<u32, 128>(
     240u, 113u, 114u, 243u, 116u, 245u, 246u, 119u, 120u, 249u, 250u, 123u, 252u, 125u, 126u, 255u
 );
 
-// IQ2XXS grid: 256 entries of uint64 stored as 512 uint32 (lo, hi pairs)
-// Each entry = 8 weight byte values. Access: grid[idx*2] = lo 4 bytes, grid[idx*2+1] = hi 4 bytes
 const IQ2XXS_GRID: array<u32, 512> = array<u32, 512>(
     0x08080808u, 0x08080808u, 0x0808082bu, 0x08080808u, 0x08081919u, 0x08080808u, 0x08082b08u, 0x08080808u,
     0x08082b2bu, 0x08080808u, 0x08190819u, 0x08080808u, 0x08191908u, 0x08080808u, 0x082b0808u, 0x08080808u,
@@ -156,7 +138,6 @@ const IQ2XXS_GRID: array<u32, 512> = array<u32, 512>(
     0x08080808u, 0x2b2b082bu, 0x08192b08u, 0x2b2b1908u, 0x19190808u, 0x2b2b2b08u, 0x08081908u, 0x2b2b2b19u
 );
 
-// Extract byte j from a u32 grid value
 fn grid_byte(g: u32, j: u32) -> f32 {
     return f32((g >> (j * 8u)) & 0xFFu);
 }
@@ -164,96 +145,109 @@ fn grid_byte(g: u32, j: u32) -> f32 {
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = select(wid.x, wid.x + wid.y * uniforms.extra, uniforms.extra > 0u);
+    let tile_start = select(wid.x * TILE_ROWS, (wid.x + wid.y * uniforms.extra) * TILE_ROWS, uniforms.extra > 0u);
     let token = select(wid.y, 0u, uniforms.extra > 0u);
     let tid = lid.x;
 
-    if (row >= uniforms.rows) {
-        return;
-    }
+    let local_row = tid / THREADS_PER_ROW;
+    let local_elem = tid % THREADS_PER_ROW;
+    let global_row = tile_start + local_row;
 
     let cols = uniforms.cols;
-    let blocks_per_row = cols / 256u;
+    let blocks_per_row = cols / BLOCK_SIZE;
     let block_bytes = 66u;
-    let row_byte_offset = row * blocks_per_row * block_bytes;
-    let x_offset = token * cols;
+    let x_base = token * cols;
+    let row_byte_offset = global_row * blocks_per_row * block_bytes;
 
-    var sum = 0.0f;
+    var acc: f32 = 0.0;
 
-    var block_idx = tid;
-    while (block_idx < blocks_per_row) {
-        let block_byte = row_byte_offset + block_idx * block_bytes;
-        let elem_base = block_idx * 256u;
+    for (var b = 0u; b < blocks_per_row; b++) {
+        x_cache[tid] = x[x_base + b * BLOCK_SIZE + tid];
+        workgroupBarrier();
 
-        // FP16 scale at offset 0
-        let d = fp16_to_f32(read_u16(block_byte, 0u));
+        if (global_row < uniforms.rows) {
+            let block_byte = row_byte_offset + b * block_bytes;
+            let d = fp16_to_f32(read_u16(block_byte, 0u));
+            let qs_base = block_byte + 2u;
 
-        // qs data starts at offset 2 (64 bytes = 16 uint32)
-        let qs_base = block_byte + 2u;
+            let my_start = local_elem * 32u;
 
-        // Process in pairs of 32-element sub-blocks (each pair = 64 elements)
-        var xi = elem_base;
-        for (var ib32 = 0u; ib32 < 8u; ib32 += 2u) {
-            // Read 4 uint32 values for this pair of sub-blocks
-            let q32_off = ib32 * 8u; // 4 uint32 * 4 bytes per sub-block pair, 2 sub-blocks
-            let q32_0 = read_u32_raw(qs_base, q32_off);
-            let q32_1 = read_u32_raw(qs_base, q32_off + 4u);
-            let q32_2 = read_u32_raw(qs_base, q32_off + 8u);
-            let q32_3 = read_u32_raw(qs_base, q32_off + 12u);
+            for (var i = 0u; i < 32u; i++) {
+                let elem = my_start + i;
+                // 8 sub-blocks processed in pairs. Each pair = 64 elements.
+                // ib32 pair = elem / 64, giving 4 pairs (ib32 = 0,2,4,6)
+                let pair = elem / 64u;
+                let in_pair = elem % 64u;
+                let ib32_base = pair * 2u;
+                // Within pair: 4 groups of 16 elements
+                let l = in_pair / 16u;    // 0..3
+                let j = in_pair % 16u;    // 0..15
 
-            let db1 = d * (0.5 + f32(q32_1 >> 28u));
-            let db2 = d * (0.5 + f32(q32_3 >> 28u));
+                let q32_off = ib32_base * 8u;
+                let q32_0 = read_u32_raw(qs_base, q32_off);
+                let q32_1 = read_u32_raw(qs_base, q32_off + 4u);
+                let q32_2 = read_u32_raw(qs_base, q32_off + 8u);
+                let q32_3 = read_u32_raw(qs_base, q32_off + 12u);
 
-            // 4 iterations, each processing 16 elements
-            var q32_arr = array<u32, 4>(q32_0, q32_1, q32_2, q32_3);
-            for (var l = 0u; l < 4u; l++) {
-                let q32_l = q32_arr[l];
+                let db1 = d * (0.5 + f32(q32_1 >> 28u));
+                let db2 = d * (0.5 + f32(q32_3 >> 28u));
+                let db = select(db2, db1, l < 2u);
+
+                var q32_l: u32;
+                switch l {
+                    case 0u: { q32_l = q32_0; }
+                    case 1u: { q32_l = q32_1; }
+                    case 2u: { q32_l = q32_2; }
+                    default: { q32_l = q32_3; }
+                }
+
                 let grid_idx1 = q32_l & 0xFFu;
                 let grid_idx2 = (q32_l >> 8u) & 0xFFu;
                 let sign_idx = (q32_l >> 16u) & 0x7Fu;
                 let signs = KSIGNS_IQ2XS[sign_idx];
-                let db = select(db2, db1, l < 2u);
 
-                // grid1: 8 weight values (uint64 = 2 x u32)
-                let g1_lo = IQ2XXS_GRID[grid_idx1 * 2u];
-                let g1_hi = IQ2XXS_GRID[grid_idx1 * 2u + 1u];
-
-                // grid2: 8 weight values
-                let g2_lo = IQ2XXS_GRID[grid_idx2 * 2u];
-                let g2_hi = IQ2XXS_GRID[grid_idx2 * 2u + 1u];
-
-                // First 8 elements from grid1 with sign application
-                for (var j = 0u; j < 4u; j++) {
-                    let w = grid_byte(g1_lo, j);
+                // 16 elements: first 8 from grid1 (with signs), next 8 from grid2 (no signs)
+                if (j < 8u) {
+                    // grid1 with sign
+                    var g: u32;
+                    if (j < 4u) {
+                        g = IQ2XXS_GRID[grid_idx1 * 2u];
+                    } else {
+                        g = IQ2XXS_GRID[grid_idx1 * 2u + 1u];
+                    }
+                    let jj = j % 4u;
+                    let w = grid_byte(g, jj);
                     let s = f32(1 - 2 * i32((signs >> j) & 1u));
-                    sum += db * w * s * x[x_offset + xi];
-                    xi++;
-                }
-                for (var j = 0u; j < 4u; j++) {
-                    let w = grid_byte(g1_hi, j);
-                    let s = f32(1 - 2 * i32((signs >> (j + 4u)) & 1u));
-                    sum += db * w * s * x[x_offset + xi];
-                    xi++;
-                }
-
-                // Next 8 elements from grid2 without sign application
-                for (var j = 0u; j < 4u; j++) {
-                    sum += db * grid_byte(g2_lo, j) * x[x_offset + xi];
-                    xi++;
-                }
-                for (var j = 0u; j < 4u; j++) {
-                    sum += db * grid_byte(g2_hi, j) * x[x_offset + xi];
-                    xi++;
+                    acc += db * w * s * x_cache[elem];
+                } else {
+                    // grid2 without sign
+                    let j2 = j - 8u;
+                    var g: u32;
+                    if (j2 < 4u) {
+                        g = IQ2XXS_GRID[grid_idx2 * 2u];
+                    } else {
+                        g = IQ2XXS_GRID[grid_idx2 * 2u + 1u];
+                    }
+                    let jj = j2 % 4u;
+                    acc += db * grid_byte(g, jj) * x_cache[elem];
                 }
             }
         }
-
-        block_idx += 256u;
+        workgroupBarrier();
     }
 
-    let result = workgroup_reduce(tid, sum);
+    reduce_buf[tid] = acc;
+    workgroupBarrier();
 
-    if (tid == 0u) {
-        out[token * uniforms.rows + row] = result;
+    let row_base = local_row * THREADS_PER_ROW;
+    if (local_elem < 4u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 4u]; }
+    workgroupBarrier();
+    if (local_elem < 2u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 2u]; }
+    workgroupBarrier();
+    if (local_elem < 1u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 1u]; }
+    workgroupBarrier();
+
+    if (local_elem == 0u && global_row < uniforms.rows) {
+        out[token * uniforms.rows + global_row] = reduce_buf[row_base];
     }
 }

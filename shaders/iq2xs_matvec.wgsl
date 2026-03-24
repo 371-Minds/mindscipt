@@ -1,10 +1,13 @@
-// IQ2_XS matvec — 2-bit codebook with explicit scales
-// 256-element blocks, 74 bytes each:
-//   d: FP16 (bytes 0-1)
-//   qs[64]: uint16[32] — 9-bit grid index + 7-bit sign index (bytes 2-65)
-//   scales[8]: 4-bit sub-block scales (bytes 66-73)
-// 8 sub-blocks of 32 elements. Each sub-block has 4 groups of 8 elements.
-// Each uint16: bits[0:8] = 9-bit grid index, bits[9:15] = 7-bit sign index
+// IQ2_XS TILED matvec — 2-bit codebook with explicit scales
+// 256-element blocks, 74 bytes each
+//
+// Tiled: TILE_ROWS=32, 8 threads per row, synchronous block iteration with shared x_cache.
+// Dispatch: (ceil(rows / TILE_ROWS), n_tokens, 1)
+
+const TILE_ROWS: u32 = 32u;
+const WG_SIZE: u32 = 256u;
+const THREADS_PER_ROW: u32 = 8u;
+const BLOCK_SIZE: u32 = 256u;
 
 struct Uniforms {
     rows: u32,
@@ -18,7 +21,8 @@ struct Uniforms {
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 
-var<workgroup> shared_data: array<f32, 256>;
+var<workgroup> x_cache: array<f32, 256>;
+var<workgroup> reduce_buf: array<f32, 256>;
 
 fn fp16_to_f32(bits: u32) -> f32 {
     let sign = (bits >> 15u) & 1u;
@@ -27,21 +31,8 @@ fn fp16_to_f32(bits: u32) -> f32 {
     if (exp == 0u && mant == 0u) {
         return select(0.0, -0.0, sign == 1u);
     }
-    let f_exp = f32(i32(exp) - 15 + 127);
-    let f_bits = (sign << 31u) | (u32(f_exp) << 23u) | (mant << 13u);
+    let f_bits = (sign << 31u) | ((exp + 112u) << 23u) | (mant << 13u);
     return bitcast<f32>(f_bits);
-}
-
-fn workgroup_reduce(lid: u32, val: f32) -> f32 {
-    shared_data[lid] = val;
-    workgroupBarrier();
-    for (var s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) {
-            shared_data[lid] += shared_data[lid + s];
-        }
-        workgroupBarrier();
-    }
-    return shared_data[0];
 }
 
 fn read_u8(base: u32, offset: u32) -> u32 {
@@ -208,77 +199,80 @@ fn grid_byte(g: u32, j: u32) -> f32 {
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = select(wid.x, wid.x + wid.y * uniforms.extra, uniforms.extra > 0u);
+    let tile_start = select(wid.x * TILE_ROWS, (wid.x + wid.y * uniforms.extra) * TILE_ROWS, uniforms.extra > 0u);
     let token = select(wid.y, 0u, uniforms.extra > 0u);
     let tid = lid.x;
 
-    if (row >= uniforms.rows) {
-        return;
-    }
+    let local_row = tid / THREADS_PER_ROW;
+    let local_elem = tid % THREADS_PER_ROW;
+    let global_row = tile_start + local_row;
 
     let cols = uniforms.cols;
-    let blocks_per_row = cols / 256u;
+    let blocks_per_row = cols / BLOCK_SIZE;
     let block_bytes = 74u;
-    let row_byte_offset = row * blocks_per_row * block_bytes;
-    let x_offset = token * cols;
+    let x_base = token * cols;
+    let row_byte_offset = global_row * blocks_per_row * block_bytes;
 
-    var sum = 0.0f;
+    var acc: f32 = 0.0;
 
-    var block_idx = tid;
-    while (block_idx < blocks_per_row) {
-        let block_byte = row_byte_offset + block_idx * block_bytes;
-        let elem_base = block_idx * 256u;
+    for (var b = 0u; b < blocks_per_row; b++) {
+        x_cache[tid] = x[x_base + b * BLOCK_SIZE + tid];
+        workgroupBarrier();
 
-        // FP16 scale at offset 0
-        let d = fp16_to_f32(read_u16(block_byte, 0u));
+        if (global_row < uniforms.rows) {
+            let block_byte = row_byte_offset + b * block_bytes;
+            let d = fp16_to_f32(read_u16(block_byte, 0u));
+            let qs_base = block_byte + 2u;
+            let scales_base = block_byte + 66u;
 
-        // qs (uint16[32]) starts at offset 2, scales at offset 66
-        let qs_base = block_byte + 2u;
-        let scales_base = block_byte + 66u;
+            let my_start = local_elem * 32u;
 
-        var xi = elem_base;
+            for (var i = 0u; i < 32u; i++) {
+                let elem = my_start + i;
+                // 8 sub-blocks of 32 elements, each sub-block has 4 groups of 8
+                let ib32 = elem / 32u;
+                let in_sub = elem % 32u;
+                let l = in_sub / 8u;      // group 0..3
+                let j = in_sub % 8u;      // element within group 0..7
 
-        // 8 sub-blocks of 32 elements
-        for (var ib32 = 0u; ib32 < 8u; ib32++) {
-            // 4-bit sub-block scale
-            let sc_byte = read_u8(scales_base, ib32 / 2u);
-            let sc_nib = (sc_byte >> ((ib32 & 1u) * 4u)) & 0xFu;
-            let db = d * (0.5 + f32(sc_nib));
+                let sc_byte = read_u8(scales_base, ib32 / 2u);
+                let sc_nib = (sc_byte >> ((ib32 & 1u) * 4u)) & 0xFu;
+                let db = d * (0.5 + f32(sc_nib));
 
-            // 4 groups of 8 elements per sub-block
-            for (var l = 0u; l < 4u; l++) {
-                // Read uint16: 9-bit grid index + 7-bit sign index
                 let q2 = read_u16(qs_base, (4u * ib32 + l) * 2u);
                 let grid_idx = q2 & 511u;
                 let sign_idx = q2 >> 9u;
                 let signs = KSIGNS_IQ2XS[sign_idx];
 
-                // Grid entry: 8 weight bytes (stored as 2 x u32)
-                let g_lo = IQ2XS_GRID[grid_idx * 2u];
-                let g_hi = IQ2XS_GRID[grid_idx * 2u + 1u];
-
-                // 8 elements with sign application
-                for (var j = 0u; j < 4u; j++) {
-                    let w = grid_byte(g_lo, j);
-                    let s = f32(1 - 2 * i32((signs >> j) & 1u));
-                    sum += db * w * s * x[x_offset + xi];
-                    xi++;
+                var g: u32;
+                var jj: u32;
+                if (j < 4u) {
+                    g = IQ2XS_GRID[grid_idx * 2u];
+                    jj = j;
+                } else {
+                    g = IQ2XS_GRID[grid_idx * 2u + 1u];
+                    jj = j - 4u;
                 }
-                for (var j = 0u; j < 4u; j++) {
-                    let w = grid_byte(g_hi, j);
-                    let s = f32(1 - 2 * i32((signs >> (j + 4u)) & 1u));
-                    sum += db * w * s * x[x_offset + xi];
-                    xi++;
-                }
+                let w = grid_byte(g, jj);
+                let s = f32(1 - 2 * i32((signs >> j) & 1u));
+                acc += db * w * s * x_cache[elem];
             }
         }
-
-        block_idx += 256u;
+        workgroupBarrier();
     }
 
-    let result = workgroup_reduce(tid, sum);
+    reduce_buf[tid] = acc;
+    workgroupBarrier();
 
-    if (tid == 0u) {
-        out[token * uniforms.rows + row] = result;
+    let row_base = local_row * THREADS_PER_ROW;
+    if (local_elem < 4u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 4u]; }
+    workgroupBarrier();
+    if (local_elem < 2u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 2u]; }
+    workgroupBarrier();
+    if (local_elem < 1u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 1u]; }
+    workgroupBarrier();
+
+    if (local_elem == 0u && global_row < uniforms.rows) {
+        out[token * uniforms.rows + global_row] = reduce_buf[row_base];
     }
 }

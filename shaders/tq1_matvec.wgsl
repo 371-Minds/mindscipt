@@ -1,9 +1,17 @@
-// TQ1_0 matvec — base-3 ternary packing
+// TQ1_0 TILED matvec — base-3 ternary packing
 // 256-element blocks, 54 bytes each: qs[48] + qh[4] + d(FP16)
 // qs[0..31]:  5 trits per byte x 32 bytes = 160 values
 // qs[32..47]: 5 trits per byte x 16 bytes = 80 values
 // qh[0..3]:   4 trits per byte x 4 bytes  = 16 values
 // Total: 160 + 80 + 16 = 256 values
+//
+// Tiled: TILE_ROWS=32, 8 threads per row, synchronous block iteration with shared x_cache.
+// Dispatch: (ceil(rows / TILE_ROWS), n_tokens, 1)
+
+const TILE_ROWS: u32 = 32u;
+const WG_SIZE: u32 = 256u;
+const THREADS_PER_ROW: u32 = 8u;
+const BLOCK_SIZE: u32 = 256u;
 
 struct Uniforms {
     rows: u32,
@@ -17,7 +25,8 @@ struct Uniforms {
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 
-var<workgroup> shared_data: array<f32, 256>;
+var<workgroup> x_cache: array<f32, 256>;
+var<workgroup> reduce_buf: array<f32, 256>;
 
 fn fp16_to_f32(bits: u32) -> f32 {
     let sign = (bits >> 15u) & 1u;
@@ -31,27 +40,10 @@ fn fp16_to_f32(bits: u32) -> f32 {
     return bitcast<f32>(f_bits);
 }
 
-fn workgroup_reduce(lid: u32, val: f32) -> f32 {
-    shared_data[lid] = val;
-    workgroupBarrier();
-    for (var s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) {
-            shared_data[lid] += shared_data[lid + s];
-        }
-        workgroupBarrier();
-    }
-    return shared_data[0];
-}
-
 fn read_u8(base: u32, offset: u32) -> u32 {
     let addr = base + offset;
     let word = weights[addr >> 2u];
     return (word >> ((addr & 3u) * 8u)) & 0xFFu;
-}
-
-fn read_i8(base: u32, offset: u32) -> i32 {
-    let v = read_u8(base, offset);
-    return select(i32(v), i32(v) - 256, v >= 128u);
 }
 
 fn read_u16(base: u32, offset: u32) -> u32 {
@@ -61,15 +53,8 @@ fn read_u16(base: u32, offset: u32) -> u32 {
     return (word >> shift) & 0xFFFFu;
 }
 
-fn read_u32_raw(base: u32, offset: u32) -> u32 {
-    return weights[(base + offset) >> 2u];
-}
-
-// Decode one trit from a byte: returns -1, 0, or 1
-// C code: uint8_t q = qs[m] * pow3[n]; (truncates to 8 bits)
-//         int16_t xi = ((uint16_t)q * 3) >> 8;
 fn decode_trit(byte_val: u32, pow3_val: u32) -> i32 {
-    let q = (byte_val * pow3_val) & 0xFFu;  // truncate to uint8
+    let q = (byte_val * pow3_val) & 0xFFu;
     let xi = (q * 3u) >> 8u;
     return i32(xi) - 1;
 }
@@ -77,72 +62,87 @@ fn decode_trit(byte_val: u32, pow3_val: u32) -> i32 {
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = select(wid.x, wid.x + wid.y * uniforms.extra, uniforms.extra > 0u);
+    let tile_start = select(wid.x * TILE_ROWS, (wid.x + wid.y * uniforms.extra) * TILE_ROWS, uniforms.extra > 0u);
     let token = select(wid.y, 0u, uniforms.extra > 0u);
     let tid = lid.x;
 
-    if (row >= uniforms.rows) {
-        return;
-    }
+    let local_row = tid / THREADS_PER_ROW;
+    let local_elem = tid % THREADS_PER_ROW;
+    let global_row = tile_start + local_row;
 
     let cols = uniforms.cols;
-    let blocks_per_row = cols / 256u;
+    let blocks_per_row = cols / BLOCK_SIZE;
     let block_bytes = 54u;
-    let row_byte_offset = row * blocks_per_row * block_bytes;
-    let x_offset = token * cols;
+    let x_base = token * cols;
 
-    // Powers of 3 for trit extraction
+    let row_byte_offset = global_row * blocks_per_row * block_bytes;
+
     let pow3 = array<u32, 5>(1u, 3u, 9u, 27u, 81u);
 
-    var sum = 0.0f;
+    var acc: f32 = 0.0;
 
-    var block_idx = tid;
-    while (block_idx < blocks_per_row) {
-        let block_byte = row_byte_offset + block_idx * block_bytes;
-        let elem_base = block_idx * 256u;
+    for (var b = 0u; b < blocks_per_row; b++) {
+        // All 256 threads load x_cache
+        x_cache[tid] = x[x_base + b * BLOCK_SIZE + tid];
+        workgroupBarrier();
 
-        // Read FP16 scale at offset 52 (after qs[48] + qh[4])
-        let d = fp16_to_f32(read_u16(block_byte, 52u));
+        if (global_row < uniforms.rows) {
+            let block_byte = row_byte_offset + b * block_bytes;
+            let d = fp16_to_f32(read_u16(block_byte, 52u));
 
-        var block_sum = 0.0f;
+            // Each thread handles 32 elements (256 / 8)
+            // Elements are mapped across 3 sections:
+            //   Section 1: elements 0..159 (qs[0..31], 5 trits each)
+            //   Section 2: elements 160..239 (qs[32..47], 5 trits each)
+            //   Section 3: elements 240..255 (qh[0..3], 4 trits each)
+            let my_start = local_elem * 32u;
+            var block_sum: f32 = 0.0;
 
-        // Section 1: qs[0..31] -> 160 values (5 trits x 32 bytes)
-        for (var n = 0u; n < 5u; n++) {
-            let p3 = pow3[n];
-            for (var m = 0u; m < 32u; m++) {
-                let byte_val = read_u8(block_byte, m);
-                let w = decode_trit(byte_val, p3);
-                block_sum += f32(w) * x[x_offset + elem_base + n * 32u + m];
+            for (var i = 0u; i < 32u; i++) {
+                let elem = my_start + i;
+                var w: i32 = 0;
+
+                if (elem < 160u) {
+                    // Section 1: qs[0..31], 5 trits per byte
+                    let n = elem / 32u;  // trit index 0..4
+                    let m = elem % 32u;  // byte index 0..31
+                    let byte_val = read_u8(block_byte, m);
+                    w = decode_trit(byte_val, pow3[n]);
+                } else if (elem < 240u) {
+                    // Section 2: qs[32..47], 5 trits per byte
+                    let idx = elem - 160u;
+                    let n = idx / 16u;   // trit index 0..4
+                    let m = idx % 16u;   // byte index 0..15
+                    let byte_val = read_u8(block_byte, 32u + m);
+                    w = decode_trit(byte_val, pow3[n]);
+                } else {
+                    // Section 3: qh[0..3], 4 trits per byte
+                    let idx = elem - 240u;
+                    let n = idx / 4u;    // trit index 0..3
+                    let m = idx % 4u;    // byte index 0..3
+                    let byte_val = read_u8(block_byte, 48u + m);
+                    w = decode_trit(byte_val, pow3[n]);
+                }
+
+                block_sum += f32(w) * x_cache[elem];
             }
+            acc += block_sum * d;
         }
-
-        // Section 2: qs[32..47] -> 80 values (5 trits x 16 bytes)
-        for (var n = 0u; n < 5u; n++) {
-            let p3 = pow3[n];
-            for (var m = 0u; m < 16u; m++) {
-                let byte_val = read_u8(block_byte, 32u + m);
-                let w = decode_trit(byte_val, p3);
-                block_sum += f32(w) * x[x_offset + elem_base + 160u + n * 16u + m];
-            }
-        }
-
-        // Section 3: qh[0..3] -> 16 values (4 trits x 4 bytes)
-        for (var n = 0u; n < 4u; n++) {
-            let p3 = pow3[n];
-            for (var m = 0u; m < 4u; m++) {
-                let byte_val = read_u8(block_byte, 48u + m);
-                let w = decode_trit(byte_val, p3);
-                block_sum += f32(w) * x[x_offset + elem_base + 240u + n * 4u + m];
-            }
-        }
-
-        sum += block_sum * d;
-        block_idx += 256u;
+        workgroupBarrier();
     }
 
-    let result = workgroup_reduce(tid, sum);
+    reduce_buf[tid] = acc;
+    workgroupBarrier();
 
-    if (tid == 0u) {
-        out[token * uniforms.rows + row] = result;
+    let row_base = local_row * THREADS_PER_ROW;
+    if (local_elem < 4u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 4u]; }
+    workgroupBarrier();
+    if (local_elem < 2u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 2u]; }
+    workgroupBarrier();
+    if (local_elem < 1u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 1u]; }
+    workgroupBarrier();
+
+    if (local_elem == 0u && global_row < uniforms.rows) {
+        out[token * uniforms.rows + global_row] = reduce_buf[row_base];
     }
 }

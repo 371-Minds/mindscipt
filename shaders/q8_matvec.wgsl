@@ -1,5 +1,12 @@
-// Q8_0 matvec/matmul — 8-bit quantization
+// Q8_0 TILED matvec — 8-bit quantization
 // 32-element blocks, 34 bytes each: 2-byte FP16 scale + 32 int8 values
+//
+// Tiled: TILE_ROWS=32, 8 threads per row, synchronous block iteration with shared x_cache.
+// Dispatch: (ceil(rows / TILE_ROWS), n_tokens, 1)
+
+const TILE_ROWS: u32 = 32u;
+const WG_SIZE: u32 = 256u;
+const THREADS_PER_ROW: u32 = 8u;
 
 struct Uniforms {
     rows: u32,
@@ -13,7 +20,8 @@ struct Uniforms {
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 
-var<workgroup> shared_data: array<f32, 256>;
+var<workgroup> x_cache: array<f32, 32>;
+var<workgroup> reduce_buf: array<f32, 256>;
 
 fn fp16_to_f32(bits: u32) -> f32 {
     let sign = (bits >> 15u) & 1u;
@@ -22,21 +30,8 @@ fn fp16_to_f32(bits: u32) -> f32 {
     if (exp == 0u && mant == 0u) {
         return select(0.0, -0.0, sign == 1u);
     }
-    let f_exp = f32(i32(exp) - 15 + 127);
-    let f_bits = (sign << 31u) | (u32(f_exp) << 23u) | (mant << 13u);
+    let f_bits = (sign << 31u) | ((exp + 112u) << 23u) | (mant << 13u);
     return bitcast<f32>(f_bits);
-}
-
-fn workgroup_reduce(lid: u32, val: f32) -> f32 {
-    shared_data[lid] = val;
-    workgroupBarrier();
-    for (var s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) {
-            shared_data[lid] += shared_data[lid + s];
-        }
-        workgroupBarrier();
-    }
-    return shared_data[0];
 }
 
 fn read_byte(byte_addr: u32) -> u32 {
@@ -52,72 +47,64 @@ fn read_fp16(byte_addr: u32) -> f32 {
 }
 
 fn sign_extend_i8(val: u32) -> i32 {
-    // Sign-extend from 8-bit to 32-bit
     return i32(val << 24u) >> 24;
 }
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = select(wid.x, wid.x + wid.y * uniforms.extra, uniforms.extra > 0u);
+    let tile_start = select(wid.x * TILE_ROWS, (wid.x + wid.y * uniforms.extra) * TILE_ROWS, uniforms.extra > 0u);
     let token = select(wid.y, 0u, uniforms.extra > 0u);
     let tid = lid.x;
 
-    if (row >= uniforms.rows) {
-        return;
-    }
+    let local_row = tid / THREADS_PER_ROW;
+    let local_elem = tid % THREADS_PER_ROW;
+    let global_row = tile_start + local_row;
 
     let cols = uniforms.cols;
     let blocks_per_row = cols / 32u;
-    // Each block is 34 bytes
-    let row_byte_offset = row * blocks_per_row * 34u;
-    let x_offset = token * cols;
+    let x_base = token * cols;
 
-    var sum = 0.0f;
+    let row_byte_base = global_row * blocks_per_row * 34u;
 
-    var block_idx = tid;
-    while (block_idx < blocks_per_row) {
-        let block_byte = row_byte_offset + block_idx * 34u;
+    var acc: f32 = 0.0;
 
-        // Read FP16 scale from first 2 bytes
-        let scale = read_fp16(block_byte);
-
-        // Quantized int8 data starts at block_byte + 2
-        let qs_byte_start = block_byte + 2u;
-        let elem_offset = block_idx * 32u;
-
-        // Process 32 int8 values, 4 at a time via u32 reads
-        for (var w = 0u; w < 8u; w++) {
-            let word_byte_addr = qs_byte_start + w * 4u;
-            let word_idx = word_byte_addr / 4u;
-            let word_off = word_byte_addr % 4u;
-
-            // Read 4 bytes (may span two u32s if not aligned)
-            var word: u32;
-            if (word_off == 0u) {
-                word = weights[word_idx];
-            } else {
-                word = (weights[word_idx] >> (word_off * 8u)) | (weights[word_idx + 1u] << ((4u - word_off) * 8u));
-            }
-
-            let i0 = sign_extend_i8(word & 0xFFu);
-            let i1 = sign_extend_i8((word >> 8u) & 0xFFu);
-            let i2 = sign_extend_i8((word >> 16u) & 0xFFu);
-            let i3 = sign_extend_i8((word >> 24u) & 0xFFu);
-
-            let base = elem_offset + w * 4u;
-            sum += scale * f32(i0) * x[x_offset + base];
-            sum += scale * f32(i1) * x[x_offset + base + 1u];
-            sum += scale * f32(i2) * x[x_offset + base + 2u];
-            sum += scale * f32(i3) * x[x_offset + base + 3u];
+    for (var b = 0u; b < blocks_per_row; b++) {
+        if (tid < 32u) {
+            let col = b * 32u + tid;
+            x_cache[tid] = select(0.0, x[x_base + col], col < cols);
         }
+        workgroupBarrier();
 
-        block_idx += 256u;
+        if (global_row < uniforms.rows) {
+            let block_byte = row_byte_base + b * 34u;
+            let scale = read_fp16(block_byte);
+            let qs_byte_start = block_byte + 2u;
+
+            // Each thread handles 4 elements (32 / 8)
+            let my_start = local_elem * 4u;
+            for (var i = 0u; i < 4u; i++) {
+                let elem = my_start + i;
+                let byte_val = read_byte(qs_byte_start + elem);
+                let ival = sign_extend_i8(byte_val);
+                acc += scale * f32(ival) * x_cache[elem];
+            }
+        }
+        workgroupBarrier();
     }
 
-    let result = workgroup_reduce(tid, sum);
+    reduce_buf[tid] = acc;
+    workgroupBarrier();
 
-    if (tid == 0u) {
-        out[token * uniforms.rows + row] = result;
+    let row_base = local_row * THREADS_PER_ROW;
+    if (local_elem < 4u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 4u]; }
+    workgroupBarrier();
+    if (local_elem < 2u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 2u]; }
+    workgroupBarrier();
+    if (local_elem < 1u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 1u]; }
+    workgroupBarrier();
+
+    if (local_elem == 0u && global_row < uniforms.rows) {
+        out[token * uniforms.rows + global_row] = reduce_buf[row_base];
     }
 }

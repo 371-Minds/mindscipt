@@ -1,5 +1,19 @@
-// Q4_0 matvec/matmul — 4-bit quantization
-// 32-element blocks, 18 bytes each: 2-byte FP16 scale + 16 bytes packed nibbles
+// Q4_0 TILED matvec — optimized for GPU bandwidth utilization
+//
+// Strategy: process TILE_ROWS output rows per workgroup.
+// All threads iterate over column blocks SYNCHRONOUSLY.
+// Per block: cooperatively load 32 x values into shared memory,
+// then each thread decodes its row's weight block and dots with cached x.
+// This amortizes x vector reads across TILE_ROWS rows.
+//
+// With TILE_ROWS=32 and dim=2048: 64 workgroups instead of 2048.
+// x vector bandwidth: 32x reduction.
+//
+// Dispatch: (ceil(rows / TILE_ROWS), n_tokens, 1)
+
+const TILE_ROWS: u32 = 32u;
+const WG_SIZE: u32 = 256u;
+const THREADS_PER_ROW: u32 = 8u;  // WG_SIZE / TILE_ROWS = 256/32 = 8
 
 struct Uniforms {
     rows: u32,
@@ -13,7 +27,10 @@ struct Uniforms {
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 
-var<workgroup> shared_data: array<f32, 256>;
+// Shared memory: cached x values for current block (32 floats)
+var<workgroup> x_cache: array<f32, 32>;
+// Shared memory: per-thread partial sums for reduction
+var<workgroup> reduce_buf: array<f32, 256>;
 
 fn fp16_to_f32(bits: u32) -> f32 {
     let sign = (bits >> 15u) & 1u;
@@ -22,85 +39,97 @@ fn fp16_to_f32(bits: u32) -> f32 {
     if (exp == 0u && mant == 0u) {
         return select(0.0, -0.0, sign == 1u);
     }
-    let f_exp = f32(i32(exp) - 15 + 127);
-    let f_bits = (sign << 31u) | (u32(f_exp) << 23u) | (mant << 13u);
+    let f_bits = (sign << 31u) | ((exp + 112u) << 23u) | (mant << 13u);
     return bitcast<f32>(f_bits);
 }
 
-fn workgroup_reduce(lid: u32, val: f32) -> f32 {
-    shared_data[lid] = val;
-    workgroupBarrier();
-    for (var s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) {
-            shared_data[lid] += shared_data[lid + s];
-        }
-        workgroupBarrier();
-    }
-    return shared_data[0];
+fn read_byte(addr: u32) -> u32 {
+    return (weights[addr >> 2u] >> ((addr & 3u) * 8u)) & 0xFFu;
+}
+
+fn read_u16_at(addr: u32) -> u32 {
+    let lo = read_byte(addr);
+    let hi = read_byte(addr + 1u);
+    return lo | (hi << 8u);
 }
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = select(wid.x, wid.x + wid.y * uniforms.extra, uniforms.extra > 0u);
+    let tile_start = select(wid.x * TILE_ROWS, (wid.x + wid.y * uniforms.extra) * TILE_ROWS, uniforms.extra > 0u);
     let token = select(wid.y, 0u, uniforms.extra > 0u);
     let tid = lid.x;
 
-    if (row >= uniforms.rows) {
-        return;
-    }
+    // Thread's assigned row and sub-element index within each block
+    let local_row = tid / THREADS_PER_ROW;    // 0..31 (which row in the tile)
+    let local_elem = tid % THREADS_PER_ROW;   // 0..7  (which element group)
+    let global_row = tile_start + local_row;
 
     let cols = uniforms.cols;
     let blocks_per_row = cols / 32u;
-    // Each block is 18 bytes. Row byte offset:
-    let row_byte_offset = row * blocks_per_row * 18u;
-    let x_offset = token * cols;
+    let x_base = token * cols;
 
-    var sum = 0.0f;
+    // Per-row byte offset for weight data
+    let row_byte_base = global_row * blocks_per_row * 18u;
 
-    var block_idx = tid;
-    while (block_idx < blocks_per_row) {
-        // Block byte offset within weight data
-        let block_byte = row_byte_offset + block_idx * 18u;
+    // Each thread accumulates partial sum for its row
+    var acc: f32 = 0.0;
 
-        // Read FP16 scale from first 2 bytes
-        let scale_u32_idx = block_byte / 4u;
-        let scale_byte_off = block_byte % 4u;
-        var scale_bits: u32;
-        if (scale_byte_off <= 2u) {
-            scale_bits = (weights[scale_u32_idx] >> (scale_byte_off * 8u)) & 0xFFFFu;
-        } else {
-            // Scale spans two u32s
-            scale_bits = (weights[scale_u32_idx] >> 24u) | ((weights[scale_u32_idx + 1u] & 0xFFu) << 8u);
+    // Synchronous iteration: ALL threads process the same block at the same time
+    for (var b = 0u; b < blocks_per_row; b++) {
+        // Step 1: Cooperatively load x values for block b into shared memory.
+        // 32 values to load, 256 threads available. First 32 threads load.
+        if (tid < 32u) {
+            let col = b * 32u + tid;
+            x_cache[tid] = select(0.0, x[x_base + col], col < cols);
         }
-        let scale = fp16_to_f32(scale_bits);
+        workgroupBarrier();
 
-        // Quantized data starts at block_byte + 2
-        let qs_byte_start = block_byte + 2u;
-        let elem_offset = block_idx * 32u;
+        // Step 2: Each thread processes its portion of the block for its row.
+        // 8 threads per row, each handles 4 elements (32 / 8 = 4).
+        if (global_row < uniforms.rows) {
+            let block_byte = row_byte_base + b * 18u;
+            let scale = fp16_to_f32(read_u16_at(block_byte));
 
-        // 16 bytes of packed nibbles → 32 elements
-        // Layout: low nibble of qs[i] → element i (0..15)
-        //         high nibble of qs[i] → element i+16 (16..31)
-        for (var i = 0u; i < 16u; i++) {
-            let byte_addr = qs_byte_start + i;
-            let word_idx = byte_addr / 4u;
-            let byte_off = byte_addr % 4u;
-            let byte_val = (weights[word_idx] >> (byte_off * 8u)) & 0xFFu;
+            // This thread handles elements [local_elem*4 .. local_elem*4+3]
+            // within the 32-element block.
+            // Q4_0 layout: low nibbles = elements 0..15, high nibbles = 16..31
+            let my_start = local_elem * 4u;
 
-            let lo = f32(i32(byte_val & 0xFu) - 8);
-            let hi = f32(i32((byte_val >> 4u) & 0xFu) - 8);
-
-            sum += scale * lo * x[x_offset + elem_offset + i];
-            sum += scale * hi * x[x_offset + elem_offset + i + 16u];
+            for (var i = 0u; i < 4u; i++) {
+                let elem = my_start + i;
+                // Determine which byte and nibble this element is in
+                var val: f32;
+                if (elem < 16u) {
+                    // Low nibble of qs[elem]
+                    let byte_val = read_byte(block_byte + 2u + elem);
+                    val = f32(i32(byte_val & 0xFu) - 8);
+                } else {
+                    // High nibble of qs[elem - 16]
+                    let byte_val = read_byte(block_byte + 2u + elem - 16u);
+                    val = f32(i32((byte_val >> 4u) & 0xFu) - 8);
+                }
+                acc += scale * val * x_cache[elem];
+            }
         }
-
-        block_idx += 256u;
+        workgroupBarrier();  // Ensure all threads done before next x_cache load
     }
 
-    let result = workgroup_reduce(tid, sum);
+    // Step 3: Reduce THREADS_PER_ROW (8) partial sums per row → 1 value
+    reduce_buf[tid] = acc;
+    workgroupBarrier();
 
-    if (tid == 0u) {
-        out[token * uniforms.rows + row] = result;
+    // Tree reduction within each row's 8-thread lane
+    let row_base = local_row * THREADS_PER_ROW;
+    if (local_elem < 4u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 4u]; }
+    workgroupBarrier();
+    if (local_elem < 2u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 2u]; }
+    workgroupBarrier();
+    if (local_elem < 1u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 1u]; }
+    workgroupBarrier();
+
+    // Step 4: First thread of each row writes the result
+    if (local_elem == 0u && global_row < uniforms.rows) {
+        out[token * uniforms.rows + global_row] = reduce_buf[row_base];
     }
 }
