@@ -7,6 +7,7 @@
 const TILE_ROWS: u32 = 32u;
 const WG_SIZE: u32 = 256u;
 const THREADS_PER_ROW: u32 = 8u;
+const ELEMS_PER_THREAD: u32 = 256u / THREADS_PER_ROW;
 const QK_K: u32 = 256u;
 const BLOCK_BYTES: u32 = 210u;
 
@@ -75,9 +76,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let sc_base = base + 192u;
             let d = fp16_to_f32(read_u16(base + 208u));
 
-            let my_start = local_elem * 32u;
+            let my_start = local_elem * ELEMS_PER_THREAD;
 
-            for (var i = 0u; i < 32u; i++) {
+            for (var i = 0u; i < ELEMS_PER_THREAD; i++) {
                 let elem = my_start + i;
                 // 256 elements in 2 halves of 128. Each half: 4 sub-groups of 32.
                 // Element mapping: half*128 + subgroup -> maps to ql/qh/scale

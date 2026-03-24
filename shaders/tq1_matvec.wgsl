@@ -11,6 +11,7 @@
 const TILE_ROWS: u32 = 32u;
 const WG_SIZE: u32 = 256u;
 const THREADS_PER_ROW: u32 = 8u;
+const ELEMS_PER_THREAD: u32 = 256u / THREADS_PER_ROW;
 const BLOCK_SIZE: u32 = 256u;
 
 struct Uniforms {
@@ -95,10 +96,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             //   Section 1: elements 0..159 (qs[0..31], 5 trits each)
             //   Section 2: elements 160..239 (qs[32..47], 5 trits each)
             //   Section 3: elements 240..255 (qh[0..3], 4 trits each)
-            let my_start = local_elem * 32u;
+            let my_start = local_elem * ELEMS_PER_THREAD;
             var block_sum: f32 = 0.0;
 
-            for (var i = 0u; i < 32u; i++) {
+            for (var i = 0u; i < ELEMS_PER_THREAD; i++) {
                 let elem = my_start + i;
                 var w: i32 = 0;
 

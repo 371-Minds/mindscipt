@@ -7,6 +7,7 @@
 const TILE_ROWS: u32 = 32u;
 const WG_SIZE: u32 = 256u;
 const THREADS_PER_ROW: u32 = 8u;
+const ELEMS_PER_THREAD: u32 = 256u / THREADS_PER_ROW;
 const QK_K: u32 = 256u;
 
 struct Uniforms {
@@ -74,8 +75,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let qs_byte_start = block_byte + 4u;
 
             // Each thread handles 32 elements (256 / 8)
-            let my_start = local_elem * 32u;
-            for (var i = 0u; i < 32u; i++) {
+            let my_start = local_elem * ELEMS_PER_THREAD;
+            for (var i = 0u; i < ELEMS_PER_THREAD; i++) {
                 let elem = my_start + i;
                 let byte_val = read_byte(qs_byte_start + elem);
                 let ival = sign_extend_i8(byte_val);

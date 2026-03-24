@@ -7,6 +7,7 @@
 const TILE_ROWS: u32 = 32u;
 const WG_SIZE: u32 = 256u;
 const THREADS_PER_ROW: u32 = 8u;
+const ELEMS_PER_THREAD: u32 = 256u / THREADS_PER_ROW;
 const QK_K: u32 = 256u;
 const BLOCK_BYTES: u32 = 84u;
 
@@ -70,9 +71,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let qs_base = base + 16u;
 
             // Each thread handles 32 elements (256 / 8)
-            let my_start = local_elem * 32u;
+            let my_start = local_elem * ELEMS_PER_THREAD;
 
-            for (var i = 0u; i < 32u; i++) {
+            for (var i = 0u; i < ELEMS_PER_THREAD; i++) {
                 let elem = my_start + i;
                 // Determine which 128-element half, sub-block, and position
                 let half = elem / 128u;       // 0 or 1

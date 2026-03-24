@@ -13,7 +13,8 @@
 
 const TILE_ROWS: u32 = 32u;
 const WG_SIZE: u32 = 256u;
-const THREADS_PER_ROW: u32 = 8u;  // WG_SIZE / TILE_ROWS = 256/32 = 8
+const THREADS_PER_ROW: u32 = 8u;
+const ELEMS_PER_THREAD: u32 = 32u / THREADS_PER_ROW;  // WG_SIZE / TILE_ROWS = 256/32 = 8
 
 struct Uniforms {
     rows: u32,
@@ -94,9 +95,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             // This thread handles elements [local_elem*4 .. local_elem*4+3]
             // within the 32-element block.
             // Q4_0 layout: low nibbles = elements 0..15, high nibbles = 16..31
-            let my_start = local_elem * 4u;
+            let my_start = local_elem * ELEMS_PER_THREAD;
 
-            for (var i = 0u; i < 4u; i++) {
+            for (var i = 0u; i < ELEMS_PER_THREAD; i++) {
                 let elem = my_start + i;
                 // Determine which byte and nibble this element is in
                 var val: f32;
@@ -119,14 +120,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     reduce_buf[tid] = acc;
     workgroupBarrier();
 
-    // Tree reduction within each row's 8-thread lane
+    // Generic tree reduction within each row's thread lane
     let row_base = local_row * THREADS_PER_ROW;
-    if (local_elem < 4u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 4u]; }
-    workgroupBarrier();
-    if (local_elem < 2u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 2u]; }
-    workgroupBarrier();
-    if (local_elem < 1u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 1u]; }
-    workgroupBarrier();
+    for (var s = THREADS_PER_ROW / 2u; s > 0u; s >>= 1u) {
+        if (local_elem < s) {
+            reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + s];
+        }
+        workgroupBarrier();
+    }
 
     // Step 4: First thread of each row writes the result
     if (local_elem == 0u && global_row < uniforms.rows) {

@@ -7,6 +7,7 @@
 const TILE_ROWS: u32 = 32u;
 const WG_SIZE: u32 = 256u;
 const THREADS_PER_ROW: u32 = 8u;
+const ELEMS_PER_THREAD: u32 = 256u / THREADS_PER_ROW;
 const BLOCK_SIZE: u32 = 256u;
 
 struct Uniforms {
@@ -56,8 +57,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
         if (global_row < uniforms.rows) {
             // Each thread handles 32 elements (256 / 8)
-            let my_start = local_elem * 32u;
-            for (var i = 0u; i < 32u; i += 2u) {
+            let my_start = local_elem * ELEMS_PER_THREAD;
+            for (var i = 0u; i < ELEMS_PER_THREAD; i += 2u) {
                 let elem = my_start + i;
                 let pair_idx = (b * BLOCK_SIZE + elem) / 2u;
                 let word = weights[row_u32_offset + pair_idx];

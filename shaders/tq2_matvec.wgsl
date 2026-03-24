@@ -7,6 +7,7 @@
 const TILE_ROWS: u32 = 32u;
 const WG_SIZE: u32 = 256u;
 const THREADS_PER_ROW: u32 = 8u;
+const ELEMS_PER_THREAD: u32 = 256u / THREADS_PER_ROW;
 const BLOCK_SIZE: u32 = 256u;
 
 struct Uniforms {
@@ -77,9 +78,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let scale = read_fp16(block_byte + 64u);
 
             // Each thread handles 32 elements (256 / 8)
-            let my_start = local_elem * 32u;
+            let my_start = local_elem * ELEMS_PER_THREAD;
 
-            for (var i = 0u; i < 32u; i += 4u) {
+            for (var i = 0u; i < ELEMS_PER_THREAD; i += 4u) {
                 let elem = my_start + i;
                 // Each byte holds 4 ternary values
                 let byte_idx = elem / 4u;

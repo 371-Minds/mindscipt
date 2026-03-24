@@ -8,6 +8,7 @@
 const TILE_ROWS: u32 = 32u;
 const WG_SIZE: u32 = 256u;
 const THREADS_PER_ROW: u32 = 8u;
+const ELEMS_PER_THREAD: u32 = 128u / THREADS_PER_ROW;
 const CHUNK_SIZE: u32 = 128u;
 
 struct Uniforms {
@@ -62,9 +63,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let chunk_u32_offset = row_offset_u32 + c * u32s_per_chunk;
 
             // Each thread handles 16 elements (128 / 8)
-            let my_start = local_elem * 16u;
+            let my_start = local_elem * ELEMS_PER_THREAD;
 
-            for (var i = 0u; i < 16u; i++) {
+            for (var i = 0u; i < ELEMS_PER_THREAD; i++) {
                 let elem = my_start + i;
                 // Which u32 and which 2-bit position within that u32
                 let w_idx = elem / 16u;  // which u32 (0..7)
