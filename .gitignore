@@ -1,5 +1,6 @@
 # Build artifacts
 bitnet
+dump_model
 src/*.o
 src/quant/*.o
 src/transformer/*.o
