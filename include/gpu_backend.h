@@ -18,7 +18,8 @@
 #define BN_GPU_SHADER_RESIDUAL_ADD 8
 #define BN_GPU_SHADER_COPY         9  // pseudo-op: buffer-to-buffer copy (no shader)
 #define BN_GPU_SHADER_BIAS_ADD     10 // x[i] += bias[i], bias from W_buf
-#define BN_GPU_SHADER_COUNT        11
+#define BN_GPU_SHADER_RESIDUAL_RMSNORM 11 // fused residual_add + rmsnorm
+#define BN_GPU_SHADER_COUNT        12
 
 // GPU-resident activation buffer indices
 #define BN_GPU_BUF_X           0
@@ -33,7 +34,8 @@
 #define BN_GPU_BUF_LOGITS      9
 #define BN_GPU_BUF_ROPE_FREQ   10
 #define BN_GPU_BUF_SCRATCH     11  // temp output for KV cache writes
-#define BN_GPU_BUF_COUNT       12
+#define BN_GPU_BUF_QKV         12  // stacked QKV matvec output [q_dim + 2*kv_dim]
+#define BN_GPU_BUF_COUNT       13
 
 // A single GPU operation in the forward pass
 typedef struct {
@@ -64,6 +66,14 @@ typedef struct {
     void *(*buffer_create)(void *ctx, const void *data, size_t size,
                            int type, int rows, int cols);
     void  (*buffer_destroy)(void *ctx, void *buffer);
+
+    // Upload quantized weight data with fused bias. Returns opaque buffer handle.
+    // The bias data (float[bias_size/4]) is appended to the repacked weight buffer.
+    // Returns NULL if not supported for this type, or on failure.
+    // Optional (NULL = not supported; caller falls back to separate bias upload).
+    void *(*buffer_create_biased)(void *ctx, const void *data, size_t size,
+                                   int type, int rows, int cols,
+                                   const void *bias, size_t bias_size);
 
     // Quantized matvec: out[rows] = W[rows, cols] @ x[cols]
     // W_buf: opaque handle from buffer_create.

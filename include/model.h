@@ -140,6 +140,8 @@ typedef struct {
     void *q_bias_gpu;
     void *k_bias_gpu;
     void *v_bias_gpu;
+    // Stacked QKV weight buffer for GPU (NULL = use individual Q/K/V)
+    void *qkv_stacked_gpu;
 } BnLayerWeights;
 
 typedef struct {

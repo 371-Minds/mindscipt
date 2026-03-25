@@ -16,6 +16,10 @@ struct Uniforms {
     cols: u32,
     n_tokens: u32,
     extra: u32,
+    bias_offset: u32,  // u32 offset into weights[] for fused bias, 0 = no bias
+    _pad5: u32,
+    _pad6: u32,
+    _pad7: u32,
 }
 
 @group(0) @binding(0) var<storage, read> weights: array<u32>;
@@ -72,6 +76,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     }
 
     if (lane == 0u && global_row < uniforms.rows) {
-        out[token * uniforms.rows + global_row] = reduce_buf[row_base];
+        var result = reduce_buf[row_base];
+        // Fused bias: if bias_offset > 0, bias f32s start at that u32 offset
+        if (uniforms.bias_offset > 0u) {
+            result += bitcast<f32>(weights[uniforms.bias_offset + global_row]);
+        }
+        out[token * uniforms.rows + global_row] = result;
     }
 }

@@ -80,6 +80,7 @@ typedef struct {
     int        type;
     int        rows;
     int        cols;
+    uint32_t   bias_offset;  /* u32 offset into buffer for fused bias, 0 = none */
 } BnWgpuBuf;
 
 /* ── Uniform block for compute shaders ─────────────────────────────── */
@@ -88,8 +89,10 @@ typedef struct {
     uint32_t rows;
     uint32_t cols;
     uint32_t n_tokens;
-    uint32_t extra;  /* reserved / padding */
-} BnWgpuUniforms;
+    uint32_t extra;        /* row-tiling param for large-vocab matvec */
+    uint32_t bias_offset;  /* fused bias u32 offset, 0 = none */
+    uint32_t _pad[3];
+} BnWgpuUniforms;  /* 32 bytes, matches p[8] in BnGPUOp */
 
 /* ── Persistent buffer helper ──────────────────────────────────────── */
 
@@ -478,12 +481,15 @@ static int compile_fwd_pipeline(BnWgpuCtx *ctx, int shader_id, const char *name)
  *   Elements stored in sequential order (0..31) for clean GPU access.
  */
 static void *repack_q4_0_for_gpu(BnWgpuCtx *ctx, const void *data, size_t size,
-                                   int rows, int cols, size_t *out_size)
+                                   int rows, int cols, size_t *out_size,
+                                   const float *bias, int bias_len)
 {
     (void)size;
     int n_blocks = rows * (cols / 32);
-    size_t repacked_size = (size_t)n_blocks * 4  /* f32 scales */
-                         + (size_t)n_blocks * 16; /* nibble data (4 u32s per block) */
+    size_t base_size = (size_t)n_blocks * 4  /* f32 scales */
+                     + (size_t)n_blocks * 16; /* nibble data (4 u32s per block) */
+    size_t bias_bytes = (bias && bias_len > 0) ? (size_t)bias_len * sizeof(float) : 0;
+    size_t repacked_size = base_size + bias_bytes;
     repacked_size = (repacked_size + 3) & ~(size_t)3;
 
     uint8_t *repacked = calloc(1, repacked_size);
@@ -527,6 +533,13 @@ static void *repack_q4_0_for_gpu(BnWgpuCtx *ctx, const void *data, size_t size,
         dst_nib[15] = (qs[14] >> 4) | ((qs[15] >> 4) << 4);
     }
 
+    /* Append fused bias data after nibbles */
+    uint32_t fused_bias_offset = 0;
+    if (bias && bias_len > 0) {
+        fused_bias_offset = (uint32_t)(base_size / sizeof(uint32_t));
+        memcpy(repacked + base_size, bias, (size_t)bias_len * sizeof(float));
+    }
+
     /* Create GPU buffer and upload */
     WGPUBufferDescriptor desc = {
         .label = sv("bn_weight_q4_repacked"),
@@ -550,6 +563,7 @@ static void *repack_q4_0_for_gpu(BnWgpuCtx *ctx, const void *data, size_t size,
     handle->type = BN_GGUF_TENSOR_Q4_0;
     handle->rows = rows;
     handle->cols = cols;
+    handle->bias_offset = fused_bias_offset;
     *out_size = repacked_size;
     return handle;
 }
@@ -564,7 +578,8 @@ static void *wgpu_buffer_create(void *vctx, const void *data, size_t size,
     /* Q4_0: repack weights for optimized GPU access */
     if (type == BN_GGUF_TENSOR_Q4_0) {
         size_t repacked_size;
-        return repack_q4_0_for_gpu(ctx, data, size, rows, cols, &repacked_size);
+        return repack_q4_0_for_gpu(ctx, data, size, rows, cols, &repacked_size,
+                                    NULL, 0);
     }
 
     /* Align size to 4 bytes (WebGPU requirement) */
@@ -593,7 +608,26 @@ static void *wgpu_buffer_create(void *vctx, const void *data, size_t size,
     handle->type = type;
     handle->rows = rows;
     handle->cols = cols;
+    handle->bias_offset = 0;
     return handle;
+}
+
+/* ── Vtable: buffer_create_biased ──────────────────────────────────── */
+
+static void *wgpu_buffer_create_biased(void *vctx, const void *data, size_t size,
+                                         int type, int rows, int cols,
+                                         const void *bias, size_t bias_size)
+{
+    BnWgpuCtx *ctx = (BnWgpuCtx *)vctx;
+    if (!ctx || !ctx->device || !data || size == 0 || !bias || bias_size == 0)
+        return NULL;
+    /* Only Q4_0 supports fused bias (repacked layout with appended bias) */
+    if (type != BN_GGUF_TENSOR_Q4_0) return NULL;
+
+    int bias_len = (int)(bias_size / sizeof(float));
+    size_t repacked_size;
+    return repack_q4_0_for_gpu(ctx, data, size, rows, cols, &repacked_size,
+                                (const float *)bias, bias_len);
 }
 
 /* ── Vtable: buffer_destroy ────────────────────────────────────────── */
@@ -680,7 +714,11 @@ static int wgpu_matvec(void *vctx, float *out, void *W_buf, const float *x,
 
         wgpuComputePassEncoderSetPipeline(pass, ctx->pipelines[type]);
         wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, ((uint32_t)rows + 31u) / 32u, 1, 1);
+        {
+            uint32_t tile = (type == BN_GGUF_TENSOR_Q4_0) ? 8u : 32u;
+            wgpuComputePassEncoderDispatchWorkgroups(
+                pass, ((uint32_t)rows + tile - 1u) / tile, 1, 1);
+        }
         wgpuComputePassEncoderEnd(pass);
 
         /* Copy out_buf → staging_buf in the same command buffer */
@@ -799,8 +837,11 @@ static int wgpu_matmul(void *vctx, float *out, void *W_buf, const float *X,
 
         wgpuComputePassEncoderSetPipeline(pass, ctx->pipelines[type]);
         wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
-        wgpuComputePassEncoderDispatchWorkgroups(
-            pass, ((uint32_t)rows + 31u) / 32u, (uint32_t)n_tokens, 1);
+        {
+            uint32_t tile = (type == BN_GGUF_TENSOR_Q4_0) ? 8u : 32u;
+            wgpuComputePassEncoderDispatchWorkgroups(
+                pass, ((uint32_t)rows + tile - 1u) / tile, (uint32_t)n_tokens, 1);
+        }
         wgpuComputePassEncoderEnd(pass);
 
         /* Copy out_buf → staging_buf in the same command buffer */
@@ -957,7 +998,11 @@ static int wgpu_matvec_batch(void *vctx, const BnGPUMatvecOp *ops, int n_ops,
 
         wgpuComputePassEncoderSetPipeline(pass, ctx->pipelines[op->type]);
         wgpuComputePassEncoderSetBindGroup(pass, 0, bind_groups[i], 0, NULL);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, ((uint32_t)op->rows + 31u) / 32u, 1, 1);
+        {
+            uint32_t tile = (op->type == BN_GGUF_TENSOR_Q4_0) ? 8u : 32u;
+            wgpuComputePassEncoderDispatchWorkgroups(
+                pass, ((uint32_t)op->rows + tile - 1u) / tile, 1, 1);
+        }
         wgpuComputePassEncoderEnd(pass);
 
         /* Copy out_buf[0..out_size] → staging[staging_offset..] */
@@ -1048,6 +1093,7 @@ static int wgpu_init_activations(void *vctx, const void *config_ptr)
     sizes[BN_GPU_BUF_LOGITS]      = (size_t)c->vocab_size * sizeof(float);
     sizes[BN_GPU_BUF_ROPE_FREQ]   = (size_t)(c->head_size / 2) * sizeof(float);
     sizes[BN_GPU_BUF_SCRATCH]     = (size_t)xb_size * sizeof(float);
+    sizes[BN_GPU_BUF_QKV]         = (size_t)(q_dim + 2 * c->kv_dim) * sizeof(float);
 
     /* Create each activation buffer (Storage | CopySrc | CopyDst) */
     for (int i = 0; i < BN_GPU_BUF_COUNT; i++) {
@@ -1115,6 +1161,7 @@ static int wgpu_init_activations(void *vctx, const void *config_ptr)
         { BN_GPU_SHADER_RELU2_GATE,   "relu2_gate"   },
         { BN_GPU_SHADER_RESIDUAL_ADD, "residual_add" },
         { BN_GPU_SHADER_BIAS_ADD,     "bias_add"     },
+        { BN_GPU_SHADER_RESIDUAL_RMSNORM, "residual_rmsnorm" },
     };
     int n_fwd = (int)(sizeof(fwd_shaders) / sizeof(fwd_shaders[0]));
     int compiled = 0;
@@ -1246,6 +1293,14 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
     if (!uni_data) return -1;
     for (int i = 0; i < n_ops; i++) {
         memcpy(uni_data + (size_t)i * uni_stride, ops[i].p, 32);
+        /* Fused bias: inject bias_offset from weight buffer metadata */
+        if (ops[i].shader == BN_GPU_SHADER_MATVEC && ops[i].W_buf) {
+            BnWgpuBuf *wbuf = (BnWgpuBuf *)ops[i].W_buf;
+            if (wbuf->bias_offset > 0) {
+                uint32_t *p = (uint32_t *)(uni_data + (size_t)i * uni_stride);
+                p[4] = wbuf->bias_offset;
+            }
+        }
     }
     wgpuQueueWriteBuffer(ctx->queue, ctx->uniform_ring, 0, uni_data, needed);
     free(uni_data);
@@ -1350,6 +1405,10 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
             op_reads = BUF_BIT(op->buf_in);
             op_writes = BUF_BIT(op->buf_in);  /* in-place */
             break;
+        case BN_GPU_SHADER_RESIDUAL_RMSNORM:
+            op_reads = BUF_BIT(op->buf_in) | BUF_BIT(op->buf_aux);
+            op_writes = BUF_BIT(op->buf_in) | BUF_BIT(op->buf_out);
+            break;
         default: continue;
         }
 
@@ -1375,7 +1434,7 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
         pass_writes |= op_writes;
 
         /* Build bind group entries per shader type */
-        WGPUBindGroupEntry entries[4];
+        WGPUBindGroupEntry entries[5];
         int n_entries = 0;
         size_t uni_offset = (size_t)i * uni_stride;
 
@@ -1514,6 +1573,28 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
             n_entries = 3;
             break;
         }
+        case BN_GPU_SHADER_RESIDUAL_RMSNORM: {
+            /* 5 bindings: x(rw), r(ro), weight(ro), out(rw), uniforms */
+            BnWgpuBuf *wbuf = (BnWgpuBuf *)op->W_buf;
+            if (!wbuf) continue;
+            entries[0] = (WGPUBindGroupEntry){
+                .binding = 0, .buffer = ctx->act_bufs[op->buf_in],
+                .offset = 0, .size = ctx->act_sizes[op->buf_in]};
+            entries[1] = (WGPUBindGroupEntry){
+                .binding = 1, .buffer = ctx->act_bufs[op->buf_aux],
+                .offset = 0, .size = ctx->act_sizes[op->buf_aux]};
+            entries[2] = (WGPUBindGroupEntry){
+                .binding = 2, .buffer = wbuf->buf,
+                .offset = 0, .size = wbuf->size};
+            entries[3] = (WGPUBindGroupEntry){
+                .binding = 3, .buffer = ctx->act_bufs[op->buf_out],
+                .offset = 0, .size = ctx->act_sizes[op->buf_out]};
+            entries[4] = (WGPUBindGroupEntry){
+                .binding = 4, .buffer = ctx->uniform_ring,
+                .offset = uni_offset, .size = 32};
+            n_entries = 5;
+            break;
+        }
         default: continue;
         }
 
@@ -1560,6 +1641,9 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
         case BN_GPU_SHADER_RESIDUAL_ADD:
         case BN_GPU_SHADER_BIAS_ADD:
             wg_x = (op->p[0] + 255) / 256;  /* ceil(dim / 256) */
+            break;
+        case BN_GPU_SHADER_RESIDUAL_RMSNORM:
+            wg_x = 1;  /* single workgroup (like rmsnorm) */
             break;
         }
 
@@ -1762,8 +1846,9 @@ BnGPUBackend *bn_gpu_wgpu_create(const char *shader_dir)
         bn_gpu_wgpu_destroy(NULL);  /* ctx leaked — but OOM anyway */
         return NULL;
     }
-    gpu->buffer_create     = wgpu_buffer_create;
-    gpu->buffer_destroy    = wgpu_buffer_destroy;
+    gpu->buffer_create         = wgpu_buffer_create;
+    gpu->buffer_create_biased  = wgpu_buffer_create_biased;
+    gpu->buffer_destroy        = wgpu_buffer_destroy;
     gpu->matvec            = wgpu_matvec;
     gpu->matmul            = wgpu_matmul;
     gpu->matvec_batch      = wgpu_matvec_batch;

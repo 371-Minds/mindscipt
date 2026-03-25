@@ -1136,13 +1136,89 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
         lw->attn_norm_gpu = upload_f32_buf(gpu, lw->attn_norm, c->dim);
         lw->ffn_norm_gpu  = upload_f32_buf(gpu, lw->ffn_norm, c->dim);
 
-        // Upload attention biases (if present)
-        if (lw->q_bias)
-            lw->q_bias_gpu = upload_f32_buf(gpu, lw->q_bias, c->dim);
-        if (lw->k_bias)
-            lw->k_bias_gpu = upload_f32_buf(gpu, lw->k_bias, c->kv_dim);
-        if (lw->v_bias)
-            lw->v_bias_gpu = upload_f32_buf(gpu, lw->v_bias, c->kv_dim);
+        // Fused bias: replace individual Q/K/V weight buffers with biased versions.
+        // When successful, q_bias_gpu stays NULL (bias embedded in weight buffer).
+        if (gpu->buffer_create_biased) {
+            struct { BnQWeight *w; float *bias; void **bias_gpu; } qkv_bias[] = {
+                { &lw->wq, lw->q_bias, &lw->q_bias_gpu },
+                { &lw->wk, lw->k_bias, &lw->k_bias_gpu },
+                { &lw->wv, lw->v_bias, &lw->v_bias_gpu },
+            };
+            for (int i = 0; i < 3; i++) {
+                if (!qkv_bias[i].bias || !qkv_bias[i].w->gpu_buf) continue;
+                size_t sz = bn_qweight_data_size(qkv_bias[i].w);
+                void *fused = gpu->buffer_create_biased(gpu->ctx,
+                    qkv_bias[i].w->data, sz,
+                    qkv_bias[i].w->type, qkv_bias[i].w->rows, qkv_bias[i].w->cols,
+                    qkv_bias[i].bias,
+                    (size_t)qkv_bias[i].w->rows * sizeof(float));
+                if (fused) {
+                    gpu->buffer_destroy(gpu->ctx, qkv_bias[i].w->gpu_buf);
+                    qkv_bias[i].w->gpu_buf = fused;
+                    /* bias is fused — don't set bias_gpu */
+                } else {
+                    *qkv_bias[i].bias_gpu = upload_f32_buf(gpu, qkv_bias[i].bias,
+                                                            qkv_bias[i].w->rows);
+                }
+            }
+        } else {
+            if (lw->q_bias)
+                lw->q_bias_gpu = upload_f32_buf(gpu, lw->q_bias, c->dim);
+            if (lw->k_bias)
+                lw->k_bias_gpu = upload_f32_buf(gpu, lw->k_bias, c->kv_dim);
+            if (lw->v_bias)
+                lw->v_bias_gpu = upload_f32_buf(gpu, lw->v_bias, c->kv_dim);
+        }
+
+        // Stacked QKV weight buffer for improved GPU occupancy.
+        // Only created when all Q/K/V are same type and same cols.
+        // I2_S excluded: per-tensor scale at end of data breaks concatenation.
+        if (lw->wq.data && lw->wk.data && lw->wv.data &&
+            lw->wq.type != BN_GGUF_TENSOR_I2_S &&
+            lw->wq.type == lw->wk.type && lw->wq.type == lw->wv.type &&
+            lw->wq.cols == lw->wk.cols && lw->wq.cols == lw->wv.cols) {
+
+            int total_rows = lw->wq.rows + lw->wk.rows + lw->wv.rows;
+            size_t q_sz = bn_qweight_data_size(&lw->wq);
+            size_t k_sz = bn_qweight_data_size(&lw->wk);
+            size_t v_sz = bn_qweight_data_size(&lw->wv);
+            size_t combined_sz = q_sz + k_sz + v_sz;
+
+            uint8_t *combined = (uint8_t *)malloc(combined_sz);
+            if (combined) {
+                memcpy(combined, lw->wq.data, q_sz);
+                memcpy(combined + q_sz, lw->wk.data, k_sz);
+                memcpy(combined + q_sz + k_sz, lw->wv.data, v_sz);
+
+                // Check if all biases are fused (bias_gpu ptrs are NULL)
+                int all_biased = lw->q_bias && !lw->q_bias_gpu &&
+                                 lw->k_bias && !lw->k_bias_gpu &&
+                                 lw->v_bias && !lw->v_bias_gpu;
+                int no_bias = !lw->q_bias && !lw->k_bias && !lw->v_bias;
+
+                if (all_biased && gpu->buffer_create_biased) {
+                    float *cbias = (float *)malloc((size_t)total_rows * sizeof(float));
+                    if (cbias) {
+                        memcpy(cbias, lw->q_bias,
+                               (size_t)lw->wq.rows * sizeof(float));
+                        memcpy(cbias + lw->wq.rows, lw->k_bias,
+                               (size_t)lw->wk.rows * sizeof(float));
+                        memcpy(cbias + lw->wq.rows + lw->wk.rows, lw->v_bias,
+                               (size_t)lw->wv.rows * sizeof(float));
+                        lw->qkv_stacked_gpu = gpu->buffer_create_biased(
+                            gpu->ctx, combined, combined_sz,
+                            lw->wq.type, total_rows, lw->wq.cols,
+                            cbias, (size_t)total_rows * sizeof(float));
+                        free(cbias);
+                    }
+                } else if (no_bias) {
+                    lw->qkv_stacked_gpu = gpu->buffer_create(
+                        gpu->ctx, combined, combined_sz,
+                        lw->wq.type, total_rows, lw->wq.cols);
+                }
+                free(combined);
+            }
+        }
     }
 
     return 0;
@@ -1187,6 +1263,10 @@ void bn_model_release_gpu(BnModel *model) {
             release_f32_buf(gpu, &lw->q_bias_gpu);
             release_f32_buf(gpu, &lw->k_bias_gpu);
             release_f32_buf(gpu, &lw->v_bias_gpu);
+            if (lw->qkv_stacked_gpu) {
+                gpu->buffer_destroy(gpu->ctx, lw->qkv_stacked_gpu);
+                lw->qkv_stacked_gpu = NULL;
+            }
         }
     }
 

@@ -28,8 +28,11 @@ fn fp16_to_f32(bits: u32) -> f32 {
     let sign = (bits >> 15u) & 1u;
     let exp = (bits >> 10u) & 0x1Fu;
     let mant = bits & 0x3FFu;
-    if (exp == 0u && mant == 0u) {
-        return select(0.0, -0.0, sign == 1u);
+    if (exp == 0u) {
+        if (mant == 0u) { return select(0.0, -0.0, sign == 1u); }
+        // Subnormal FP16: value = +/-2^(-24) * mant
+        let val = f32(mant) * 5.9604644775390625e-8;
+        return select(val, -val, sign == 1u);
     }
     let f_bits = (sign << 31u) | ((exp + 112u) << 23u) | (mant << 13u);
     return bitcast<f32>(f_bits);
