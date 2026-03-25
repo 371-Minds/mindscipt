@@ -60,14 +60,18 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 
             for (var i = 0u; i < ELEMS_PER_THREAD; i++) {
                 let elem = my_start + i;
-                // Which u32 and which 2-bit position within that u32
-                let w_idx = elem / 16u;  // which u32 (0..7)
-                let byte_in_word = (elem / 4u) % 4u;
-                let bit_in_byte = elem % 4u;
+                // I2_S interleaved layout: byte gp contains 4 elements
+                // at positions gp, 32+gp, 64+gp, 96+gp within the chunk.
+                // bits [7:6]→gp, [5:4]→32+gp, [3:2]→64+gp, [1:0]→96+gp
+                let quarter = elem / 32u;  // which group (0..3)
+                let gp = elem % 32u;       // byte index within 32-byte chunk
 
+                let w_idx = gp / 4u;       // which u32 (0..7)
+                let byte_in_word = gp % 4u;
                 let word = weights[chunk_u32_offset + w_idx];
                 let byte_val = (word >> (byte_in_word * 8u)) & 0xFFu;
-                let v = (byte_val >> (bit_in_byte * 2u)) & 3u;
+                let shift = (3u - quarter) * 2u;
+                let v = (byte_val >> shift) & 3u;
 
                 // Map: 0→-1, 1→0, 2→+1, 3→0
                 let dv = select(f32(i32(v) - 1), 0.0, v == 3u);
