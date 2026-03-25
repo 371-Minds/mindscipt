@@ -1289,7 +1289,9 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
     double t0_all = bn_platform_time_ms();
 
     /* 1. Upload all per-dispatch uniforms to the ring buffer.
-     * Each slot is 256-byte aligned (min_uniform_buffer_offset_alignment). */
+     * Each slot is 256-byte aligned (min_uniform_buffer_offset_alignment).
+     * Ring holds 1024 slots — sufficient for current models (max ~650 ops at 36 layers).
+     * AUDIT(M7): if models exceed 1024 ops/token, this needs dynamic sizing. */
     size_t uni_stride = 256;
     size_t needed = (size_t)n_ops * uni_stride;
     if (needed > ctx->uniform_ring_size) return -1;

@@ -40,7 +40,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let chunks_per_row = cols / CHUNK_SIZE;
     let x_base = token * cols;
 
-    // Per-tensor scale at end of weight data
+    // Per-tensor scale at end of weight data.
+    // AUDIT(M9): u32 arithmetic overflows if rows*cols > 2^32; safe for models up to ~4B elements.
     let scale_offset = uniforms.rows * cols / 16u;
     let scale = bitcast<f32>(weights[scale_offset]);
 
