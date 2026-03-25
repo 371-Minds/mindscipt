@@ -485,7 +485,7 @@ static void *repack_q4_0_for_gpu(BnWgpuCtx *ctx, const void *data, size_t size,
                                    const float *bias, int bias_len)
 {
     (void)size;
-    int n_blocks = rows * (cols / 32);
+    int n_blocks = (int)((size_t)rows * ((unsigned)cols / 32));
     size_t base_size = (size_t)n_blocks * 4  /* f32 scales */
                      + (size_t)n_blocks * 16; /* nibble data (4 u32s per block) */
     size_t bias_bytes = (bias && bias_len > 0) ? (size_t)bias_len * sizeof(float) : 0;

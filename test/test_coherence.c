@@ -214,12 +214,15 @@ int main(int argc, char **argv) {
     BnGGUFFile *gf = bn_gguf_open(mf.data, mf.size);
     if (!gf) {
         fprintf(stderr, "Failed to parse GGUF\n");
+        bn_platform_unload_file(&mf);
         return 1;
     }
 
     BnModel model;
     if (bn_model_load(&model, gf, 2048, 0) != 0) {
         fprintf(stderr, "Failed to load model\n");
+        bn_gguf_free(gf);
+        bn_platform_unload_file(&mf);
         return 1;
     }
     model.file = mf;

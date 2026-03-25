@@ -980,6 +980,7 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
     int rope_dims = c->rope_dim_count > 0 ? c->rope_dim_count : head_size;
 
     // Embed token on CPU, upload to GPU x buffer
+    if (dim > BN_MAX_VLA_ELEMS) return NULL;
     float emb[dim];
     bn_model_embed_token(m, emb, token);
     if (gpu->write_activation(gpu->ctx, BN_GPU_BUF_X, emb,
@@ -1021,8 +1022,10 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
     uint32_t u_eps;
     { float eps = c->norm_eps; memcpy(&u_eps, &eps, 4); }
 
-    // Max ops: ~21 per layer + initial rmsnorm + logits
-    int max_ops = 23 * c->n_layers + 4;
+    // Max ops per layer: QKV stacked (9) or individual+3 bias (13), GQA (4),
+    // Wo (1), fused resid+norm (1), FFN gated (3), down (1), fused resid+norm (1) = ~23 max
+    // Add margin for safety.
+    int max_ops = 26 * c->n_layers + 4;
     BnGPUOp *ops = (BnGPUOp *)malloc((size_t)max_ops * sizeof(BnGPUOp));
     if (!ops) return NULL;
     int n = 0;
