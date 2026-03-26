@@ -1115,6 +1115,7 @@ static float *forward_logits(BnModel *m, BnSession *sess) {
 // Supports attention biases (Qwen2.5) and tied embeddings (BitNet).
 // Returns s->logits on success, NULL to fall back to CPU.
 static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
+    (void)0;
     BnConfig *c = &m->config;
     BnWeights *w = &m->weights;
     BnRunState *s = &sess->state;
@@ -1153,12 +1154,11 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
         BnLayerWeights *lw = &w->layers[l];
         int is_attn = (c->full_attn_interval == 0) ||
                       ((l + 1) % c->full_attn_interval == 0);
-        if (!is_attn) { has_ssm = 1; continue; }           // SSM: skip GPU validation
+        if (!is_attn) { has_ssm = 1; continue; }
         if (lw->router_weight) { has_moe = 1; }
         if (!lw->wq.data) return NULL;
-        // Q-gated: fall back to CPU until deinterleave shader is verified
+        // Q-gated: fall back to CPU (deinterleave + stacked QKV interaction needs debugging)
         if (lw->wq.rows > q_dim) return NULL;
-        // Q/K norms: require GPU handles if present
         if (lw->q_norm && !lw->q_norm_gpu) return NULL;
         if (lw->k_norm && !lw->k_norm_gpu) return NULL;
         if (lw->attn_sub_norm && !lw->attn_sub_norm_gpu) return NULL;
@@ -1344,7 +1344,8 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
         int n_kv = (pos + 1 < c->seq_len) ? pos + 1 : c->seq_len;
 
         // ---- QKV matvecs ----
-        if (lw->qkv_stacked_gpu) {
+        // Q-gated layers must use separate Q/K/V path (stacked doesn't handle interleaved Q+Gate)
+        if (lw->qkv_stacked_gpu && lw->wq.rows <= q_dim) {
             // Stacked QKV: single matvec -> QKV buf, then split
             int total_rows = lw->wq.rows + lw->wk.rows + lw->wv.rows;
             ops[n++] =(BnGPUOp){
@@ -1429,6 +1430,7 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
                     .shader = BN_GPU_SHADER_DEINTERLEAVE_Q, .type = -1, .W_buf = NULL,
                     .buf_in = BN_GPU_BUF_QKV, .buf_out = BN_GPU_BUF_Q, .buf_aux = -1,
                     .p = { (uint32_t)q_dim, (uint32_t)head_size, 0, 0, 0, 0, 0, 0 } };
+                (void)0; // debug removed
             } else {
                 // Standard Q matvec to Q buffer
                 ops[n++] = (BnGPUOp){
