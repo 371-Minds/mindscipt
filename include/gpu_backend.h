@@ -19,7 +19,13 @@
 #define BN_GPU_SHADER_COPY         9  // pseudo-op: buffer-to-buffer copy (no shader)
 #define BN_GPU_SHADER_BIAS_ADD     10 // x[i] += bias[i], bias from W_buf
 #define BN_GPU_SHADER_RESIDUAL_RMSNORM 11 // fused residual_add + rmsnorm
-#define BN_GPU_SHADER_COUNT        12
+#define BN_GPU_SHADER_WEIGHTED_ADD   12 // x[i] += weight * r[i] (MoE expert accum)
+#define BN_GPU_SHADER_SSM_CONV_SILU  13 // Conv1d + SiLU + conv_state shift
+#define BN_GPU_SHADER_SSM_L2NORM     14 // Per-head L2 normalization of Q/K
+#define BN_GPU_SHADER_SSM_ALPHA_BETA 15 // Softplus + exp/sigmoid for decay/update
+#define BN_GPU_SHADER_SSM_DELTA      16 // Delta rule recurrence
+#define BN_GPU_SHADER_SSM_GATE       17 // Per-head RMSNorm + SiLU gate
+#define BN_GPU_SHADER_COUNT          18
 
 // GPU-resident activation buffer indices
 #define BN_GPU_BUF_X           0
@@ -35,7 +41,17 @@
 #define BN_GPU_BUF_ROPE_FREQ   10
 #define BN_GPU_BUF_SCRATCH     11  // temp output for KV cache writes
 #define BN_GPU_BUF_QKV         12  // stacked QKV matvec output [q_dim + 2*kv_dim]
-#define BN_GPU_BUF_COUNT       13
+// MoE buffers
+#define BN_GPU_BUF_MOE_HB     13  // expert gate output [moe_hidden_dim]
+#define BN_GPU_BUF_MOE_HB2    14  // expert up output [moe_hidden_dim]
+#define BN_GPU_BUF_MOE_OUT    15  // accumulated expert output [dim]
+// SSM buffers (persistent across tokens)
+#define BN_GPU_BUF_SSM_STATE      16  // [n_ssm * num_v_heads * hk * hv]
+#define BN_GPU_BUF_SSM_CONV_STATE 17  // [n_ssm * (kern-1) * qkv_dim]
+#define BN_GPU_BUF_SSM_QKV        18  // SSM QKV projection output [qkv_dim]
+#define BN_GPU_BUF_SSM_Z          19  // Z gate projection output [value_dim]
+#define BN_GPU_BUF_SSM_AB         20  // alpha + beta [2 * num_v_heads]
+#define BN_GPU_BUF_COUNT          21
 
 // Shader uniform parameter count (32 bytes = 8 × u32, matches WGSL Uniforms structs)
 #define BN_GPU_OP_PARAMS 8
