@@ -203,6 +203,9 @@ Optional GPU inference via wgpu-native. Build with `make BN_ENABLE_GPU=1 WGPU_LI
 - `--gpu` CLI flag enables GPU inference
 - Single-submit forward pass: one command buffer per token
 - Hull-compatible: `WGPU_LIB_DIR` override avoids double-vendoring
+- WSL2 requires a patched Mesa dzn driver — see `patches/` directory and `patches/build-dzn.sh`
+- WSL2 GPU run: `LD_LIBRARY_PATH=/usr/lib/wsl/lib VK_ICD_FILENAMES=/tmp/mesa-dzn/build/src/microsoft/vulkan/dzn_devenv_icd.x86_64.json ./bitnet model.gguf --gpu --maxseq 4096`
+- `--maxseq` is recommended on GPU to cap KV cache VRAM (models with 256K context will OOM otherwise)
 
 ## Common Tasks
 

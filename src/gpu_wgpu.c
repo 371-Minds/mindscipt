@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 
 /* Max tensor type enum value we index into (I2_S = 36, plus margin) */
 #define BN_WGPU_MAX_TYPES 40
@@ -70,6 +71,9 @@ typedef struct {
 
     /* Shader directory path (stored from create) */
     char shader_dir[256];
+
+    /* Device limits (stored at creation for runtime validation) */
+    uint64_t max_buffer_size;
 
     /* Profiling state */
     int gpu_frame;
@@ -1070,6 +1074,8 @@ cleanup:
     return rc;
 }
 
+static void wgpu_free_activations(void *vctx);  /* forward decl for cleanup */
+
 /* ── Vtable: init_activations ──────────────────────────────────────── */
 
 static int wgpu_init_activations(void *vctx, const void *config_ptr)
@@ -1127,6 +1133,16 @@ static int wgpu_init_activations(void *vctx, const void *config_ptr)
         sizes[BN_GPU_BUF_SSM_V]          = (size_t)value_dim * sizeof(float);
     }
 
+    /* Validate buffer sizes against device limits before allocating */
+    for (int i = 0; i < BN_GPU_BUF_COUNT; i++) {
+        if (sizes[i] > 0 && (uint64_t)sizes[i] > ctx->max_buffer_size) {
+            fprintf(stderr, "[bn:gpu:wgpu] activation buffer %d size %zu exceeds "
+                    "maxBufferSize %llu (try --maxseq to reduce context length)\n",
+                    i, sizes[i], (unsigned long long)ctx->max_buffer_size);
+            return -1;
+        }
+    }
+
     /* Create each activation buffer (Storage | CopySrc | CopyDst) */
     for (int i = 0; i < BN_GPU_BUF_COUNT; i++) {
         if (sizes[i] == 0) continue;
@@ -1138,7 +1154,10 @@ static int wgpu_init_activations(void *vctx, const void *config_ptr)
             .size = aligned,
         };
         ctx->act_bufs[i] = wgpuDeviceCreateBuffer(ctx->device, &desc);
-        if (!ctx->act_bufs[i]) return -1;
+        if (!ctx->act_bufs[i]) {
+            wgpu_free_activations(ctx);
+            return -1;
+        }
         ctx->act_sizes[i] = aligned;
     }
 
@@ -1945,10 +1964,13 @@ BnGPUBackend *bn_gpu_wgpu_create(const char *shader_dir)
     if (!ctx) return NULL;
     ctx->gpu_profile = -1;  /* uninitialized, checked on first execute */
 
-    /* Create instance with primary backends */
+    /* Create instance with primary backends.
+     * Bit 3 = AllowUnderlyingNonCompliantAdapter (not in wgpu.h yet),
+     * needed for Mesa dzn (Vulkan-over-D3D12) on WSL2. */
     WGPUInstanceExtras extras = {
         .chain = { .sType = (WGPUSType)WGPUSType_InstanceExtras },
         .backends = WGPUInstanceBackend_Primary,
+        .flags = WGPUInstanceFlag_Default | (1 << 3),
     };
     WGPUInstanceDescriptor inst_desc = {
         .nextInChain = &extras.chain,
@@ -1963,6 +1985,7 @@ BnGPUBackend *bn_gpu_wgpu_create(const char *shader_dir)
     /* Request high-performance adapter */
     AdapterReq areq = {0};
     WGPURequestAdapterOptions adapter_opts = {
+        .featureLevel = WGPUFeatureLevel_Compatibility,
         .powerPreference = WGPUPowerPreference_HighPerformance,
     };
     WGPURequestAdapterCallbackInfo adapter_cb = {
@@ -1985,12 +2008,19 @@ BnGPUBackend *bn_gpu_wgpu_create(const char *shader_dir)
     WGPUStatus lim_status = wgpuAdapterGetLimits(ctx->adapter, &limits);
     if (lim_status != WGPUStatus_Success) {
         fprintf(stderr, "[bn:gpu:wgpu] failed to get adapter limits\n");
+        wgpuAdapterRelease(ctx->adapter);
+        wgpuInstanceRelease(ctx->instance);
+        free(ctx);
+        return NULL;
     }
-    /* Override buffer sizes to allow large weight tensors (up to 2GB) */
-    if (limits.maxStorageBufferBindingSize < (uint64_t)2u * 1024 * 1024 * 1024)
-        limits.maxStorageBufferBindingSize = (uint64_t)2u * 1024 * 1024 * 1024;
-    if (limits.maxBufferSize < (uint64_t)2u * 1024 * 1024 * 1024)
-        limits.maxBufferSize = (uint64_t)2u * 1024 * 1024 * 1024;
+    /* Use adapter limits as-is — they represent the hardware maximum.
+     * Clamp to wgpu's INT32_MAX ceiling to avoid off-by-one validation. */
+    const uint64_t wgpu_ceil = (uint64_t)INT32_MAX;
+    if (limits.maxStorageBufferBindingSize > wgpu_ceil)
+        limits.maxStorageBufferBindingSize = wgpu_ceil;
+    if (limits.maxBufferSize > wgpu_ceil)
+        limits.maxBufferSize = wgpu_ceil;
+    ctx->max_buffer_size = limits.maxBufferSize;
     /* Request ShaderF16 feature for f16 WGSL shaders */
     WGPUFeatureName required_features[] = { WGPUFeatureName_ShaderF16 };
     WGPUDeviceDescriptor dev_desc = {

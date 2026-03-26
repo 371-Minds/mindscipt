@@ -426,6 +426,33 @@ The GPU backend uses 31 WGSL shaders (23 matvec covering all quantization format
 
 For Hull integration, set `WGPU_LIB_DIR` to avoid double-vendoring the wgpu-native library.
 
+### GPU on WSL2
+
+WSL2 does not ship a native NVIDIA Vulkan ICD. GPU inference requires Mesa's **dzn** (Dozen) driver, which translates Vulkan calls to D3D12 and routes them to the host GPU. Stock dzn lacks extensions wgpu-native requires, so a patch is included.
+
+```bash
+# Prerequisites
+sudo apt-get install -y meson libdrm-dev libelf-dev llvm-dev \
+  libexpat1-dev directx-headers-dev ninja-build python3-mako libvulkan-dev
+pip3 install --user meson   # need meson >= 1.4
+
+# Build patched dzn driver (~1 min)
+./patches/build-dzn.sh
+
+# Run with GPU
+LD_LIBRARY_PATH=/usr/lib/wsl/lib \
+VK_ICD_FILENAMES=/tmp/mesa-dzn/build/src/microsoft/vulkan/dzn_devenv_icd.x86_64.json \
+./bitnet model.gguf --gpu --maxseq 4096 -p "Hello" -n 64
+```
+
+**Note:** `--maxseq 4096` (or similar) is recommended on GPU to keep KV cache buffers within VRAM. Without it, models with large context windows (e.g. 256K) will try to allocate terabytes of KV cache on the GPU.
+
+The patch (`patches/mesa-dzn-wgpu-compat.patch`) makes these changes to Mesa's dzn driver:
+- Advertises `VK_EXT_robustness2`, `VK_EXT_image_robustness`, `VK_KHR_zero_initialize_workgroup_memory` (D3D12 provides the underlying guarantees)
+- Raises `maxStorageBufferRange` from 128 MB to 2 GB-1 (D3D12 supports this)
+- Sets robustness2 alignment properties (required by wgpu, D3D12 has no alignment constraint)
+- Reports conformance version 1.0.0.0 (wgpu rejects adapters reporting 0.0.0.0)
+
 ## Model Support
 
 Tested models with generation quality and performance on Apple M1 Max (8 P-cores, 32 GB), release build, greedy decoding, 8 threads:

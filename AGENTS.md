@@ -90,6 +90,7 @@ Modules have strict, one-directional dependencies. When modifying a module, only
 - `--kv-tq <bits>` — TurboQuant KV cache compression (2, 3, or 4 bits; recommended: 3). 8.9x per-session KV compression — the key benefit is multi-user serving: ~9x more concurrent sessions in the same RAM. Combine with `--pread --cache-mb 2048` for minimal footprint: 35B MoE + 64K context = 8.4 GB/session (vs 26 GB with FP32 KV).
 - `--no-prefill` — disable batch prefill
 - `--gpu` — enable GPU inference (requires `BN_ENABLE_GPU=1` build)
+- `--maxseq N` — cap sequence length (recommended on GPU to limit KV cache VRAM)
 - `-t N` — thread count
 
 ## WASM Specifics
@@ -98,3 +99,16 @@ Modules have strict, one-directional dependencies. When modifying a module, only
 - Maximum 2 GB WASM memory — constrains model + KV cache size
 - `wasm/api.c` uses global state (single model instance)
 - All WASM-exported functions must be listed in `wasm/build.sh`
+
+## GPU on WSL2
+
+WSL2 lacks a native NVIDIA Vulkan ICD. GPU inference uses Mesa's **dzn** (Dozen) driver, which translates Vulkan to D3D12. Stock dzn is missing extensions wgpu-native requires (`VK_EXT_robustness2`, etc.), so a patch is provided in `patches/mesa-dzn-wgpu-compat.patch`.
+
+**Setup:**
+1. Install deps: `sudo apt-get install -y meson libdrm-dev libelf-dev llvm-dev libexpat1-dev directx-headers-dev ninja-build python3-mako libvulkan-dev && pip3 install --user meson`
+2. Run `./patches/build-dzn.sh` (clones Mesa, applies patch, builds dzn — ~1 min)
+3. Run with: `LD_LIBRARY_PATH=/usr/lib/wsl/lib VK_ICD_FILENAMES=/tmp/mesa-dzn/build/src/microsoft/vulkan/dzn_devenv_icd.x86_64.json ./bitnet model.gguf --gpu --maxseq 4096`
+
+**What the patch does:** Adds `VK_EXT_robustness2` + `VK_EXT_image_robustness` (D3D12 provides the guarantees natively), raises `maxStorageBufferRange` to 2GB-1, sets robustness2 alignment properties, and bumps the conformance version so wgpu accepts the adapter.
+
+**Important:** Use `--maxseq` on GPU to cap KV cache size. Models with large context windows (e.g. 256K) will try to allocate far more VRAM than available without this flag.
