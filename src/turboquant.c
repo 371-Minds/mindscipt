@@ -32,13 +32,6 @@ static uint64_t tq_rng_next(void) {
     return result;
 }
 
-// Box-Muller: generate standard normal N(0,1)
-static float tq_randn(void) {
-    float u1 = (float)((tq_rng_next() >> 11) + 1) / (float)(1ULL << 53);
-    float u2 = (float)((tq_rng_next() >> 11) + 1) / (float)(1ULL << 53);
-    return sqrtf(-2.0f * logf(u1)) * cosf(6.283185307f * u2);
-}
-
 // --- Lloyd-Max centroids for N(0,1), hardcoded ---
 // These are the optimal scalar quantization centroids for a standard Gaussian.
 // Scaled by 1/sqrt(d) at init time.
@@ -108,6 +101,19 @@ static void rht_inverse(const BnTQState *st, const float *in, float *out, int d)
     fwht_inplace(out, d);
     for (int i = 0; i < d; i++)
         out[i] *= st->rht_signs[i];
+}
+
+// QJL sign projection via RHT: out_signs = sign(H * D_qjl * in)
+// Produces d/8 bytes of packed sign bits. O(d log d).
+static void qjl_project_signs(const BnTQState *st, const float *in, uint8_t *out_signs, int d) {
+    float tmp[d];
+    for (int i = 0; i < d; i++)
+        tmp[i] = st->qjl_signs[i] * in[i];
+    fwht_inplace(tmp, d);
+    memset(out_signs, 0, d / 8);
+    for (int i = 0; i < d; i++)
+        if (tmp[i] >= 0.0f)
+            out_signs[i / 8] |= (1 << (i % 8));
 }
 
 // --- Quantize a scalar to nearest centroid index ---
@@ -296,11 +302,11 @@ int bn_tq_init(BnTQState *state, int head_dim, int bits, uint64_t seed) {
         state->rht_signs[i] = (tq_rng_next() & 1) ? 1.0f : -1.0f;
     state->rht_scale = inv_sqrt_d;
 
-    // Generate QJL random matrix S [d×d]
-    state->qjl_S = (float *)malloc((size_t)d * d * sizeof(float));
-    if (!state->qjl_S) { bn_tq_free(state); return -1; }
-    for (int i = 0; i < d * d; i++)
-        state->qjl_S[i] = tq_randn();
+    // Generate QJL diagonal signs (second RHT with independent signs)
+    state->qjl_signs = (float *)malloc((size_t)d * sizeof(float));
+    if (!state->qjl_signs) { bn_tq_free(state); return -1; }
+    for (int i = 0; i < d; i++)
+        state->qjl_signs[i] = (tq_rng_next() & 1) ? 1.0f : -1.0f;
 
     return 0;
 }
@@ -308,9 +314,9 @@ int bn_tq_init(BnTQState *state, int head_dim, int bits, uint64_t seed) {
 void bn_tq_free(BnTQState *state) {
     if (!state) return;
     free(state->rht_signs);
+    free(state->qjl_signs);
     free(state->centroids);
     free(state->boundaries);
-    free(state->qjl_S);
     memset(state, 0, sizeof(BnTQState));
 }
 
@@ -347,16 +353,9 @@ void bn_tq_quantize_key(const BnTQState *st, const float *key, uint8_t *out) {
     }
     float res_norm = sqrtf(res_norm_sq);
 
-    // Step 5: QJL sign projection: sign(S * residual)
+    // Step 5: QJL sign projection via RHT: sign(H * D_qjl * residual)
     uint8_t qjl_signs[qjl_sz];
-    memset(qjl_signs, 0, qjl_sz);
-    for (int i = 0; i < d; i++) {
-        float dot = 0.0f;
-        const float *row = st->qjl_S + i * d;
-        for (int j = 0; j < d; j++) dot += row[j] * residual[j];
-        if (dot >= 0.0f)
-            qjl_signs[i / 8] |= (1 << (i % 8));
-    }
+    qjl_project_signs(st, residual, qjl_signs, d);
 
     // Pack output: [indices][qjl_signs][residual_norm_fp16][vec_norm_fp16]
     pack_indices(indices, d, st->bits, out);
@@ -413,16 +412,9 @@ void bn_tq_attention_scores(const BnTQState *st, const float *rotated_q,
     int idx_sz = index_bytes(d, st->bits);
     int qjl_sz = d / 8;
 
-    // Precompute sign(S * rotated_q) for QJL correction
+    // Precompute sign(H * D_qjl * rotated_q) for QJL correction
     uint8_t q_signs[qjl_sz];
-    memset(q_signs, 0, qjl_sz);
-    for (int i = 0; i < d; i++) {
-        float dot = 0.0f;
-        const float *row = st->qjl_S + i * d;
-        for (int j = 0; j < d; j++) dot += row[j] * rotated_q[j];
-        if (dot >= 0.0f)
-            q_signs[i / 8] |= (1 << (i % 8));
-    }
+    qjl_project_signs(st, rotated_q, q_signs, d);
 
     float qjl_scale = sqrtf(3.14159265f / 2.0f) / (float)d;
 

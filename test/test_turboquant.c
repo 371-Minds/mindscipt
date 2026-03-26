@@ -219,9 +219,9 @@ static void test_deterministic(void) {
     for (int i = 0; i < 128; i++)
         assert(st1.rht_signs[i] == st2.rht_signs[i]);
 
-    // Same seed → same QJL
-    for (int i = 0; i < 128 * 128; i++)
-        assert(st1.qjl_S[i] == st2.qjl_S[i]);
+    // Same seed → same QJL signs
+    for (int i = 0; i < 128; i++)
+        assert(st1.qjl_signs[i] == st2.qjl_signs[i]);
 
     bn_tq_free(&st1);
     bn_tq_free(&st2);

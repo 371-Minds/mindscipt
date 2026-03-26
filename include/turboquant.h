@@ -13,9 +13,9 @@ typedef struct {
     int n_centroids;    // 2^bits
     float *centroids;   // [2^b] Lloyd-Max centroids (scaled by 1/sqrt(d))
     float *boundaries;  // [2^b - 1] decision boundaries
-    float *qjl_S;       // [d*d] random Gaussian matrix for QJL (keys only)
     // RHT state: y = (1/sqrt(d)) * H * D * x
-    float *rht_signs;   // [d] random ±1 diagonal
+    float *rht_signs;   // [d] random ±1 diagonal for rotation
+    float *qjl_signs;   // [d] random ±1 diagonal for QJL projection
     float rht_scale;    // 1/sqrt(d) normalization
 } BnTQState;
 
