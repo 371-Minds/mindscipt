@@ -1,4 +1,5 @@
 #include "transformer_internal.h"
+#include "turboquant.h"
 #include "quant_internal.h"
 #include "gpu_backend.h"
 #include "moe.h"
@@ -66,6 +67,60 @@ static void bl_print_reset(void) {
 #endif
 
 // --- Forward pass ---
+
+// TQ KV write: quantize float K/V vectors into compressed TQ cache.
+// k_tmp/v_tmp: [kv_dim] float vectors after norms + RoPE.
+// attn_idx: layer index among attention layers.
+// cache_pos: position within seq_len (modular).
+static inline void tq_write_kv(const BnTQState *tq, BnRunState *s,
+                                const float *k_tmp, const float *v_tmp,
+                                int n_kv_heads, int head_size,
+                                int attn_idx, int cache_pos, int seq_len) {
+    int key_bytes = bn_tq_key_bytes(tq);
+    int val_bytes = bn_tq_value_bytes(tq);
+    size_t tq_loff_k = (size_t)attn_idx * seq_len * n_kv_heads * key_bytes;
+    size_t tq_loff_v = (size_t)attn_idx * seq_len * n_kv_heads * val_bytes;
+    uint8_t *kc_tq = s->key_cache_tq   + tq_loff_k + (size_t)cache_pos * n_kv_heads * key_bytes;
+    uint8_t *vc_tq = s->value_cache_tq + tq_loff_v + (size_t)cache_pos * n_kv_heads * val_bytes;
+    for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
+        bn_tq_quantize_key(tq, k_tmp + kv_h * head_size, kc_tq + kv_h * key_bytes);
+        bn_tq_quantize_value(tq, v_tmp + kv_h * head_size, vc_tq + kv_h * val_bytes);
+    }
+}
+
+// TQ GQA dispatch: set up context and dispatch TQ attention.
+static inline void tq_gqa_dispatch(BnModel *m, BnRunState *s,
+                                    int attn_idx, int pos, int n_heads,
+                                    int n_kv_heads, int head_size, int kv_mul) {
+    const BnConfig *c = &m->config;
+    const BnTQState *tq = m->tq_state;
+    int key_bytes = bn_tq_key_bytes(tq);
+    int val_bytes = bn_tq_value_bytes(tq);
+    int n_kv = (pos + 1 < c->seq_len) ? pos + 1 : c->seq_len;
+
+    size_t tq_loff_k = (size_t)attn_idx * c->seq_len * n_kv_heads * key_bytes;
+    size_t tq_loff_v = (size_t)attn_idx * c->seq_len * n_kv_heads * val_bytes;
+
+    BnGQATQCtx tctx = {
+        .c = c, .s = s, .tq = tq,
+        .tq_keys = s->key_cache_tq + tq_loff_k,
+        .tq_values = s->value_cache_tq + tq_loff_v,
+        .key_stride = n_kv_heads * key_bytes,
+        .val_stride = n_kv_heads * val_bytes,
+        .key_bytes = key_bytes,
+        .val_bytes = val_bytes,
+        .pos = pos, .n_kv = n_kv, .kv_mul = kv_mul,
+        .head_size = head_size, .seq_len = c->seq_len,
+        .n_kv_heads = n_kv_heads
+    };
+#ifdef __ARM_NEON
+    bn_tp_fn attn_fn = bn_transformer_gqa_tq_neon_range;
+#else
+    bn_tp_fn attn_fn = bn_transformer_gqa_tq_scalar_range;
+#endif
+    BnTPTask gqa = { attn_fn, &tctx, n_heads };
+    bn_tp_dispatch(m->pool, &gqa, 1);
+}
 
 // Inline helper: add residual xb (or xb2) into x
 static inline void residual_add(float *x, const float *r, int dim) {
@@ -410,39 +465,61 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
         if (q_gated) {
             // --- Gated Q path (Qwen3.5 attention) ---
             float *q_full = s->hb;  // [2*dim]
+            float *k_tmp = s->hb2;
+            float *v_tmp = s->hb2 + kv_dim;
 
-            if (c->kv_f16) {
-                float *k_tmp = s->hb2;
-                float *v_tmp = s->hb2 + kv_dim;
+            // Q + K/V matvecs (always to temp buffers)
+            {
                 BnMatvecTask q_task[1] = {{ q_full, &lw->wq }};
                 bn_quant_matvec_batch_gpu(q_task, 1, s->xb, s->x_q, m->pool, m->gpu);
+            }
+            if (!(c->kv_tq_bits > 0 && m->tq_state) && !c->kv_f16) {
+                // FP32 path: write directly to cache
+                float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
+                float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
+                BnMatvecTask kv[2] = {
+                    { key_cache_row,   &lw->wk },
+                    { value_cache_row, &lw->wv },
+                };
+                bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
+                k_tmp = key_cache_row;
+                v_tmp = value_cache_row;
+            } else {
                 BnMatvecTask kv[2] = {
                     { k_tmp, &lw->wk },
                     { v_tmp, &lw->wv },
                 };
                 bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
-                BL_ACC(bl_matvec_qkv_us);
+            }
+            BL_ACC(bl_matvec_qkv_us);
 
+            for (int h = 0; h < n_heads; h++)
+                memcpy(s->q + h * head_size,
+                       q_full + h * 2 * head_size,
+                       head_size * sizeof(float));
+
+            if (lw->q_norm)
                 for (int h = 0; h < n_heads; h++)
-                    memcpy(s->q + h * head_size,
-                           q_full + h * 2 * head_size,
-                           head_size * sizeof(float));
+                    rmsnorm(s->q + h*head_size, s->q + h*head_size,
+                            lw->q_norm + h*qk_stride, head_size, c->norm_eps);
+            if (lw->k_norm)
+                for (int h = 0; h < c->n_kv_heads; h++)
+                    rmsnorm(k_tmp + h*head_size, k_tmp + h*head_size,
+                            lw->k_norm + h*qk_stride, head_size, c->norm_eps);
 
-                if (lw->q_norm)
-                    for (int h = 0; h < n_heads; h++)
-                        rmsnorm(s->q + h*head_size, s->q + h*head_size,
-                                lw->q_norm + h*qk_stride, head_size, c->norm_eps);
-                if (lw->k_norm)
-                    for (int h = 0; h < c->n_kv_heads; h++)
-                        rmsnorm(k_tmp + h*head_size, k_tmp + h*head_size,
-                                lw->k_norm + h*qk_stride, head_size, c->norm_eps);
+            apply_rope_heads(s->q, n_heads, head_size,
+                             rope_dims, rope_cos, rope_sin);
+            apply_rope_heads(k_tmp, c->n_kv_heads, head_size,
+                             rope_dims, rope_cos, rope_sin);
+            BL_ACC(bl_rope_us);
 
-                apply_rope_heads(s->q, n_heads, head_size,
-                                 rope_dims, rope_cos, rope_sin);
-                apply_rope_heads(k_tmp, c->n_kv_heads, head_size,
-                                 rope_dims, rope_cos, rope_sin);
-                BL_ACC(bl_rope_us);
-
+            // Write KV + GQA
+            if (c->kv_tq_bits > 0 && m->tq_state) {
+                tq_write_kv(m->tq_state, s, k_tmp, v_tmp,
+                            c->n_kv_heads, head_size, attn_idx, cache_pos, c->seq_len);
+                tq_gqa_dispatch(m, s, attn_idx, pos, n_heads,
+                                c->n_kv_heads, head_size, kv_mul);
+            } else if (c->kv_f16) {
                 uint16_t *kc = (uint16_t *)s->key_cache   + loff + (size_t)cache_pos * kv_dim;
                 uint16_t *vc = (uint16_t *)s->value_cache + loff + (size_t)cache_pos * kv_dim;
 #ifdef __ARM_NEON
@@ -461,40 +538,10 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                     vc[i] = bn_fp32_to_fp16(v_tmp[i]);
                 }
 #endif
-            } else {
-                float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
-                float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
-                BnMatvecTask q_task[1] = {{ q_full, &lw->wq }};
-                bn_quant_matvec_batch_gpu(q_task, 1, s->xb, s->x_q, m->pool, m->gpu);
-                BnMatvecTask kv[2] = {
-                    { key_cache_row,   &lw->wk },
-                    { value_cache_row, &lw->wv },
-                };
-                bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
-
-                for (int h = 0; h < n_heads; h++)
-                    memcpy(s->q + h * head_size,
-                           q_full + h * 2 * head_size,
-                           head_size * sizeof(float));
-
-                if (lw->q_norm)
-                    for (int h = 0; h < n_heads; h++)
-                        rmsnorm(s->q + h*head_size, s->q + h*head_size,
-                                lw->q_norm + h*qk_stride, head_size, c->norm_eps);
-                if (lw->k_norm)
-                    for (int h = 0; h < c->n_kv_heads; h++)
-                        rmsnorm(key_cache_row + h*head_size,
-                                key_cache_row + h*head_size,
-                                lw->k_norm + h*qk_stride, head_size, c->norm_eps);
-
-                apply_rope_heads(s->q, n_heads, head_size,
-                                 rope_dims, rope_cos, rope_sin);
-                apply_rope_heads(key_cache_row, c->n_kv_heads, head_size,
-                                 rope_dims, rope_cos, rope_sin);
             }
+            // FP32 path already wrote to cache directly
 
-            // GQA attention
-            {
+            if (!(c->kv_tq_bits > 0 && m->tq_state)) {
                 int n_kv = (pos + 1 < c->seq_len) ? pos + 1 : c->seq_len;
                 BnGQACtx gctx = { c, s, loff, pos, n_kv, kv_mul, head_size, kv_dim, c->seq_len };
 #ifdef __ARM_NEON
@@ -541,23 +588,30 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
 
         } else if (q_wide) {
             // --- Wide Q path (Qwen3 MoE: head_size > dim/n_heads, no gate) ---
-            // Q projection: dim → q_dim (larger than dim)
-            // K/V: dim → kv_dim (uses head_size from attention.key_length)
-            float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
-            float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
+            float *k_tmp = s->hb, *v_tmp = s->hb2;
 
             // Q matvec: xb[dim] → q[q_dim]
             {
                 BnMatvecTask q_task[1] = {{ s->q, &lw->wq }};
                 bn_quant_matvec_batch_gpu(q_task, 1, s->xb, s->x_q, m->pool, m->gpu);
             }
-            // K/V matvec: xb[dim] → kv_dim
-            {
+            // K/V matvec: xb[dim] → kv_dim (always to temp buffers for TQ compat)
+            if (c->kv_tq_bits > 0 && m->tq_state) {
+                BnMatvecTask kv[2] = {
+                    { k_tmp, &lw->wk },
+                    { v_tmp, &lw->wv },
+                };
+                bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
+            } else {
+                float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
+                float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
                 BnMatvecTask kv[2] = {
                     { key_cache_row,   &lw->wk },
                     { value_cache_row, &lw->wv },
                 };
                 bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
+                k_tmp = key_cache_row;
+                v_tmp = value_cache_row;
             }
 
             if (lw->q_norm)
@@ -566,16 +620,22 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                             lw->q_norm + h*qk_stride, head_size, c->norm_eps);
             if (lw->k_norm)
                 for (int h = 0; h < c->n_kv_heads; h++)
-                    rmsnorm(key_cache_row + h*head_size, key_cache_row + h*head_size,
+                    rmsnorm(k_tmp + h*head_size, k_tmp + h*head_size,
                             lw->k_norm + h*qk_stride, head_size, c->norm_eps);
 
             apply_rope_heads(s->q, n_heads, head_size,
                              rope_dims, rope_cos, rope_sin);
-            apply_rope_heads(key_cache_row, c->n_kv_heads, head_size,
+            apply_rope_heads(k_tmp, c->n_kv_heads, head_size,
                              rope_dims, rope_cos, rope_sin);
 
-            // GQA attention
-            {
+            if (c->kv_tq_bits > 0 && m->tq_state) {
+                // TQ write + GQA
+                tq_write_kv(m->tq_state, s, k_tmp, v_tmp,
+                            c->n_kv_heads, head_size, attn_idx, cache_pos, c->seq_len);
+                tq_gqa_dispatch(m, s, attn_idx, pos, n_heads,
+                                c->n_kv_heads, head_size, kv_mul);
+            } else {
+                // Standard GQA
                 int n_kv = (pos + 1 < c->seq_len) ? pos + 1 : c->seq_len;
                 BnGQACtx gctx = { c, s, loff, pos, n_kv, kv_mul, head_size, kv_dim, c->seq_len };
 #ifdef __ARM_NEON
@@ -591,8 +651,6 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                 bn_tp_dispatch(m->pool, &gqa, 1);
             }
 
-            // No sigmoid gate (unlike gated-Q path)
-
             // wo projection (q_dim → dim) + residual
             if (lw->attn_sub_norm)
                 rmsnorm(s->xb, s->xb, lw->attn_sub_norm, q_dim, c->norm_eps);
@@ -607,7 +665,47 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
             float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
             float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
 
-            if (c->kv_f16) {
+            if (c->kv_tq_bits > 0 && m->tq_state) {
+                // --- TurboQuant KV path ---
+                // Use temp buffers for K/V, then quantize into TQ cache
+                float *k_tmp = s->hb, *v_tmp = s->hb2;
+                BnMatvecTask qkv[3] = {
+                    { s->q,  &lw->wq },
+                    { k_tmp, &lw->wk },
+                    { v_tmp, &lw->wv },
+                };
+                bn_quant_matvec_batch_gpu(qkv, 3, s->xb, s->x_q, m->pool, m->gpu);
+                BL_ACC(bl_matvec_qkv_us);
+
+                if (lw->q_bias) for (int i = 0; i < dim; i++) s->q[i] += lw->q_bias[i];
+                if (lw->k_bias) for (int i = 0; i < kv_dim; i++) k_tmp[i] += lw->k_bias[i];
+                if (lw->v_bias) for (int i = 0; i < kv_dim; i++) v_tmp[i] += lw->v_bias[i];
+
+                if (lw->q_norm)
+                    for (int h = 0; h < n_heads; h++)
+                        rmsnorm(s->q + h*head_size, s->q + h*head_size,
+                                lw->q_norm + h*head_size, head_size, c->norm_eps);
+                if (lw->k_norm)
+                    for (int h = 0; h < c->n_kv_heads; h++)
+                        rmsnorm(k_tmp + h*head_size, k_tmp + h*head_size,
+                                lw->k_norm + h*head_size, head_size, c->norm_eps);
+
+                apply_rope_heads(s->q, n_heads, head_size,
+                                 rope_dims, rope_cos, rope_sin);
+                apply_rope_heads(k_tmp, c->n_kv_heads, head_size,
+                                 rope_dims, rope_cos, rope_sin);
+                BL_ACC(bl_rope_us);
+
+                // Write TQ compressed KV
+                tq_write_kv(m->tq_state, s, k_tmp, v_tmp,
+                            c->n_kv_heads, head_size, attn_idx, cache_pos, c->seq_len);
+
+                // TQ GQA
+                tq_gqa_dispatch(m, s, attn_idx, pos, n_heads,
+                                c->n_kv_heads, head_size, kv_mul);
+                BL_ACC(bl_gqa_us);
+
+            } else if (c->kv_f16) {
                 float *k_tmp = s->hb, *v_tmp = s->hb2;
                 BnMatvecTask qkv[3] = {
                     { s->q,  &lw->wq },
@@ -687,8 +785,8 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                 BL_ACC(bl_rope_us);
             }
 
-            // GQA attention
-            {
+            // GQA attention (standard path — TQ handled above)
+            if (!(c->kv_tq_bits > 0 && m->tq_state)) {
                 int n_kv = (pos + 1 < c->seq_len) ? pos + 1 : c->seq_len;
                 BnGQACtx gctx = { c, s, loff, pos, n_kv, kv_mul, head_size, kv_dim, c->seq_len };
 #ifdef __ARM_NEON
@@ -702,8 +800,8 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
 #endif
                 BnTPTask gqa = { attn_fn, &gctx, n_heads };
                 bn_tp_dispatch(m->pool, &gqa, 1);
+                BL_ACC(bl_gqa_us);
             }
-            BL_ACC(bl_gqa_us);
 
             // Attention sub-norm + wo projection + residual
             if (lw->attn_sub_norm)
@@ -987,15 +1085,17 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
                               (size_t)dim * sizeof(float), 0) != 0)
         return NULL;
 
-    // Validation: reject unsupported layer configurations up front
+    // Validation: check for unsupported layer configurations
+    // MoE and SSM layers are allowed but handled via CPU fallback per-layer.
     if (!w->output_norm_gpu) return NULL;
+    int has_moe = 0, has_ssm = 0;
     for (int l = 0; l < c->n_layers; l++) {
         BnLayerWeights *lw = &w->layers[l];
         int is_attn = (c->full_attn_interval == 0) ||
                       ((l + 1) % c->full_attn_interval == 0);
-        if (!is_attn) return NULL;                          // SSM layer
-        if (lw->router_weight) return NULL;                 // MoE
-        if (!lw->wq.data) return NULL;                      // missing Q weight
+        if (!is_attn) { has_ssm = 1; continue; }           // SSM: skip GPU validation
+        if (lw->router_weight) { has_moe = 1; }            // MoE: FFN on CPU, attn on GPU
+        if (!lw->wq.data) return NULL;
         int q_gated = (lw->wq.rows > q_dim);
         int q_wide  = (!q_gated && lw->wq.rows > dim);
         if (q_gated || q_wide) return NULL;
@@ -1003,6 +1103,9 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
         if (lw->attn_sub_norm || lw->ffn_sub_norm) return NULL;
         if (!lw->attn_norm_gpu || !lw->ffn_norm_gpu) return NULL;
     }
+    // Models with SSM or MoE need per-layer CPU-GPU sync via read/write_activation
+    if ((has_moe || has_ssm) && (!gpu->read_activation || !gpu->write_activation))
+        return NULL;
 
     // Resolve logits weight
     BnQWeight *ow = &w->output_weight;
@@ -1022,13 +1125,19 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
     uint32_t u_eps;
     { float eps = c->norm_eps; memcpy(&u_eps, &eps, 4); }
 
-    // Max ops per layer: QKV stacked (9) or individual+3 bias (13), GQA (4),
-    // Wo (1), fused resid+norm (1), FFN gated (3), down (1), fused resid+norm (1) = ~23 max
-    // Add margin for safety.
-    int max_ops = 26 * c->n_layers + 4;
+    // Max ops per batch. MoE/SSM flush between layers, so single-layer max suffices.
+    int max_ops = has_moe || has_ssm ? 30 + 4 : 26 * c->n_layers + 4;
     BnGPUOp *ops = (BnGPUOp *)malloc((size_t)max_ops * sizeof(BnGPUOp));
     if (!ops) return NULL;
     int n = 0;
+
+    // Helper: flush current ops (no readback), reset counter
+    #define GPU_FLUSH() do { \
+        if (n > 0) { \
+            if (gpu->execute(gpu->ctx, ops, n, -1, NULL, 0) != 0) { free(ops); return NULL; } \
+            n = 0; \
+        } \
+    } while(0)
 
     // ---- Initial RMSNorm: x -> xb (using layer 0 attn_norm) ----
     ops[n++] =(BnGPUOp){
@@ -1041,6 +1150,39 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
 
     for (int l = 0; l < c->n_layers; l++) {
         BnLayerWeights *lw = &w->layers[l];
+        int is_attn = (c->full_attn_interval == 0) ||
+                      ((l + 1) % c->full_attn_interval == 0);
+
+        // ---- SSM layer: flush GPU ops, run on CPU, upload result ----
+        if (!is_attn) {
+            GPU_FLUSH();
+            // Read x from GPU to CPU
+            if (gpu->read_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
+                                      (size_t)dim * sizeof(float), 0) != 0)
+                { free(ops); return NULL; }
+            // Run SSM block + residual + FFN on CPU
+            forward_ssm_block(m, sess, lw, l);
+            residual_add(s->x, s->xb, dim);
+            if (lw->router_weight)
+                bn_moe_forward(m, sess, lw, l);
+            else
+                forward_ffn_block(m, sess, lw);
+            // Upload result back to GPU
+            if (gpu->write_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
+                                       (size_t)dim * sizeof(float), 0) != 0)
+                { free(ops); return NULL; }
+            // Re-norm for next layer
+            void *next_norm = (l + 1 < c->n_layers)
+                ? w->layers[l + 1].attn_norm_gpu : w->output_norm_gpu;
+            ops[n++] = (BnGPUOp){
+                .shader = BN_GPU_SHADER_RMSNORM, .type = -1,
+                .W_buf = next_norm,
+                .buf_in = BN_GPU_BUF_X, .buf_out = BN_GPU_BUF_XB, .buf_aux = -1,
+                .rows = 0, .cols = 0,
+                .p = { (uint32_t)dim, u_eps, 0, 0, 0, 0, 0, 0 }
+            };
+            continue;
+        }
 
         // KV cache addressing
         int attn_idx = (c->full_attn_interval > 0)
@@ -1242,7 +1384,34 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
             .p = { (uint32_t)dim, u_eps, 0, 0, 0, 0, 0, 0 }
         };
 
-        // ---- FFN ----
+        // ---- FFN (MoE or dense) ----
+        if (lw->router_weight) {
+            // MoE FFN: flush GPU, run on CPU, upload result
+            GPU_FLUSH();
+            if (gpu->read_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
+                                      (size_t)dim * sizeof(float), 0) != 0)
+                { free(ops); return NULL; }
+            // xb is the normed input (already computed by fused resid+rmsnorm above)
+            if (gpu->read_activation(gpu->ctx, BN_GPU_BUF_XB, s->xb,
+                                      (size_t)dim * sizeof(float), 0) != 0)
+                { free(ops); return NULL; }
+            bn_moe_forward(m, sess, lw, l);
+            // bn_moe_forward does norm + route + expert FFN + residual add to s->x
+            if (gpu->write_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
+                                       (size_t)dim * sizeof(float), 0) != 0)
+                { free(ops); return NULL; }
+            // RMSNorm for next layer
+            void *next_norm = (l + 1 < c->n_layers)
+                ? w->layers[l + 1].attn_norm_gpu : w->output_norm_gpu;
+            ops[n++] = (BnGPUOp){
+                .shader = BN_GPU_SHADER_RMSNORM, .type = -1,
+                .W_buf = next_norm,
+                .buf_in = BN_GPU_BUF_X, .buf_out = BN_GPU_BUF_XB, .buf_aux = -1,
+                .rows = 0, .cols = 0,
+                .p = { (uint32_t)dim, u_eps, 0, 0, 0, 0, 0, 0 }
+            };
+            continue;  // skip dense FFN below
+        }
         if (c->has_ffn_gate && lw->ffn_gate.data) {
             ops[n++] =(BnGPUOp){
                 .shader = BN_GPU_SHADER_MATVEC, .type = lw->ffn_gate.type,
@@ -1329,10 +1498,11 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
     // Safety: verify we didn't overflow the ops array
     if (n > max_ops) { free(ops); return NULL; }
 
-    // Execute the entire forward pass as one GPU submission
+    // Execute final batch (logits + any remaining layer ops)
     int rc = gpu->execute(gpu->ctx, ops, n, BN_GPU_BUF_LOGITS,
                           s->logits, c->vocab_size);
     free(ops);
+    #undef GPU_FLUSH
     return (rc == 0) ? s->logits : NULL;
 }
 
