@@ -76,6 +76,7 @@ Modules have strict, one-directional dependencies. When modifying a module, only
 - Atomic work-stealing thread dispatch for load balancing
 - Batch prefill with fused Q4_K matmul kernel (dense models)
 - KV cache pre-allocated for max sequence length
+- TurboQuant KV compression: Randomized Hadamard Transform (O(d log d)), NEON vectorized FWHT + popcount + FMA, precomputed QJL to avoid per-key redundancy
 
 ## CLI Flags (key ones for agents)
 
@@ -86,6 +87,7 @@ Modules have strict, one-directional dependencies. When modifying a module, only
 - `--draft-k N` — draft tokens per iteration (default 5)
 - `--flash` — flash attention (online softmax)
 - `--kv16` — FP16 KV cache
+- `--kv-tq <bits>` — TurboQuant KV cache compression (2, 3, or 4 bits; recommended: 3). 8.9x compression at 3-bit. Combine with `--pread --cache-mb 2048` for minimal memory: 35B MoE model + 64K context in 8.4 GB RAM.
 - `--no-prefill` — disable batch prefill
 - `--gpu` — enable GPU inference (requires `BN_ENABLE_GPU=1` build)
 - `-t N` — thread count

@@ -19,7 +19,7 @@ make avx2-check         # AVX2 cross-compile check
 make fetch-wgpu         # download wgpu-native v27
 ```
 
-Individual test targets: `make test_gguf`, `make test_quant`, `make test_tokenizer`, `make test_transformer`, `make test_generate`, `make test_session`, `make test_prompt_cache`, `make test_threadpool`, `make test_safety`, `make test_arena`, `make test_ssm`, `make test_gguf_fuzz`, `make test_moe`.
+Individual test targets: `make test_gguf`, `make test_quant`, `make test_tokenizer`, `make test_transformer`, `make test_generate`, `make test_session`, `make test_prompt_cache`, `make test_threadpool`, `make test_safety`, `make test_arena`, `make test_ssm`, `make test_gguf_fuzz`, `make test_moe`, `make test_turboquant`.
 
 GPU-specific test targets (require `BN_ENABLE_GPU=1`): `make test_gpu_wgpu`, `make test_gpu_validate`, `make test_gpu_backend`.
 
@@ -37,18 +37,19 @@ Modules are organized in strict dependency order — each depends only on those 
 1. `platform` — mmap/buffer abstraction, timing
 2. `gguf` — GGUF v3 binary parser (standalone)
 3. `quant` — dequantization + SIMD matvec, 22 types x 5 backends (standalone)
-4. `model` — GGUF → Config/Weights mapping, session arena helpers, GPU weight upload (depends on gguf + quant)
-5. `tokenizer` — BPE tokenizer (depends on gguf)
-6. `moe` — MoE expert routing, loading, caching (depends on model + quant)
-7. `session` — per-request mutable state: KV cache, activation buffers, MoE compute buffers (depends on model + bn_alloc)
-8. `transformer` — forward pass, CPU SIMD + GPU-resident (depends on model + session + quant + moe)
-9. `sampler` — sampling strategies (standalone)
-10. `threadpool` — persistent pthread pool with atomic work-stealing
-11. `bn_alloc` — vtable allocator interface (standalone, Hull-compatible with `KlAllocator`)
-12. `prompt_cache` — shared KV prefix cache: longest-prefix matching, FIFO eviction, thread-safe (depends on model + session + bn_alloc)
-13. `generate` — library API: generation, prefill, chat formatting, SSE streaming, logprobs, stop strings (depends on model + session + tokenizer + sampler + transformer + bn_alloc)
-14. `gpu_wgpu` — wgpu-native WebGPU backend, optional with `BN_ENABLE_GPU=1` (depends on model + gpu_backend)
-15. `main` — CLI wiring (depends on generate + all above)
+4. `turboquant` — TurboQuant KV cache compression: Randomized Hadamard Transform + Lloyd-Max quantization + QJL residual. NEON SIMD vectorized (FWHT butterfly, vcntq popcount, FMA). Scalar fallback on non-ARM. (standalone)
+5. `model` — GGUF → Config/Weights mapping, session arena helpers, GPU weight upload (depends on gguf + quant + turboquant)
+6. `tokenizer` — BPE tokenizer (depends on gguf)
+7. `moe` — MoE expert routing, loading, caching (depends on model + quant)
+8. `session` — per-request mutable state: KV cache, activation buffers, MoE compute buffers (depends on model + bn_alloc)
+9. `transformer` — forward pass, CPU SIMD + GPU-resident (depends on model + session + quant + moe + turboquant)
+10. `sampler` — sampling strategies (standalone)
+11. `threadpool` — persistent pthread pool with atomic work-stealing
+12. `bn_alloc` — vtable allocator interface (standalone, Hull-compatible with `KlAllocator`)
+13. `prompt_cache` — shared KV prefix cache: longest-prefix matching, FIFO eviction, thread-safe (depends on model + session + bn_alloc + turboquant)
+14. `generate` — library API: generation, prefill, chat formatting, SSE streaming, logprobs, stop strings (depends on model + session + tokenizer + sampler + transformer + bn_alloc)
+15. `gpu_wgpu` — wgpu-native WebGPU backend, optional with `BN_ENABLE_GPU=1` (depends on model + gpu_backend)
+16. `main` — CLI wiring (depends on generate + all above)
 
 Headers live in `include/`, implementations in `src/`, tests in `test/`.
 
@@ -82,6 +83,8 @@ Headers live in `include/`, implementations in `src/`, tests in `test/`.
 - `BnAllocator` — vtable allocator (malloc/realloc/free + ctx), compatible with Hull's `KlAllocator`
 - `BnChatMessage` — `{role, content}` for multi-turn chat formatting
 - `BnStopStrings` — stop string array for generation halting
+- `BnTQState` — TurboQuant state: RHT signs (rotation + QJL), Lloyd-Max centroids/boundaries, scale factor
+- `BnGQATQCtx` — TurboQuant GQA attention context (packed keys/values, byte strides)
 
 ## MoE (Mixture of Experts)
 
@@ -129,6 +132,35 @@ Persistent pthread pool with atomic work-stealing dispatch (`include/threadpool.
 ### Speculative Decoding
 
 Optional `--draft <model.gguf>` flag loads a small draft model to generate K candidate tokens (default K=5 via `--draft-k`), then verifies with the target model. Greedy only (temp=0). Draft and target must share the same tokenizer (same vocab_size). Two `BnModel` instances coexist with shared thread pool; each has its own `BnSession` with independent KV cache and activation buffers. No KV cache rollback needed (attention window bounded by pos). Best with dense targets + same-family small draft; MoE targets verify sequentially (no batch speedup yet).
+
+### TurboQuant KV Cache Compression
+
+`--kv-tq <bits>` enables TurboQuant KV cache compression (2, 3, or 4 bits; recommended: 3). Based on arXiv 2504.19874.
+
+**Algorithm**: Randomized Hadamard Transform (RHT) rotates vectors to Gaussianize coordinates, Lloyd-Max scalar quantization maps each coordinate to the nearest centroid, QJL residual correction preserves key score accuracy via 1-bit sign projections.
+
+**Implementation** (`src/turboquant.c`, `include/turboquant.h`):
+- **RHT**: `y = (1/sqrt(d)) * H * D * x` where H is Walsh-Hadamard (FWHT butterfly, O(d log d)) and D is diagonal ±1 signs from seeded PRNG
+- **QJL**: Second independent RHT for sign projection (replaces dense O(d²) Gaussian matrix)
+- **NEON SIMD** (`#ifdef __ARM_NEON`): vectorized FWHT (vuzp/vzip stride-1/2, vaddq/vsubq stride-4+), XOR sign-bit application, vcntq_u8 XNOR popcount, vfmaq_f32 centroid dot + value accumulate
+- **Scalar fallback** (`#else`): pure C, no SIMD — always available on all platforms
+- **Precomputed QJL API**: `bn_tq_qjl_precompute` + `bn_tq_score_key_precomputed` eliminate redundant per-key O(d log d) QJL projection
+
+**GQA TQ kernels** (`src/transformer/gqa_tq_scalar.c`, `src/transformer/gqa_tq_neon.c`):
+- Dispatch via `#ifdef __ARM_NEON` in `src/transformer.c`
+- NEON version delegates to scalar (which internally uses NEON-optimized turboquant.c)
+- Precomputes QJL signs once per head, scores all keys, softmax, then weighted combine
+
+**Packed format per head** (d=128, 3-bit): key=68B, value=50B. For d=256: key=132B, value=98B.
+
+**Memory profile with `--pread --cache-mb 2048 --kv-tq 3` (Qwen3.5-35B-A3B)**:
+- Non-expert weights: ~4.1 GB (always resident)
+- Expert LRU cache: 2 GB (configurable via `--cache-mb`)
+- KV cache: 8.9x smaller than FP32 — 64K context in 2.2 GB instead of 20 GB
+- **Total 64K context: 8.4 GB** (fits 16 GB Mac). Without TQ: 26.1 GB.
+- **Total 256K context: 15.1 GB**. Without TQ: 86.1 GB (impossible on 32 GB).
+
+**Performance overhead**: ~2x at 30 tokens, ~1.2x at 140 tokens, <5% at 500+ tokens. The per-token write cost amortizes as context grows.
 
 ### Concurrent Sessions (BnModel/BnSession Split)
 

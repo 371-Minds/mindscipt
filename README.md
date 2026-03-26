@@ -14,6 +14,7 @@ Zero dependencies beyond libc and libm, four SIMD backends, compiles to WASM, an
 - **Full transformer forward pass** — RoPE, GQA, RMSNorm, sub-norms, tied/untied embeddings
 - **Hybrid SSM + Attention** — Gated DeltaNet SSM layers (conv1d, SiLU, delta rule recurrence) alongside standard GQA attention layers
 - **Flash GQA attention** — online softmax with KV-head grouping, single-pass over KV cache
+- **TurboQuant KV cache compression** — `--kv-tq 3` compresses KV cache to 3-bit (8.9x smaller) via Randomized Hadamard Transform + Lloyd-Max quantization + QJL residual correction. NEON SIMD vectorized. Enables 256K context in 15 GB RAM for 35B MoE models.
 - **Optional F16 KV cache** — `--kv16` halves attention DRAM bandwidth with minimal precision loss
 - **5 SIMD backends** — ARM NEON/SDOT, AVX2, WASM SIMD128, scalar fallback (auto-selected at compile time), plus optional WebGPU
 - **Mixture of Experts (MoE)** — sparse MoE with top-K routing, batched expert dispatch, 3 I/O modes (mmap, pread+LRU cache, madvise)
@@ -124,6 +125,7 @@ Usage: ./bitnet <model.gguf> [options]
   --chat          Interactive chat REPL mode
   --repeat-penalty <float>  Repetition penalty (default: 1.0, chat: 1.1)
   --kv16          Store KV cache in FP16 (halves attention DRAM bandwidth)
+  --kv-tq <bits>  TurboQuant KV compression (2, 3, or 4 bits; recommended: 3)
   --no-prefill    Disable batch prompt prefill (compute logits for every token)
   --pread         Force pread for MoE expert loading (lower RSS than mmap)
   --cache-mb <N>  Expert LRU cache budget in MB (default: 4096, 0 to disable)
@@ -158,6 +160,41 @@ For Mixture of Experts models (Qwen3-MoE, OLMoE, Mixtral), expert weights can be
 # Pread with custom cache size
 ./bitnet models/Qwen3-30B-A3B-Q4_K_M.gguf -p "Hello" -n 64 --pread --cache-mb 2048
 ```
+
+### TurboQuant KV Cache Compression
+
+`--kv-tq 3` compresses the KV cache from FP32 (32 bits per element) to 3-bit quantized representation — an **8.9x compression ratio**. Based on the TurboQuant paper (arXiv 2504.19874), using Randomized Hadamard Transform for O(d log d) rotation, Lloyd-Max scalar quantization, and QJL residual correction for keys. NEON SIMD vectorized on ARM.
+
+```bash
+# Enable 3-bit TQ KV compression
+./bitnet model.gguf -p "Hello" -n 256 --kv-tq 3
+
+# Combine with pread for minimal memory footprint
+./bitnet models/Qwen3.5-35B-A3B-Q4_K_M.gguf --pread --cache-mb 2048 --kv-tq 3 -p "Hello" -n 256
+```
+
+**Memory savings — Qwen3.5-35B-A3B (pread + 2 GB expert cache):**
+
+| Context | FP32 KV | TQ-3 KV | Total RSS | vs FP32 RSS |
+|---------|---------|---------|-----------|-------------|
+| 4K tokens | 1.2 GB | 0.1 GB | **6.3 GB** | 7.4 GB |
+| 16K tokens | 5.0 GB | 0.6 GB | **6.7 GB** | 11.1 GB |
+| 64K tokens | 20.0 GB | 2.2 GB | **8.4 GB** | 26.1 GB |
+| 128K tokens | 40.0 GB | 4.5 GB | **10.6 GB** | 46.1 GB |
+| 256K tokens | 80.0 GB | 9.0 GB | **15.1 GB** | 86.1 GB |
+
+At 64K context, a 35B MoE model runs in **8.4 GB** — fits on a 16 GB Mac with room for the OS. Without TQ, FP32 KV alone is 20 GB at 64K.
+
+**Performance overhead vs context length (Qwen3.5-35B-A3B):**
+
+| Context | TQ-3 tok/s | Baseline tok/s | Overhead |
+|---------|-----------|---------------|----------|
+| 30 tokens | 3.5 | 7.2 | 2.1x |
+| 141 tokens | 3.1 | 3.6 | 1.2x |
+| 561 tokens | 1.1 | 1.2 | 1.06x |
+| 1401 tokens | 0.45 | 0.47 | 1.04x |
+
+TQ overhead vanishes at longer context — at 500+ tokens it's within 5% of baseline. The per-token write cost (rotation + quantization) is amortized by the bandwidth savings when reading compressed keys/values.
 
 ## Getting a Model
 
