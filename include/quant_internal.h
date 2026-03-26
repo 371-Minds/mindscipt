@@ -203,6 +203,7 @@ void bn_quant_q6k_neon_sdot_matmul_range(void *ctx, int row_start, int row_end);
 void bn_quant_q4k_avx2_sdot_range(void *ctx, int start, int end);
 void bn_quant_q4k_avx2_sdot_matmul_range(void *ctx, int row_start, int row_end);
 void bn_quant_q6k_avx2_sdot_range(void *ctx, int start, int end);
+void bn_quant_q6k_avx2_4row_range(void *ctx, int group_start, int group_end);
 void bn_quant_q6k_avx2_sdot_matmul_range(void *ctx, int row_start, int row_end);
 void bn_quant_q4k_neon_range(void *ctx, int start, int end);
 void bn_quant_q4k_avx2_range(void *ctx, int start, int end);
