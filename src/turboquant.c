@@ -3,6 +3,14 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+static inline float tq_neon_hsum(float32x4_t v) {
+    float32x2_t r = vadd_f32(vget_low_f32(v), vget_high_f32(v));
+    return vget_lane_f32(vpadd_f32(r, r), 0);
+}
+#endif
+
 // --- xoshiro256** PRNG (deterministic, seeded) ---
 
 static uint64_t tq_rng_state[4];
@@ -67,6 +75,39 @@ static const float lloyd_max_4bit_bounds[15] = {
 // --- Fast Walsh-Hadamard Transform (in-place, unnormalized) ---
 // d must be a power of 2. O(d log d) add/sub operations.
 
+#ifdef __ARM_NEON
+static void fwht_inplace(float *x, int d) {
+    // Stage 0: len=1 butterflies (stride-1, deinterleave)
+    for (int i = 0; i < d; i += 8) {
+        float32x4_t v0 = vld1q_f32(x + i);
+        float32x4_t v1 = vld1q_f32(x + i + 4);
+        float32x4x2_t deint = vuzpq_f32(v0, v1);
+        float32x4_t sum = vaddq_f32(deint.val[0], deint.val[1]);
+        float32x4_t dif = vsubq_f32(deint.val[0], deint.val[1]);
+        float32x4x2_t reint = vzipq_f32(sum, dif);
+        vst1q_f32(x + i, reint.val[0]);
+        vst1q_f32(x + i + 4, reint.val[1]);
+    }
+    // Stage 1: len=2 butterflies (stride-2, lo/hi split)
+    for (int i = 0; i < d; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        float32x2_t lo = vget_low_f32(v);
+        float32x2_t hi = vget_high_f32(v);
+        vst1q_f32(x + i, vcombine_f32(vadd_f32(lo, hi), vsub_f32(lo, hi)));
+    }
+    // Stages 2+: len=4,8,16,... (contiguous NEON pairs)
+    for (int len = 4; len < d; len <<= 1) {
+        for (int i = 0; i < d; i += len << 1) {
+            for (int j = i; j < i + len; j += 4) {
+                float32x4_t a = vld1q_f32(x + j);
+                float32x4_t b = vld1q_f32(x + j + len);
+                vst1q_f32(x + j, vaddq_f32(a, b));
+                vst1q_f32(x + j + len, vsubq_f32(a, b));
+            }
+        }
+    }
+}
+#else
 static void fwht_inplace(float *x, int d) {
     for (int len = 1; len < d; len <<= 1) {
         for (int i = 0; i < d; i += len << 1) {
@@ -78,37 +119,72 @@ static void fwht_inplace(float *x, int d) {
         }
     }
 }
+#endif
+
+// --- NEON helpers for sign application ---
+#ifdef __ARM_NEON
+static inline void tq_apply_signs_neon(const float *signs, const float *in, float *out, int d) {
+    uint32x4_t sign_mask = vdupq_n_u32(0x80000000);
+    for (int i = 0; i < d; i += 4) {
+        uint32x4_t v = vreinterpretq_u32_f32(vld1q_f32(in + i));
+        uint32x4_t s = vandq_u32(vreinterpretq_u32_f32(vld1q_f32(signs + i)), sign_mask);
+        vst1q_f32(out + i, vreinterpretq_f32_u32(veorq_u32(v, s)));
+    }
+}
+static inline void tq_scale_neon(float *x, float scale, int d) {
+    float32x4_t sv = vdupq_n_f32(scale);
+    for (int i = 0; i < d; i += 4)
+        vst1q_f32(x + i, vmulq_f32(vld1q_f32(x + i), sv));
+}
+#endif
 
 // RHT forward: out = scale * H * D * in
 static void rht_forward(const BnTQState *st, const float *in, float *out, int d) {
+#ifdef __ARM_NEON
+    tq_apply_signs_neon(st->rht_signs, in, out, d);
+    fwht_inplace(out, d);
+    tq_scale_neon(out, st->rht_scale, d);
+#else
     for (int i = 0; i < d; i++)
         out[i] = st->rht_signs[i] * in[i];
     fwht_inplace(out, d);
     float s = st->rht_scale;
     for (int i = 0; i < d; i++)
         out[i] *= s;
+#endif
 }
 
 // RHT inverse: out = D * H * (scale * in)
-// Since H and D are self-inverse (H^-1 = H/d, D^-1 = D), and the forward
-// transform is scale * H * D, the inverse is (1/scale) * D * H^-1 = D * H * (1/(scale*d))
-// But scale = 1/sqrt(d), so scale*d = sqrt(d), and 1/(scale*d) = 1/sqrt(d) = scale.
-// So inverse is: D * H * scale * in, i.e., apply scale, FWHT, then signs.
+// Inverse is: D * H * scale * in (H and D are self-inverse, scale cancels).
 static void rht_inverse(const BnTQState *st, const float *in, float *out, int d) {
+#ifdef __ARM_NEON
+    {
+        float32x4_t sv = vdupq_n_f32(st->rht_scale);
+        for (int i = 0; i < d; i += 4)
+            vst1q_f32(out + i, vmulq_f32(vld1q_f32(in + i), sv));
+    }
+    fwht_inplace(out, d);
+    tq_apply_signs_neon(st->rht_signs, out, out, d);
+#else
     float s = st->rht_scale;
     for (int i = 0; i < d; i++)
         out[i] = s * in[i];
     fwht_inplace(out, d);
     for (int i = 0; i < d; i++)
         out[i] *= st->rht_signs[i];
+#endif
 }
 
 // QJL sign projection via RHT: out_signs = sign(H * D_qjl * in)
 // Produces d/8 bytes of packed sign bits. O(d log d).
 static void qjl_project_signs(const BnTQState *st, const float *in, uint8_t *out_signs, int d) {
     float tmp[d];
+#ifdef __ARM_NEON
+    tq_apply_signs_neon(st->qjl_signs, in, tmp, d);
+#else
     for (int i = 0; i < d; i++)
         tmp[i] = st->qjl_signs[i] * in[i];
+#endif
     fwht_inplace(tmp, d);
     memset(out_signs, 0, d / 8);
     for (int i = 0; i < d; i++)
@@ -433,24 +509,57 @@ void bn_tq_attention_scores(const BnTQState *st, const float *rotated_q,
         float vec_norm = tq_fp16_to_fp32(vec_norm_fp16);
 
         // Centroid dot product: sum(q_rot[i] * centroids[idx[i]])
-        // This approximates <q_rot, normalized_rotated_key>
-        // Multiply by vec_norm to get <q, key> ≈ vec_norm * <Pi*q, quantized(Pi*key_hat)>
+#ifdef __ARM_NEON
+        float c_tmp[4];
+        float32x4_t acc = vdupq_n_f32(0);
+        for (int i = 0; i < d; i += 4) {
+            c_tmp[0] = st->centroids[indices[i]];
+            c_tmp[1] = st->centroids[indices[i+1]];
+            c_tmp[2] = st->centroids[indices[i+2]];
+            c_tmp[3] = st->centroids[indices[i+3]];
+            acc = vfmaq_f32(acc, vld1q_f32(rotated_q + i), vld1q_f32(c_tmp));
+        }
+        float centroid_dot = tq_neon_hsum(acc);
+#else
         float centroid_dot = 0.0f;
         for (int i = 0; i < d; i++)
             centroid_dot += rotated_q[i] * st->centroids[indices[i]];
+#endif
 
         // QJL correction: XNOR popcount between q_signs and key qjl_signs
         const uint8_t *key_signs = pk + idx_sz;
         int agree = 0;
+#ifdef __ARM_NEON
+        {
+            int b = 0;
+            for (; b + 16 <= qjl_sz; b += 16) {
+                uint8x16_t xnor = vmvnq_u8(veorq_u8(vld1q_u8(q_signs + b),
+                                                       vld1q_u8(key_signs + b)));
+                uint8x16_t cnt = vcntq_u8(xnor);
+                uint16x8_t p1 = vpaddlq_u8(cnt);
+                uint32x4_t p2 = vpaddlq_u16(p1);
+                uint64x2_t p3 = vpaddlq_u32(p2);
+                agree += (int)(vgetq_lane_u64(p3, 0) + vgetq_lane_u64(p3, 1));
+            }
+            for (; b < qjl_sz; b++) {
+                uint8_t xnor = ~(q_signs[b] ^ key_signs[b]);
+                uint8_t v = xnor;
+                v = (v & 0x55) + ((v >> 1) & 0x55);
+                v = (v & 0x33) + ((v >> 2) & 0x33);
+                v = (v & 0x0F) + ((v >> 4) & 0x0F);
+                agree += v;
+            }
+        }
+#else
         for (int b = 0; b < qjl_sz; b++) {
             uint8_t xnor = ~(q_signs[b] ^ key_signs[b]);
-            // Popcount
             uint8_t v = xnor;
             v = (v & 0x55) + ((v >> 1) & 0x55);
             v = (v & 0x33) + ((v >> 2) & 0x33);
             v = (v & 0x0F) + ((v >> 4) & 0x0F);
             agree += v;
         }
+#endif
         // QJL estimator: (2*agree - d) * res_norm * scale
         float qjl_correction = (float)(2 * agree - d) * res_norm * qjl_scale;
 
@@ -490,7 +599,95 @@ void bn_tq_attention_combine(const BnTQState *st, const uint8_t *packed_values,
 
         // Accumulate: out += w * val_norm * dequant
         float wn = w * val_norm;
+#ifdef __ARM_NEON
+        {
+            float32x4_t wv = vdupq_n_f32(wn);
+            for (int i = 0; i < d; i += 4)
+                vst1q_f32(out + i, vfmaq_f32(vld1q_f32(out + i), wv, vld1q_f32(dequant + i)));
+        }
+#else
         for (int i = 0; i < d; i++)
             out[i] += wn * dequant[i];
+#endif
     }
+}
+
+// --- Precomputed QJL API (avoids redundant per-key projection) ---
+
+void bn_tq_qjl_precompute(const BnTQState *st, const float *rotated_q,
+                            uint8_t *q_signs_out) {
+    qjl_project_signs(st, rotated_q, q_signs_out, st->head_dim);
+}
+
+float bn_tq_score_key_precomputed(const BnTQState *st, const float *rotated_q,
+                                    const uint8_t *q_signs, const uint8_t *packed_key) {
+    int d = st->head_dim;
+    int idx_sz = index_bytes(d, st->bits);
+    int qjl_sz = d / 8;
+
+    int indices[d];
+    unpack_indices(packed_key, d, st->bits, indices);
+
+    uint16_t res_norm_fp16, vec_norm_fp16;
+    memcpy(&res_norm_fp16, packed_key + idx_sz + qjl_sz, 2);
+    memcpy(&vec_norm_fp16, packed_key + idx_sz + qjl_sz + 2, 2);
+    float res_norm = tq_fp16_to_fp32(res_norm_fp16);
+    float vec_norm = tq_fp16_to_fp32(vec_norm_fp16);
+
+    // Centroid dot product
+#ifdef __ARM_NEON
+    float c_tmp[4];
+    float32x4_t acc = vdupq_n_f32(0);
+    for (int i = 0; i < d; i += 4) {
+        c_tmp[0] = st->centroids[indices[i]];
+        c_tmp[1] = st->centroids[indices[i+1]];
+        c_tmp[2] = st->centroids[indices[i+2]];
+        c_tmp[3] = st->centroids[indices[i+3]];
+        acc = vfmaq_f32(acc, vld1q_f32(rotated_q + i), vld1q_f32(c_tmp));
+    }
+    float centroid_dot = tq_neon_hsum(acc);
+#else
+    float centroid_dot = 0.0f;
+    for (int i = 0; i < d; i++)
+        centroid_dot += rotated_q[i] * st->centroids[indices[i]];
+#endif
+
+    // XNOR popcount
+    const uint8_t *key_signs = packed_key + idx_sz;
+    int agree = 0;
+#ifdef __ARM_NEON
+    {
+        int b = 0;
+        for (; b + 16 <= qjl_sz; b += 16) {
+            uint8x16_t xnor = vmvnq_u8(veorq_u8(vld1q_u8(q_signs + b),
+                                                   vld1q_u8(key_signs + b)));
+            uint8x16_t cnt = vcntq_u8(xnor);
+            uint16x8_t p1 = vpaddlq_u8(cnt);
+            uint32x4_t p2 = vpaddlq_u16(p1);
+            uint64x2_t p3 = vpaddlq_u32(p2);
+            agree += (int)(vgetq_lane_u64(p3, 0) + vgetq_lane_u64(p3, 1));
+        }
+        for (; b < qjl_sz; b++) {
+            uint8_t xnor = ~(q_signs[b] ^ key_signs[b]);
+            uint8_t v = xnor;
+            v = (v & 0x55) + ((v >> 1) & 0x55);
+            v = (v & 0x33) + ((v >> 2) & 0x33);
+            v = (v & 0x0F) + ((v >> 4) & 0x0F);
+            agree += v;
+        }
+    }
+#else
+    for (int b = 0; b < qjl_sz; b++) {
+        uint8_t xnor = ~(q_signs[b] ^ key_signs[b]);
+        uint8_t v = xnor;
+        v = (v & 0x55) + ((v >> 1) & 0x55);
+        v = (v & 0x33) + ((v >> 2) & 0x33);
+        v = (v & 0x0F) + ((v >> 4) & 0x0F);
+        agree += v;
+    }
+#endif
+
+    float qjl_scale = sqrtf(3.14159265f / 2.0f) / (float)d;
+    float qjl_correction = (float)(2 * agree - d) * res_norm * qjl_scale;
+    return vec_norm * (centroid_dot + qjl_correction);
 }

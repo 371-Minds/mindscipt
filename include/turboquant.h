@@ -54,6 +54,15 @@ void bn_tq_attention_combine(const BnTQState *st, const uint8_t *packed_values,
                               int n_keys, int val_stride,
                               const float *weights, float *out);
 
+// Precompute QJL sign projection for a rotated query (once per head).
+// q_signs_out must be head_dim/8 bytes.
+void bn_tq_qjl_precompute(const BnTQState *st, const float *rotated_q,
+                            uint8_t *q_signs_out);
+
+// Score one packed key using precomputed QJL signs (avoids redundant projection).
+float bn_tq_score_key_precomputed(const BnTQState *st, const float *rotated_q,
+                                    const uint8_t *q_signs, const uint8_t *packed_key);
+
 // Packed byte sizes per vector.
 int bn_tq_key_bytes(const BnTQState *st);
 int bn_tq_value_bytes(const BnTQState *st);
