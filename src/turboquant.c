@@ -11,27 +11,23 @@ static inline float tq_neon_hsum(float32x4_t v) {
 }
 #endif
 
-// --- xoshiro256** PRNG (deterministic, seeded) ---
-
-static uint64_t tq_rng_state[4];
+// --- xoshiro256** PRNG (deterministic, seeded, thread-safe via local state) ---
 
 static uint64_t tq_rotl(uint64_t x, int k) {
     return (x << k) | (x >> (64 - k));
 }
 
-static void tq_rng_seed(uint64_t seed) {
-    // SplitMix64 to expand seed into state
+static void tq_rng_seed(uint64_t rng[4], uint64_t seed) {
     for (int i = 0; i < 4; i++) {
         seed += 0x9e3779b97f4a7c15ULL;
         uint64_t z = seed;
         z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
         z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-        tq_rng_state[i] = z ^ (z >> 31);
+        rng[i] = z ^ (z >> 31);
     }
 }
 
-static uint64_t tq_rng_next(void) {
-    uint64_t *s = tq_rng_state;
+static uint64_t tq_rng_next(uint64_t *s) {
     uint64_t result = tq_rotl(s[1] * 5, 7) * 9;
     uint64_t t = s[1] << 17;
     s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3];
@@ -73,7 +69,7 @@ static const float lloyd_max_4bit_bounds[15] = {
 };
 
 // --- Fast Walsh-Hadamard Transform (in-place, unnormalized) ---
-// d must be a power of 2. O(d log d) add/sub operations.
+// d must be a power of 2, >= 8. Enforced by bn_tq_init. O(d log d) add/sub operations.
 
 #ifdef __ARM_NEON
 static void fwht_inplace(float *x, int d) {
@@ -122,6 +118,7 @@ static void fwht_inplace(float *x, int d) {
 #endif
 
 // --- NEON helpers for sign application ---
+// Invariant: d >= 8 and d is a power of 2 (enforced by bn_tq_init), so d % 4 == 0.
 #ifdef __ARM_NEON
 static inline void tq_apply_signs_neon(const float *signs, const float *in, float *out, int d) {
     uint32x4_t sign_mask = vdupq_n_u32(0x80000000);
@@ -177,6 +174,7 @@ static void rht_inverse(const BnTQState *st, const float *in, float *out, int d)
 
 // QJL sign projection via RHT: out_signs = sign(H * D_qjl * in)
 // Produces d/8 bytes of packed sign bits. O(d log d).
+// Precondition: d % 8 == 0 (enforced by bn_tq_init).
 static void qjl_project_signs(const BnTQState *st, const float *in, uint8_t *out_signs, int d) {
     float tmp[d];
 #ifdef __ARM_NEON
@@ -208,6 +206,7 @@ static inline int quantize_scalar(float x, const float *boundaries, int n_centro
 }
 
 // --- Pack indices ---
+// Precondition: d must be a multiple of 8 (enforced by bn_tq_init power-of-2 >= 8).
 
 // Pack 2-bit indices: 4 per byte, d indices → d/4 bytes
 static void pack_2bit(const int *indices, int d, uint8_t *out) {
@@ -291,12 +290,14 @@ static int index_bytes(int d, int bits) {
 
 // --- FP16 helpers (IEEE 754 half-precision) ---
 
+// Accepted: denorms flush to zero. Smallest representable is ~6.1e-5.
+// Residual norms below this threshold lose QJL correction (negligible in practice).
 static inline uint16_t tq_fp32_to_fp16(float f) {
     union { float f; uint32_t u; } fi = { .f = f };
     uint32_t sign = (fi.u >> 16) & 0x8000;
     int exp = ((fi.u >> 23) & 0xFF) - 127 + 15;
     uint32_t frac = (fi.u >> 13) & 0x3FF;
-    if (exp <= 0) return (uint16_t)sign;
+    if (exp <= 0) return (uint16_t)sign; // flush denorms to zero
     if (exp >= 31) return (uint16_t)(sign | 0x7C00);
     return (uint16_t)(sign | (exp << 10) | frac);
 }
@@ -343,7 +344,8 @@ int bn_tq_value_bytes(const BnTQState *st) {
 int bn_tq_init(BnTQState *state, int head_dim, int bits, uint64_t seed) {
     if (!state) return -1;
     if (bits < 2 || bits > 4) return -1;
-    if (head_dim <= 0 || (head_dim % 8) != 0) return -1;
+    if (head_dim <= 0 || (head_dim & (head_dim - 1)) != 0) return -1; // must be power of 2
+    if (head_dim < 8) return -1; // minimum for NEON (8-wide FWHT stage 0)
 
     memset(state, 0, sizeof(BnTQState));
     state->head_dim = head_dim;
@@ -369,20 +371,21 @@ int bn_tq_init(BnTQState *state, int head_dim, int bits, uint64_t seed) {
     for (int i = 0; i < state->n_centroids - 1; i++)
         state->boundaries[i] = src_b[i] * inv_sqrt_d;
 
-    // Generate RHT diagonal signs: random ±1 from seeded PRNG
+    // Generate RHT diagonal signs: random ±1 from seeded PRNG (local state, thread-safe)
     state->rht_signs = (float *)malloc((size_t)d * sizeof(float));
     if (!state->rht_signs) { bn_tq_free(state); return -1; }
 
-    tq_rng_seed(seed);
+    uint64_t rng[4];
+    tq_rng_seed(rng, seed);
     for (int i = 0; i < d; i++)
-        state->rht_signs[i] = (tq_rng_next() & 1) ? 1.0f : -1.0f;
+        state->rht_signs[i] = (tq_rng_next(rng) & 1) ? 1.0f : -1.0f;
     state->rht_scale = inv_sqrt_d;
 
     // Generate QJL diagonal signs (second RHT with independent signs)
     state->qjl_signs = (float *)malloc((size_t)d * sizeof(float));
     if (!state->qjl_signs) { bn_tq_free(state); return -1; }
     for (int i = 0; i < d; i++)
-        state->qjl_signs[i] = (tq_rng_next() & 1) ? 1.0f : -1.0f;
+        state->qjl_signs[i] = (tq_rng_next(rng) & 1) ? 1.0f : -1.0f;
 
     return 0;
 }
@@ -399,7 +402,9 @@ void bn_tq_free(BnTQState *state) {
 // --- Quantize key ---
 
 void bn_tq_quantize_key(const BnTQState *st, const float *key, uint8_t *out) {
+    if (!st) return;
     int d = st->head_dim;
+    if (d <= 0 || d > BN_MAX_VLA_ELEMS) return;
     int idx_sz = index_bytes(d, st->bits);
     int qjl_sz = d / 8;
 
@@ -445,7 +450,9 @@ void bn_tq_quantize_key(const BnTQState *st, const float *key, uint8_t *out) {
 // --- Quantize value ---
 
 void bn_tq_quantize_value(const BnTQState *st, const float *val, uint8_t *out) {
+    if (!st) return;
     int d = st->head_dim;
+    if (d <= 0 || d > BN_MAX_VLA_ELEMS) return;
     int idx_sz = index_bytes(d, st->bits);
 
     // Step 1: Compute vector norm
@@ -474,6 +481,7 @@ void bn_tq_quantize_value(const BnTQState *st, const float *val, uint8_t *out) {
 // --- Rotate query ---
 
 void bn_tq_rotate_query(const BnTQState *st, const float *q_in, float *q_out) {
+    if (!st) return;
     rht_forward(st, q_in, q_out, st->head_dim);
 }
 
@@ -484,7 +492,9 @@ void bn_tq_rotate_query(const BnTQState *st, const float *q_in, float *q_out) {
 void bn_tq_attention_scores(const BnTQState *st, const float *rotated_q,
                              const uint8_t *packed_keys, int n_keys,
                              int key_stride, float *scores_out) {
+    if (!st) return;
     int d = st->head_dim;
+    if (d <= 0 || d > BN_MAX_VLA_ELEMS) return;
     int idx_sz = index_bytes(d, st->bits);
     int qjl_sz = d / 8;
 
@@ -572,7 +582,9 @@ void bn_tq_attention_scores(const BnTQState *st, const float *rotated_q,
 void bn_tq_attention_combine(const BnTQState *st, const uint8_t *packed_values,
                               int n_keys, int val_stride,
                               const float *weights, float *out) {
+    if (!st) return;
     int d = st->head_dim;
+    if (d <= 0 || d > BN_MAX_VLA_ELEMS) return;
     int idx_sz = index_bytes(d, st->bits);
 
     memset(out, 0, d * sizeof(float));
@@ -616,12 +628,15 @@ void bn_tq_attention_combine(const BnTQState *st, const uint8_t *packed_values,
 
 void bn_tq_qjl_precompute(const BnTQState *st, const float *rotated_q,
                             uint8_t *q_signs_out) {
+    if (!st) return;
     qjl_project_signs(st, rotated_q, q_signs_out, st->head_dim);
 }
 
 float bn_tq_score_key_precomputed(const BnTQState *st, const float *rotated_q,
                                     const uint8_t *q_signs, const uint8_t *packed_key) {
+    if (!st) return 0.0f;
     int d = st->head_dim;
+    if (d <= 0 || d > BN_MAX_VLA_ELEMS) return 0.0f;
     int idx_sz = index_bytes(d, st->bits);
     int qjl_sz = d / 8;
 

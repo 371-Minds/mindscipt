@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+#ifndef BN_MAX_VLA_ELEMS
+#define BN_MAX_VLA_ELEMS 8192
+#endif
+
 // TurboQuant KV cache compression (ICLR 2026, arXiv 2504.19874).
 // Compresses KV cache to 3-bit via random rotation + Lloyd-Max scalar
 // quantization + 1-bit QJL residual correction for keys.

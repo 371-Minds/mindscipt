@@ -12,7 +12,7 @@ void bn_transformer_gqa_tq_scalar_range(void *ctx, int h_start, int h_end) {
     int kv_mul = g->kv_mul;
     int n_kv = g->n_kv;
     int seq_len = g->seq_len;
-    int start = g->pos - n_kv + 1;
+    int start = g->pos - n_kv + 1; // always >= 0: n_kv = min(pos+1, seq_len)
     int key_bytes = g->key_bytes;
     int val_bytes = g->val_bytes;
     int n_kv_heads = g->n_kv_heads;
