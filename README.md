@@ -1,14 +1,24 @@
 # bitnet.c
 
-A minimal, embeddable LLM inference engine in pure C11.
+Minimal, zero-dependency LLM inference in pure C11.
 
-Loads GGUF models and runs autoregressive text generation on CPU. Supports 20+ quantization formats — from ternary (I2_S, TQ1/TQ2) through k-quants (Q2–Q8) and imatrix (IQ2–IQ4) to unquantized (F16, BF16, F32). Handles both standard transformer and hybrid SSM+Attention architectures (Gated DeltaNet). Inspired by Karpathy's [llama2.c](https://github.com/karpathy/llama2.c).
+## Why bitnet.c
 
-Zero dependencies beyond libc and libm, four SIMD backends, compiles to WASM, and fits in ~8,000 lines of modular C.
+LLM inference engines are bloated. llama.cpp is 200K+ lines of C++ with CMake, CUDA SDKs, and abstraction layers between you and the SIMD instructions that actually matter. Ollama wraps that in Go. vLLM wraps PyTorch in Python. Each layer adds build complexity, deployment friction, and memory overhead.
+
+bitnet.c takes the opposite approach:
+
+- **Zero dependencies.** Only libc and libm. No C++, no CMake, no Python, no package managers. Optional GPU via wgpu-native — but CPU is the default and first-class citizen.
+- **Minimal memory footprint.** [TurboQuant](#turboquant-kv-cache-compression) compresses the KV cache to 3-bit (8.9x smaller), so you serve ~9x more concurrent users in the same RAM. A 35B MoE model at 64K context runs in 8.4 GB — not 26 GB.
+- **Flash MoE.** SSD-streamed expert loading via pread + LRU cache means you run 21 GB MoE models on a 16 GB machine. Hot experts stay in cache; cold ones stream from NVMe at 5 GB/s.
+- **CPU-first SIMD.** ARM NEON/SDOT, AVX2, WASM SIMD128 — auto-selected at compile time. The forward pass is a flat `for` loop over layers calling SIMD matvec kernels directly. No graph abstraction, no tensor framework.
+- **Embeddable.** ~8,000 lines of C11. Compiles to WASM and runs in a browser. Clean build under 3 seconds. Link it as a static library into anything.
+
+**When to use llama.cpp/Ollama instead:** CUDA/Metal GPU inference, OpenAI-compatible API serving, or multi-model management.
 
 ## Features
 
-- **Pure C11** — no C++, no frameworks, no dependencies beyond libc and libm
+- **Pure C11** — no C++, no frameworks, no dependencies beyond libc and libm (GPU backend optional)
 - **GGUF model loading** — loads any GGUF file with supported tensor types
 - **20+ quantization formats** — ternary, k-quants, imatrix codebook, and unquantized (see table below)
 - **Full transformer forward pass** — RoPE, GQA, RMSNorm, sub-norms, tied/untied embeddings
@@ -438,27 +448,6 @@ Measured on Apple M1 Max (8 P-cores, 32 GB), PGO build, greedy decoding, 8 threa
 | Llama3-8B-1.58 | 3.4 GB | TQ1_0 (ternary) | **14.5 tok/s** | 19 tok/s | — |
 
 CPU performance: on ternary models (TQ1_0) it reaches **76% of llama.cpp CPU** — close to parity. On standard quants (Q4_0) it reaches **75% of llama.cpp CPU** using multi-row interleaved kernels (4 output rows per pass, amortizing activation loads). llama.cpp does not support TQ1_0 on Metal. An optional WebGPU backend (`--gpu`) is available for GPU-accelerated inference.
-
-## Design Decisions
-
-### Why not llama.cpp / Ollama?
-
-llama.cpp supports dozens of quantization formats, model architectures, GPU backends (CUDA, Metal, Vulkan, SYCL), and serving modes. That generality costs ~200K lines of C++ and a build system that pulls in platform-specific SDKs.
-
-bitnet.c exists as the opposite tradeoff:
-
-- **Embeddable.** ~8,000 lines of C11, zero dependencies. Compiles to WASM and runs in a browser. Link it into your app as a static library.
-- **Optional GPU, no framework lock-in.** An optional WebGPU backend via wgpu-native provides GPU acceleration without CUDA/Metal/Vulkan SDK dependencies. CPU inference with SIMD kernels remains the default and is fast enough for models that fit in RAM.
-- **No abstraction layers.** llama.cpp routes tensor operations through GGML's graph-based backend abstraction. bitnet.c calls the matvec kernel directly — the forward pass is a flat loop over layers with inline SIMD.
-- **Fast builds.** Clean build under 3 seconds. No CMake, no Python, no package managers.
-
-**When to use llama.cpp/Ollama instead:** Models too large for RAM, CUDA/Metal-specific optimizations, OpenAI-compatible API serving, or multi-model management.
-
-### Why C
-
-The inner loop is SIMD intrinsics — the code *is* the assembly, minus register allocation. The entire forward pass is a `for` loop over layers. The GGUF parser is pointer arithmetic into a mmap'd buffer. C gives you exactly what's needed and nothing else.
-
-Rust would wrap every mmap pointer in `unsafe`. C++ would template the tensor types. Go can't do NEON. Python would need ctypes back into C. For a DRAM-bandwidth-bound SIMD kernel, the right language compiles directly to the SIMD instructions.
 
 ## Known Limitations
 
