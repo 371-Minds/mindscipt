@@ -335,17 +335,45 @@ static void forward_ffn_block(BnModel *m, BnSession *sess, BnLayerWeights *lw) {
     int dim = c->dim;
     int hidden_dim = c->hidden_dim;
 
-    rmsnorm(s->xb, s->x, lw->ffn_norm, dim, c->norm_eps);
+    /* Fused RMSNorm + Q8K quantization on AVX2 for k-quant FFN weights:
+     * saves 2 full passes over dim by combining norm scaling with Q8K
+     * amax-finding and quantization. Falls back to separate path for GPU
+     * or non-k-quant weight types. */
+    int fused_gate_up = 0;
+#ifdef __AVX2__
+    if (c->has_ffn_gate && !m->gpu && dim % BN_QK_K == 0 &&
+        (lw->ffn_gate.type == BN_GGUF_TENSOR_Q4_K ||
+         lw->ffn_gate.type == BN_GGUF_TENSOR_Q6_K)) {
+        int n_sb = dim / BN_QK_K;
+        float q8k_d[n_sb];
+        int16_t q8k_bsums[n_sb * 16];
+        bn_quant_rmsnorm_q8k_avx2(s->x, lw->ffn_norm, dim, c->norm_eps,
+                                    s->xb, s->x_q, q8k_d, q8k_bsums);
+        BnMatvecTask ffn[2] = {
+            { s->hb,  &lw->ffn_gate },
+            { s->hb2, &lw->ffn_up   },
+        };
+        bn_quant_matvec_batch_preq8k(ffn, 2, s->x_q, q8k_d, q8k_bsums, s->xb, m->pool);
+        fused_gate_up = 1;
+    }
+#endif
+    if (!fused_gate_up) {
+        rmsnorm(s->xb, s->x, lw->ffn_norm, dim, c->norm_eps);
 
-    if (c->has_ffn_gate) {
-        {
+        if (c->has_ffn_gate) {
             BnMatvecTask ffn[2] = {
                 { s->hb,  &lw->ffn_gate },
                 { s->hb2, &lw->ffn_up   },
             };
             bn_quant_matvec_batch_gpu(ffn, 2, s->xb, s->x_q, m->pool, m->gpu);
+        } else {
+            BnMatvecTask ffn[1] = {{ s->hb, &lw->ffn_up }};
+            bn_quant_matvec_batch_gpu(ffn, 1, s->xb, s->x_q, m->pool, m->gpu);
         }
+    }
 
+    /* Activation function (shared by fused and non-fused paths) */
+    if (c->has_ffn_gate) {
         if (c->act_type == 1) {
 #ifdef __ARM_NEON
             float32x4_t zero = vdupq_n_f32(0);
@@ -386,11 +414,6 @@ static void forward_ffn_block(BnModel *m, BnSession *sess, BnLayerWeights *lw) {
 #endif
         }
     } else {
-        {
-            BnMatvecTask ffn[1] = {{ s->hb, &lw->ffn_up }};
-            bn_quant_matvec_batch_gpu(ffn, 1, s->xb, s->x_q, m->pool, m->gpu);
-        }
-
         if (c->act_type == 1) {
             for (int i = 0; i < hidden_dim; i++) {
                 float v = s->hb[i] > 0 ? s->hb[i] : 0;

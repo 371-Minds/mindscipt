@@ -217,6 +217,13 @@ typedef struct {
 void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
                            const float *x, int8_t *x_q_buf, BnThreadPool *pool);
 
+// Batch matvec with pre-quantized Q8_K input (skips redundant quantization).
+// Used after fused rmsnorm+q8k to avoid re-quantizing the same activation.
+void bn_quant_matvec_batch_preq8k(const BnMatvecTask *tasks, int n_tasks,
+                                    const int8_t *x_q, const float *x_d,
+                                    const int16_t *x_bsums, const float *x_float,
+                                    BnThreadPool *pool);
+
 // Multi-input matvec: K independent (W, x) pairs dispatched in a single cycle.
 // Each task has its own weight matrix and input vector.
 // x_q_bufs must be [n_tasks * max_cols] int8 (pre-allocated scratch).
@@ -251,6 +258,15 @@ void bn_quant_x_to_q8k(const float *x, int8_t *x_q, float *x_d,
 // Quantize F16 rows to INT8 + per-row scales for INT8 logits kernel.
 void bn_quant_f16_rows_to_i8(const uint16_t *f16, int8_t *i8_out,
                               float *scales_out, int n_rows, int dim);
+
+// Fused RMSNorm + Q8_K quantization (AVX2 only). Saves 2 passes over dim.
+// xb_out receives the scaled x*w (float), x_q/x_d/x_bsums receive Q8_K result.
+#ifdef __AVX2__
+void bn_quant_rmsnorm_q8k_avx2(const float *x, const float *w, int dim, float eps,
+                                  float *xb_out, int8_t *x_q, float *x_d,
+                                  int16_t *x_bsums);
+#endif
+
 #endif
 
 // GPU-accelerated matvec with CPU fallback

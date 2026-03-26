@@ -986,6 +986,46 @@ void bn_quant_matvec_batch(const BnMatvecTask *tasks, int n_tasks,
     }
 }
 
+// Batch matvec with pre-quantized Q8_K input. Dispatches 4-row kernels
+// directly without re-quantizing. Falls back to float path for non-k-quant types.
+void bn_quant_matvec_batch_preq8k(const BnMatvecTask *tasks, int n_tasks,
+                                    const int8_t *x_q, const float *x_d,
+                                    const int16_t *x_bsums, const float *x_float,
+                                    BnThreadPool *pool) {
+    if (n_tasks <= 0) return;
+    int type0 = tasks[0].W->type;
+
+#ifdef __AVX2__
+    if ((type0 == BN_GGUF_TENSOR_Q4_K || type0 == BN_GGUF_TENSOR_Q6_K)
+        && n_tasks <= BN_MAX_BATCH) {
+        int all_same = 1;
+        for (int t = 1; t < n_tasks; t++)
+            if (tasks[t].W->type != type0) { all_same = 0; break; }
+        if (all_same) {
+            BnKQuantSdotCtx ctxs[BN_MAX_BATCH];
+            BnTPTask tp_tasks[BN_MAX_BATCH];
+            bn_tp_fn fn = (type0 == BN_GGUF_TENSOR_Q4_K)
+                ? (bn_tp_fn)bn_quant_q4k_avx2_4row_range
+                : (bn_tp_fn)bn_quant_q6k_avx2_4row_range;
+            for (int t = 0; t < n_tasks; t++) {
+                ctxs[t] = (BnKQuantSdotCtx){ tasks[t].out, tasks[t].W,
+                                              (int8_t *)x_q, (float *)x_d, (int16_t *)x_bsums };
+                int n_groups = (tasks[t].W->rows + 3) / 4;
+                tp_tasks[t] = (BnTPTask){ fn, &ctxs[t], n_groups };
+            }
+            bn_tp_dispatch(pool, tp_tasks, n_tasks);
+            return;
+        }
+    }
+#endif
+
+    // Fallback: use float path (x_float must be provided)
+    if (x_float) {
+        for (int t = 0; t < n_tasks; t++)
+            bn_quant_matvec(tasks[t].out, tasks[t].W, x_float, (int8_t *)x_q, pool);
+    }
+}
+
 // Multi-input matvec: K independent (W, x) pairs in a single dispatch.
 // Pre-quantizes each x, builds per-task contexts, dispatches all at once.
 void bn_quant_matvec_multi(const BnMatvecMultiTask *tasks, int n_tasks,
