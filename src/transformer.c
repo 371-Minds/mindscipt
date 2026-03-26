@@ -1303,7 +1303,7 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
                     .W_buf = lw->ssm_dt_bias_gpu, .buf_in = BN_GPU_BUF_SSM_ALPHA,
                     .buf_out = -1, .buf_aux = BN_GPU_BUF_SSM_BETA,
                     .p = { (uint32_t)num_v_heads, 0, 0, 0, 0, 0,
-                           (uint32_t)(a_ptr & 0xFFFFFFFF), (uint32_t)(a_ptr >> 32) } };
+                           (uint32_t)(a_ptr & 0xFFFFFFFF), (uint32_t)((uint64_t)a_ptr >> 32) } };
             }
             // 12. Delta rule recurrence
             ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_SSM_DELTA, .type = -1, .W_buf = NULL,

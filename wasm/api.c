@@ -31,7 +31,7 @@ int bitnet_init(const uint8_t *data, size_t size) {
     g_gguf = bn_gguf_open(mf.data, mf.size);
     if (!g_gguf) return -1;
 
-    if (bn_model_load(&g_model, g_gguf, 2048, 0) != 0) {
+    if (bn_model_load(&g_model, g_gguf, 2048, 0, 0) != 0) {
         bn_gguf_free(g_gguf);
         return -1;
     }
