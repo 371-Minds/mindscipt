@@ -147,16 +147,18 @@ void bn_quant_q4k_avx2_sdot_matmul_range(void *ctx, int row_start, int row_end) 
                 for (int j = 0; j < 8; j++)
                     bsum_corr += (int32_t)mins[j] * ((int32_t)bsums[2*j] + (int32_t)bsums[2*j + 1]);
 
+                /* Compute all 8 DPBUSDs first (deferred hsum for ILP) */
+                __m256i dots[8];
+                for (int p = 0; p < 4; p++) {
+                    dots[2*p]   = bn_avx2_dpbusd(zero, w_lo[p],
+                        _mm256_loadu_si256((const __m256i *)(xb + p * 64)));
+                    dots[2*p+1] = bn_avx2_dpbusd(zero, w_hi[p],
+                        _mm256_loadu_si256((const __m256i *)(xb + p * 64 + 32)));
+                }
                 int32_t sumi = 0;
                 for (int p = 0; p < 4; p++) {
-                    int sub = p * 2;
-                    __m256i dot_lo = bn_avx2_dpbusd(zero, w_lo[p],
-                        _mm256_loadu_si256((const __m256i *)(xb + p * 64)));
-                    __m256i dot_hi = bn_avx2_dpbusd(zero, w_hi[p],
-                        _mm256_loadu_si256((const __m256i *)(xb + p * 64 + 32)));
-
-                    sumi += bn_avx2_hsum_epi32(dot_lo) * (int32_t)sc[sub]
-                          + bn_avx2_hsum_epi32(dot_hi) * (int32_t)sc[sub + 1];
+                    sumi += bn_avx2_hsum_epi32(dots[2*p])   * (int32_t)sc[2*p]
+                          + bn_avx2_hsum_epi32(dots[2*p+1]) * (int32_t)sc[2*p + 1];
                 }
 
                 c->out[(size_t)t * rows + row] += dx * (d * (float)sumi - dmin * (float)bsum_corr);

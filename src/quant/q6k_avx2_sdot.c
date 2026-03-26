@@ -181,24 +181,23 @@ void bn_quant_q6k_avx2_sdot_matmul_range(void *ctx, int row_start, int row_end) 
                     int base = chunk * 4;
                     const int8_t *xbc = xb + chunk * 128;
 
+                    /* All 4 DPBUSDs first (deferred hsum for ILP) */
                     __m256i dot0 = bn_avx2_dpbusd(zero, W_all[base+0],
                         _mm256_loadu_si256((const __m256i *)xbc));
-                    sumi += hsum_lane_lo(dot0) * (int32_t)sc[0]
-                          + hsum_lane_hi(dot0) * (int32_t)sc[1];
-
                     __m256i dot1 = bn_avx2_dpbusd(zero, W_all[base+1],
                         _mm256_loadu_si256((const __m256i *)(xbc + 32)));
-                    sumi += hsum_lane_lo(dot1) * (int32_t)sc[2]
-                          + hsum_lane_hi(dot1) * (int32_t)sc[3];
-
                     __m256i dot2 = bn_avx2_dpbusd(zero, W_all[base+2],
                         _mm256_loadu_si256((const __m256i *)(xbc + 64)));
-                    sumi += hsum_lane_lo(dot2) * (int32_t)sc[4]
-                          + hsum_lane_hi(dot2) * (int32_t)sc[5];
-
                     __m256i dot3 = bn_avx2_dpbusd(zero, W_all[base+3],
                         _mm256_loadu_si256((const __m256i *)(xbc + 96)));
-                    sumi += hsum_lane_lo(dot3) * (int32_t)sc[6]
+
+                    sumi += hsum_lane_lo(dot0) * (int32_t)sc[0]
+                          + hsum_lane_hi(dot0) * (int32_t)sc[1]
+                          + hsum_lane_lo(dot1) * (int32_t)sc[2]
+                          + hsum_lane_hi(dot1) * (int32_t)sc[3]
+                          + hsum_lane_lo(dot2) * (int32_t)sc[4]
+                          + hsum_lane_hi(dot2) * (int32_t)sc[5]
+                          + hsum_lane_lo(dot3) * (int32_t)sc[6]
                           + hsum_lane_hi(dot3) * (int32_t)sc[7];
 
                     for (int g = 0; g < 8; g++)

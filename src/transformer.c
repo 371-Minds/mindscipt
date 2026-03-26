@@ -483,7 +483,28 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
         int q_gated = lw->wq.data && (lw->wq.rows > q_dim);
         int q_wide  = !q_gated && lw->wq.data && (lw->wq.rows > dim);
 
-        rmsnorm(s->xb, s->x, lw->attn_norm, dim, c->norm_eps);
+        /* Fused attn RMSNorm + Q8K: quantize s->xb once, reuse for Q and K+V */
+        int attn_preq8k = 0;
+#ifdef __AVX2__
+        int attn_kquant = (lw->wq.type == BN_GGUF_TENSOR_Q4_K ||
+                           lw->wq.type == BN_GGUF_TENSOR_Q6_K) &&
+                          !m->gpu && dim % BN_QK_K == 0;
+#else
+        int attn_kquant = 0;
+#endif
+        int n_sb_attn = dim / BN_QK_K;
+        float attn_q8k_d[n_sb_attn > 0 ? n_sb_attn : 1];
+        int16_t attn_q8k_bsums[n_sb_attn > 0 ? n_sb_attn * 16 : 1];
+#ifdef __AVX2__
+        if (attn_kquant) {
+            bn_quant_rmsnorm_q8k_avx2(s->x, lw->attn_norm, dim, c->norm_eps,
+                                        s->xb, s->x_q, attn_q8k_d, attn_q8k_bsums);
+            attn_preq8k = 1;
+        } else
+#endif
+        {
+            rmsnorm(s->xb, s->x, lw->attn_norm, dim, c->norm_eps);
+        }
         BL_ACC(bl_rmsnorm_us);
 
         if (q_gated) {
@@ -492,20 +513,26 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
             float *k_tmp = s->hb2;
             float *v_tmp = s->hb2 + kv_dim;
 
-            // Q + K/V matvecs (always to temp buffers)
+            // Q matvec (reuse cached Q8K if available)
             {
                 BnMatvecTask q_task[1] = {{ q_full, &lw->wq }};
-                bn_quant_matvec_batch_gpu(q_task, 1, s->xb, s->x_q, m->pool, m->gpu);
+                if (attn_preq8k)
+                    bn_quant_matvec_batch_preq8k(q_task, 1, s->x_q, attn_q8k_d, attn_q8k_bsums, s->xb, m->pool);
+                else
+                    bn_quant_matvec_batch_gpu(q_task, 1, s->xb, s->x_q, m->pool, m->gpu);
             }
+            // K+V matvecs (reuse same cached Q8K)
             if (!(c->kv_tq_bits > 0 && m->tq_state) && !c->kv_f16) {
-                // FP32 path: write directly to cache
                 float *key_cache_row   = s->key_cache   + loff + (size_t)cache_pos * kv_dim;
                 float *value_cache_row = s->value_cache + loff + (size_t)cache_pos * kv_dim;
                 BnMatvecTask kv[2] = {
                     { key_cache_row,   &lw->wk },
                     { value_cache_row, &lw->wv },
                 };
-                bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
+                if (attn_preq8k)
+                    bn_quant_matvec_batch_preq8k(kv, 2, s->x_q, attn_q8k_d, attn_q8k_bsums, s->xb, m->pool);
+                else
+                    bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
                 k_tmp = key_cache_row;
                 v_tmp = value_cache_row;
             } else {
@@ -513,19 +540,27 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
                     { k_tmp, &lw->wk },
                     { v_tmp, &lw->wv },
                 };
-                bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
+                if (attn_preq8k)
+                    bn_quant_matvec_batch_preq8k(kv, 2, s->x_q, attn_q8k_d, attn_q8k_bsums, s->xb, m->pool);
+                else
+                    bn_quant_matvec_batch_gpu(kv, 2, s->xb, s->x_q, m->pool, m->gpu);
             }
             BL_ACC(bl_matvec_qkv_us);
 
-            for (int h = 0; h < n_heads; h++)
-                memcpy(s->q + h * head_size,
-                       q_full + h * 2 * head_size,
-                       head_size * sizeof(float));
-
-            if (lw->q_norm)
+            /* Extract Q from interleaved [Q, gate] and optionally apply Q norm.
+             * Fused: copy from q_full stride-2hs directly into rmsnorm if norm exists,
+             * avoiding a separate memcpy + reload. */
+            if (lw->q_norm) {
                 for (int h = 0; h < n_heads; h++)
-                    rmsnorm(s->q + h*head_size, s->q + h*head_size,
+                    rmsnorm(s->q + h*head_size,
+                            q_full + h * 2 * head_size,
                             lw->q_norm + h*qk_stride, head_size, c->norm_eps);
+            } else {
+                for (int h = 0; h < n_heads; h++)
+                    memcpy(s->q + h * head_size,
+                           q_full + h * 2 * head_size,
+                           head_size * sizeof(float));
+            }
             if (lw->k_norm)
                 for (int h = 0; h < c->n_kv_heads; h++)
                     rmsnorm(k_tmp + h*head_size, k_tmp + h*head_size,
