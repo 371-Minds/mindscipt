@@ -69,30 +69,33 @@ void bn_quant_q6k_avx2_4row_range(void *ctx, int group_start, int group_end) {
 
                     int base = chunk * 4;
 
-                    /* DPBUSD dot products — reuse preloaded xv[] */
+                    /* DPBUSD all 4 dot products first — no scalar dependencies
+                     * between them, so CPU can pipeline all 4 in parallel. */
                     __m256i dot0 = bn_avx2_dpbusd(zero, w0, xv[base + 0]);
-                    __m128i h0 = _mm_hadd_epi32(_mm256_castsi256_si128(dot0), _mm256_extracti128_si256(dot0, 1));
-                    h0 = _mm_hadd_epi32(h0, h0);
-                    sumi += _mm_cvtsi128_si32(h0) * (int32_t)sc[0]
-                          + _mm_extract_epi32(h0, 1) * (int32_t)sc[1];
-
                     __m256i dot1 = bn_avx2_dpbusd(zero, w1, xv[base + 1]);
-                    __m128i h1 = _mm_hadd_epi32(_mm256_castsi256_si128(dot1), _mm256_extracti128_si256(dot1, 1));
-                    h1 = _mm_hadd_epi32(h1, h1);
-                    sumi += _mm_cvtsi128_si32(h1) * (int32_t)sc[2]
-                          + _mm_extract_epi32(h1, 1) * (int32_t)sc[3];
-
                     __m256i dot2 = bn_avx2_dpbusd(zero, w2, xv[base + 2]);
-                    __m128i h2 = _mm_hadd_epi32(_mm256_castsi256_si128(dot2), _mm256_extracti128_si256(dot2, 1));
-                    h2 = _mm_hadd_epi32(h2, h2);
-                    sumi += _mm_cvtsi128_si32(h2) * (int32_t)sc[4]
-                          + _mm_extract_epi32(h2, 1) * (int32_t)sc[5];
-
                     __m256i dot3 = bn_avx2_dpbusd(zero, w3, xv[base + 3]);
-                    __m128i h3 = _mm_hadd_epi32(_mm256_castsi256_si128(dot3), _mm256_extracti128_si256(dot3, 1));
-                    h3 = _mm_hadd_epi32(h3, h3);
-                    sumi += _mm_cvtsi128_si32(h3) * (int32_t)sc[6]
-                          + _mm_extract_epi32(h3, 1) * (int32_t)sc[7];
+
+                    /* Deferred hsum phase: per-lane sums with separate scales.
+                     * Each 256-bit dot has 2 sub-blocks (lo/hi 128-bit lanes). */
+                    __m128i lo0 = _mm256_castsi256_si128(dot0), hi0 = _mm256_extracti128_si256(dot0, 1);
+                    __m128i lo1 = _mm256_castsi256_si128(dot1), hi1 = _mm256_extracti128_si256(dot1, 1);
+                    __m128i lo2 = _mm256_castsi256_si128(dot2), hi2 = _mm256_extracti128_si256(dot2, 1);
+                    __m128i lo3 = _mm256_castsi256_si128(dot3), hi3 = _mm256_extracti128_si256(dot3, 1);
+
+                    /* Pairwise hadd to get [sum01_lo, sum01_hi, sum23_lo, sum23_hi] */
+                    __m128i p01 = _mm_hadd_epi32(_mm_hadd_epi32(lo0, hi0), _mm_hadd_epi32(lo1, hi1));
+                    __m128i p23 = _mm_hadd_epi32(_mm_hadd_epi32(lo2, hi2), _mm_hadd_epi32(lo3, hi3));
+                    /* p01 = [sum(lo0), sum(hi0), sum(lo1), sum(hi1)]
+                     * p23 = [sum(lo2), sum(hi2), sum(lo3), sum(hi3)] */
+
+                    int32_t s01[4], s23[4];
+                    _mm_storeu_si128((__m128i *)s01, p01);
+                    _mm_storeu_si128((__m128i *)s23, p23);
+                    sumi += s01[0] * (int32_t)sc[0] + s01[1] * (int32_t)sc[1]
+                          + s01[2] * (int32_t)sc[2] + s01[3] * (int32_t)sc[3]
+                          + s23[0] * (int32_t)sc[4] + s23[1] * (int32_t)sc[5]
+                          + s23[2] * (int32_t)sc[6] + s23[3] * (int32_t)sc[7];
 
                     for (int s = 0; s < 8; s++)
                         bias_corr += (int32_t)sc[s] * (int32_t)bsums[chunk * 8 + s];
