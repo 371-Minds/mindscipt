@@ -50,8 +50,10 @@
 #define BN_GPU_BUF_SSM_CONV_STATE 17  // [n_ssm * (kern-1) * qkv_dim]
 #define BN_GPU_BUF_SSM_QKV        18  // SSM QKV projection output [qkv_dim]
 #define BN_GPU_BUF_SSM_Z          19  // Z gate projection output [value_dim]
-#define BN_GPU_BUF_SSM_AB         20  // alpha + beta [2 * num_v_heads]
-#define BN_GPU_BUF_COUNT          21
+#define BN_GPU_BUF_SSM_ALPHA      20  // decay rates [num_v_heads]
+#define BN_GPU_BUF_SSM_BETA       21  // update rates [num_v_heads]
+#define BN_GPU_BUF_SSM_V          22  // V vectors for delta [value_dim]
+#define BN_GPU_BUF_COUNT          23
 
 // Shader uniform parameter count (32 bytes = 8 × u32, matches WGSL Uniforms structs)
 #define BN_GPU_OP_PARAMS 8

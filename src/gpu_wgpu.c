@@ -1122,7 +1122,9 @@ static int wgpu_init_activations(void *vctx, const void *config_ptr)
         sizes[BN_GPU_BUF_SSM_CONV_STATE] = (size_t)n_ssm * (kern - 1) * qkv_dim * sizeof(float);
         sizes[BN_GPU_BUF_SSM_QKV]        = (size_t)qkv_dim * sizeof(float);
         sizes[BN_GPU_BUF_SSM_Z]          = (size_t)value_dim * sizeof(float);
-        sizes[BN_GPU_BUF_SSM_AB]         = (size_t)num_v_heads * 2 * sizeof(float);
+        sizes[BN_GPU_BUF_SSM_ALPHA]      = (size_t)num_v_heads * sizeof(float);
+        sizes[BN_GPU_BUF_SSM_BETA]       = (size_t)num_v_heads * sizeof(float);
+        sizes[BN_GPU_BUF_SSM_V]          = (size_t)value_dim * sizeof(float);
     }
 
     /* Create each activation buffer (Storage | CopySrc | CopyDst) */
@@ -1461,11 +1463,12 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
             op_writes = BUF_BIT(op->buf_in) | BUF_BIT(op->buf_aux);
             break;
         case BN_GPU_SHADER_SSM_ALPHA_BETA:
-            op_reads = BUF_BIT(op->buf_in) | BUF_BIT(op->buf_aux);
-            op_writes = BUF_BIT(op->buf_in) | BUF_BIT(op->buf_aux);
+            op_reads = BUF_BIT(BN_GPU_BUF_SSM_ALPHA) | BUF_BIT(BN_GPU_BUF_SSM_BETA);
+            op_writes = BUF_BIT(BN_GPU_BUF_SSM_ALPHA) | BUF_BIT(BN_GPU_BUF_SSM_BETA);
             break;
         case BN_GPU_SHADER_SSM_DELTA:
-            op_reads = BUF_BIT(BN_GPU_BUF_SSM_STATE) | BUF_BIT(op->buf_in) | BUF_BIT(op->buf_aux);
+            op_reads = BUF_BIT(BN_GPU_BUF_SSM_STATE) | BUF_BIT(op->buf_in) | BUF_BIT(op->buf_aux)
+                     | BUF_BIT(BN_GPU_BUF_SSM_V) | BUF_BIT(BN_GPU_BUF_SSM_ALPHA) | BUF_BIT(BN_GPU_BUF_SSM_BETA);
             op_writes = BUF_BIT(BN_GPU_BUF_SSM_STATE) | BUF_BIT(op->buf_out);
             break;
         case BN_GPU_SHADER_SSM_GATE:
@@ -1706,16 +1709,16 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
             break;
         }
         case BN_GPU_SHADER_SSM_ALPHA_BETA: {
-            /* alpha(rw), beta(rw), dt_bias(ro), a_log(ro), uniforms */
+            /* alpha(rw)=SSM_ALPHA, beta(rw)=SSM_BETA, dt_bias(ro), a_log(ro), uniforms */
             BnWgpuBuf *wbuf = (BnWgpuBuf *)op->W_buf;  /* packed dt_bias + a_log */
             if (!wbuf) continue;
             entries[0] = (WGPUBindGroupEntry){
-                .binding = 0, .buffer = ctx->act_bufs[op->buf_in],
-                .offset = 0, .size = ctx->act_sizes[op->buf_in]};
+                .binding = 0, .buffer = ctx->act_bufs[BN_GPU_BUF_SSM_ALPHA],
+                .offset = 0, .size = ctx->act_sizes[BN_GPU_BUF_SSM_ALPHA]};
             entries[1] = (WGPUBindGroupEntry){
-                .binding = 1, .buffer = ctx->act_bufs[op->buf_aux],
-                .offset = 0, .size = ctx->act_sizes[op->buf_aux]};
-            /* dt_bias and a_log are packed in W_buf: [dt_bias..., a_log...] */
+                .binding = 1, .buffer = ctx->act_bufs[BN_GPU_BUF_SSM_BETA],
+                .offset = 0, .size = ctx->act_sizes[BN_GPU_BUF_SSM_BETA]};
+            /* dt_bias and a_log packed in W_buf: [dt_bias[nv], a_log[nv]] */
             entries[2] = (WGPUBindGroupEntry){
                 .binding = 2, .buffer = wbuf->buf,
                 .offset = 0, .size = wbuf->size / 2};
@@ -1743,15 +1746,14 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
                 .binding = 3, .buffer = ctx->act_bufs[op->buf_aux],
                 .offset = 0, .size = ctx->act_sizes[op->buf_aux]};
             entries[4] = (WGPUBindGroupEntry){
-                .binding = 4, .buffer = ctx->act_bufs[BN_GPU_BUF_SSM_Z],
-                .offset = 0, .size = ctx->act_sizes[BN_GPU_BUF_SSM_Z]};
+                .binding = 4, .buffer = ctx->act_bufs[BN_GPU_BUF_SSM_V],
+                .offset = 0, .size = ctx->act_sizes[BN_GPU_BUF_SSM_V]};
             entries[5] = (WGPUBindGroupEntry){
-                .binding = 5, .buffer = ctx->act_bufs[BN_GPU_BUF_SSM_AB],
-                .offset = 0, .size = ctx->act_sizes[BN_GPU_BUF_SSM_AB] / 2};
+                .binding = 5, .buffer = ctx->act_bufs[BN_GPU_BUF_SSM_ALPHA],
+                .offset = 0, .size = ctx->act_sizes[BN_GPU_BUF_SSM_ALPHA]};
             entries[6] = (WGPUBindGroupEntry){
-                .binding = 6, .buffer = ctx->act_bufs[BN_GPU_BUF_SSM_AB],
-                .offset = ctx->act_sizes[BN_GPU_BUF_SSM_AB] / 2,
-                .size = ctx->act_sizes[BN_GPU_BUF_SSM_AB] / 2};
+                .binding = 6, .buffer = ctx->act_bufs[BN_GPU_BUF_SSM_BETA],
+                .offset = 0, .size = ctx->act_sizes[BN_GPU_BUF_SSM_BETA]};
             entries[7] = (WGPUBindGroupEntry){
                 .binding = 7, .buffer = ctx->uniform_ring,
                 .offset = uni_offset, .size = 32};

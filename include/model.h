@@ -7,6 +7,7 @@
 #include "threadpool.h"
 #include "sh_arena.h"
 #include "gpu_backend.h"
+#include "turboquant.h"
 
 // Forward declaration for MoE expert map (defined in moe.h)
 typedef struct {
@@ -108,6 +109,8 @@ typedef struct {
     int moe_intermediate_size;  // per-expert hidden dim
     int has_shared_expert;      // 1 if shared expert exists
     int shared_expert_intermediate_size; // shared expert hidden dim
+    // TurboQuant KV compression (0=disabled, 2-4 = bits)
+    int kv_tq_bits;
 } BnConfig;
 
 typedef struct {
@@ -142,6 +145,10 @@ typedef struct {
     void *v_bias_gpu;
     // Stacked QKV weight buffer for GPU (NULL = use individual Q/K/V)
     void *qkv_stacked_gpu;
+    // GPU handles for SSM weights (NULL = not uploaded or not SSM layer)
+    void *ssm_conv1d_gpu;       // [kern * qkv_dim] F32
+    void *ssm_dt_bias_a_gpu;    // packed [dt_bias[nv], a_log[nv]] F32
+    void *ssm_norm_gpu;         // [head_v_dim] F32
 } BnLayerWeights;
 
 typedef struct {
@@ -166,6 +173,10 @@ typedef struct {
     float *value_cache;           // [n_attn_layers * seq_len * kv_dim]
     int8_t *x_q;                  // [max(dim, hidden_dim)] scratch for int8 quantized x
     float *rope_freq;             // [head_size/2] precomputed RoPE frequencies
+    // TurboQuant compressed KV cache (NULL if kv_tq_bits == 0)
+    uint8_t *key_cache_tq;        // [n_attn_layers * seq_len * n_kv_heads * key_bytes]
+    uint8_t *value_cache_tq;      // [n_attn_layers * seq_len * n_kv_heads * val_bytes]
+    float *q_rotated;             // [n_heads * head_size] scratch for rotated queries
     // SSM state (NULL if no SSM layers)
     float *ssm_state;             // [n_ssm * num_v_heads * head_k_dim * head_v_dim]
     float *ssm_conv_state;        // [n_ssm * (conv_kernel-1) * conv_dim]
@@ -181,9 +192,10 @@ typedef struct {
     BnMoEIO moe_io;
     int expert_fd;           // file descriptor for expert pread, -1 if unused
     BnGPUBackend *gpu;       // GPU compute backend (NULL = CPU only)
+    BnTQState *tq_state;     // TurboQuant state (NULL = no TQ compression)
 } BnModel;
 
-int  bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16);
+int  bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv_tq_bits);
 void bn_model_free(BnModel *m);
 void bn_model_embed_token(const BnModel *m, float *out, int token);
 

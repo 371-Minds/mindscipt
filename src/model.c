@@ -221,10 +221,11 @@ static int load_expert_map_proj(BnGGUFFile *f, const char *name,
 
 // --- Model loading ---
 
-int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
+int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv_tq_bits) {
     memset(m, 0, sizeof(BnModel));
     BnConfig *c = &m->config;
     c->kv_f16 = kv_f16;
+    c->kv_tq_bits = kv_tq_bits;
 
     // Try to detect architecture prefix
     const char *arch = bn_gguf_get_str(f, "general.architecture");
@@ -783,6 +784,22 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16) {
 #endif
     }
 
+    // Initialize TurboQuant state if KV compression is enabled
+    if (c->kv_tq_bits > 0) {
+        m->tq_state = (BnTQState *)malloc(sizeof(BnTQState));
+        if (!m->tq_state) goto fail_state;
+        if (bn_tq_init(m->tq_state, c->head_size, c->kv_tq_bits, 0x5451303042ULL) != 0) {
+            free(m->tq_state);
+            m->tq_state = NULL;
+            goto fail_state;
+        }
+        char tq_bits[4], tq_kb[16], tq_vb[16];
+        snprintf(tq_bits, sizeof(tq_bits), "%d", c->kv_tq_bits);
+        snprintf(tq_kb, sizeof(tq_kb), "%d", bn_tq_key_bytes(m->tq_state));
+        snprintf(tq_vb, sizeof(tq_vb), "%d", bn_tq_value_bytes(m->tq_state));
+        SH_LOG_INFO("TurboQuant KV", "bits", tq_bits, "key_bytes", tq_kb, "val_bytes", tq_vb);
+    }
+
     return 0;
 
 fail_state:
@@ -889,6 +906,24 @@ size_t bn_model_session_arena_size(const BnConfig *c, const BnWeights *w) {
     arena_size += (size_t)half_head * sizeof(float);
     arena_size += (ssm_state_size_total + ssm_conv_state_total) * sizeof(float);
     arena_size += moe_arena_bytes;
+
+    // TurboQuant compressed KV cache
+    if (c->kv_tq_bits > 0) {
+        // Need a temporary BnTQState to compute byte sizes
+        BnTQState tq_tmp;
+        if (bn_tq_init(&tq_tmp, c->head_size, c->kv_tq_bits, 0) == 0) {
+            int key_bytes = bn_tq_key_bytes(&tq_tmp);
+            int val_bytes = bn_tq_value_bytes(&tq_tmp);
+            size_t tq_keys = (size_t)n_attn_layers * c->seq_len * c->n_kv_heads * key_bytes;
+            size_t tq_vals = (size_t)n_attn_layers * c->seq_len * c->n_kv_heads * val_bytes;
+            arena_size += tq_keys + tq_vals;
+            // q_rotated scratch: n_heads * head_size floats
+            arena_size += (size_t)c->n_heads * c->head_size * sizeof(float);
+            arena_size += 3 * SH_ARENA_ALIGN;
+            bn_tq_free(&tq_tmp);
+        }
+    }
+
     arena_size += 16 * SH_ARENA_ALIGN;
 
     return arena_size;
@@ -990,6 +1025,26 @@ int bn_model_alloc_session_buffers(const BnConfig *c, const BnWeights *w,
         s->ssm_conv_state = (float *)sh_arena_calloc(arena, ssm_conv_state_total, sizeof(float));
     }
 
+    // TurboQuant compressed KV cache
+    s->key_cache_tq = NULL;
+    s->value_cache_tq = NULL;
+    s->q_rotated = NULL;
+    if (c->kv_tq_bits > 0) {
+        BnTQState tq_tmp;
+        if (bn_tq_init(&tq_tmp, c->head_size, c->kv_tq_bits, 0) == 0) {
+            int key_bytes = bn_tq_key_bytes(&tq_tmp);
+            int val_bytes = bn_tq_value_bytes(&tq_tmp);
+            size_t tq_key_total = (size_t)n_attn_layers * c->seq_len * c->n_kv_heads * key_bytes;
+            size_t tq_val_total = (size_t)n_attn_layers * c->seq_len * c->n_kv_heads * val_bytes;
+            s->key_cache_tq   = (uint8_t *)sh_arena_calloc(arena, tq_key_total, 1);
+            s->value_cache_tq = (uint8_t *)sh_arena_calloc(arena, tq_val_total, 1);
+            s->q_rotated      = (float *)sh_arena_calloc(arena, c->n_heads * c->head_size, sizeof(float));
+            bn_tq_free(&tq_tmp);
+            if (!s->key_cache_tq || !s->value_cache_tq || !s->q_rotated)
+                return -1;
+        }
+    }
+
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 ||
         !s->q || !s->att || !s->logits || !s->key_cache || !s->value_cache ||
         !s->x_q || !s->rope_freq)
@@ -1053,6 +1108,11 @@ void bn_model_free(BnModel *m) {
     bn_model_release_gpu(m);
     bn_moe_prefetch_destroy(&m->moe_io);
     bn_tp_free(m->pool);
+    if (m->tq_state) {
+        bn_tq_free(m->tq_state);
+        free(m->tq_state);
+        m->tq_state = NULL;
+    }
     free(m->weights.layers);
     sh_arena_free(m->weight_arena);
     bn_platform_unload_file(&m->file);
@@ -1219,6 +1279,34 @@ int bn_model_upload_weights(BnModel *model, BnGPUBackend *gpu) {
                 free(combined);
             }
         }
+
+        // Upload SSM F32 weights (for hybrid SSM+Attention models)
+        if (lw->ssm_conv1d) {
+            int num_v_heads = c->ssm_time_step_rank;
+            int head_k_dim  = c->ssm_state_size;
+            int key_dim     = c->ssm_group_count * head_k_dim;
+            int qkv_dim     = key_dim * 2 + c->ssm_inner_size;
+            int kern        = c->ssm_conv_kernel > 0 ? c->ssm_conv_kernel : 4;
+            lw->ssm_conv1d_gpu = upload_f32_buf(gpu, lw->ssm_conv1d, kern * qkv_dim);
+
+            if (lw->ssm_dt_bias && lw->ssm_a && num_v_heads > 0) {
+                int nv = num_v_heads;
+                float *packed = (float *)malloc((size_t)nv * 2 * sizeof(float));
+                if (packed) {
+                    memcpy(packed, lw->ssm_dt_bias, (size_t)nv * sizeof(float));
+                    memcpy(packed + nv, lw->ssm_a, (size_t)nv * sizeof(float));
+                    lw->ssm_dt_bias_a_gpu = gpu->buffer_create(gpu->ctx, packed,
+                        (size_t)nv * 2 * sizeof(float), -1, nv * 2, 1);
+                    free(packed);
+                }
+            }
+
+            if (lw->ssm_norm) {
+                int head_v_dim = num_v_heads > 0
+                    ? c->ssm_inner_size / num_v_heads : c->ssm_inner_size;
+                lw->ssm_norm_gpu = upload_f32_buf(gpu, lw->ssm_norm, head_v_dim);
+            }
+        }
     }
 
     return 0;
@@ -1263,6 +1351,12 @@ void bn_model_release_gpu(BnModel *model) {
             release_f32_buf(gpu, &lw->q_bias_gpu);
             release_f32_buf(gpu, &lw->k_bias_gpu);
             release_f32_buf(gpu, &lw->v_bias_gpu);
+            release_f32_buf(gpu, &lw->ssm_conv1d_gpu);
+            release_f32_buf(gpu, &lw->ssm_norm_gpu);
+            if (lw->ssm_dt_bias_a_gpu) {
+                gpu->buffer_destroy(gpu->ctx, lw->ssm_dt_bias_a_gpu);
+                lw->ssm_dt_bias_a_gpu = NULL;
+            }
             if (lw->qkv_stacked_gpu) {
                 gpu->buffer_destroy(gpu->ctx, lw->qkv_stacked_gpu);
                 lw->qkv_stacked_gpu = NULL;

@@ -1153,35 +1153,119 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
         int is_attn = (c->full_attn_interval == 0) ||
                       ((l + 1) % c->full_attn_interval == 0);
 
-        // ---- SSM layer: flush GPU ops, run on CPU, upload result ----
+        // ---- SSM layer: GPU-native if weights uploaded, else CPU fallback ----
         if (!is_attn) {
-            GPU_FLUSH();
-            // Read x from GPU to CPU
-            if (gpu->read_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
-                                      (size_t)dim * sizeof(float), 0) != 0)
-                { free(ops); return NULL; }
-            // Run SSM block + residual + FFN on CPU
-            forward_ssm_block(m, sess, lw, l);
-            residual_add(s->x, s->xb, dim);
-            if (lw->router_weight)
-                bn_moe_forward(m, sess, lw, l);
-            else
-                forward_ffn_block(m, sess, lw);
-            // Upload result back to GPU
-            if (gpu->write_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
-                                       (size_t)dim * sizeof(float), 0) != 0)
-                { free(ops); return NULL; }
-            // Re-norm for next layer
-            void *next_norm = (l + 1 < c->n_layers)
-                ? w->layers[l + 1].attn_norm_gpu : w->output_norm_gpu;
-            ops[n++] = (BnGPUOp){
-                .shader = BN_GPU_SHADER_RMSNORM, .type = -1,
-                .W_buf = next_norm,
-                .buf_in = BN_GPU_BUF_X, .buf_out = BN_GPU_BUF_XB, .buf_aux = -1,
-                .rows = 0, .cols = 0,
-                .p = { (uint32_t)dim, u_eps, 0, 0, 0, 0, 0, 0 }
-            };
-            continue;
+            if (!lw->ssm_conv1d_gpu || !lw->ssm_dt_bias_a_gpu || !lw->ssm_norm_gpu ||
+                !lw->wqkv.gpu_buf || !lw->wz.gpu_buf ||
+                !lw->ssm_alpha.gpu_buf || !lw->ssm_beta.gpu_buf ||
+                !lw->ssm_out.gpu_buf) {
+                // CPU fallback: flush GPU, run SSM on CPU, upload result
+                GPU_FLUSH();
+                if (gpu->read_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
+                                          (size_t)dim * sizeof(float), 0) != 0)
+                    { free(ops); return NULL; }
+                forward_ssm_block(m, sess, lw, l);
+                residual_add(s->x, s->xb, dim);
+                if (lw->router_weight)
+                    bn_moe_forward(m, sess, lw, l);
+                else
+                    forward_ffn_block(m, sess, lw);
+                if (gpu->write_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
+                                           (size_t)dim * sizeof(float), 0) != 0)
+                    { free(ops); return NULL; }
+                void *nn = (l + 1 < c->n_layers) ? w->layers[l + 1].attn_norm_gpu : w->output_norm_gpu;
+                ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_RMSNORM, .type = -1,
+                    .W_buf = nn, .buf_in = BN_GPU_BUF_X, .buf_out = BN_GPU_BUF_XB, .buf_aux = -1,
+                    .p = { (uint32_t)dim, u_eps, 0, 0, 0, 0, 0, 0 } };
+                continue;
+            }
+
+            // GPU-native SSM path
+            int ssm_idx = l - (l + 1) / c->full_attn_interval;
+            int num_k_heads = c->ssm_group_count;
+            int head_k_dim  = c->ssm_state_size;
+            int num_v_heads = c->ssm_time_step_rank;
+            int head_v_dim  = c->ssm_inner_size / (num_v_heads > 0 ? num_v_heads : 1);
+            int key_dim     = num_k_heads * head_k_dim;
+            int value_dim   = c->ssm_inner_size;
+            int qkv_dim_ssm = key_dim * 2 + value_dim;
+            int kern        = c->ssm_conv_kernel > 0 ? c->ssm_conv_kernel : 4;
+            size_t conv_off = (size_t)ssm_idx * (kern - 1) * qkv_dim_ssm;
+            size_t state_per = (size_t)num_v_heads * head_k_dim * head_v_dim;
+            size_t state_off = (size_t)ssm_idx * state_per;
+            uint32_t u_qscale; { float qs = 1.0f / sqrtf((float)head_k_dim); memcpy(&u_qscale, &qs, 4); }
+
+            // 1. RMSNorm: X -> XB (already done by previous layer's fused resid+norm)
+            // 2. QKV matvec: XB -> SSM_QKV
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_MATVEC, .type = lw->wqkv.type,
+                .W_buf = lw->wqkv.gpu_buf, .buf_in = BN_GPU_BUF_XB, .buf_out = BN_GPU_BUF_SSM_QKV,
+                .buf_aux = -1, .rows = lw->wqkv.rows, .cols = lw->wqkv.cols,
+                .p = { (uint32_t)lw->wqkv.rows, (uint32_t)lw->wqkv.cols, 1, 0, 0, 0, 0, 0 } };
+            // 3. Z matvec: XB -> SSM_Z
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_MATVEC, .type = lw->wz.type,
+                .W_buf = lw->wz.gpu_buf, .buf_in = BN_GPU_BUF_XB, .buf_out = BN_GPU_BUF_SSM_Z,
+                .buf_aux = -1, .rows = lw->wz.rows, .cols = lw->wz.cols,
+                .p = { (uint32_t)lw->wz.rows, (uint32_t)lw->wz.cols, 1, 0, 0, 0, 0, 0 } };
+            // 4. Conv1d + SiLU
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_SSM_CONV_SILU, .type = -1,
+                .W_buf = lw->ssm_conv1d_gpu, .buf_in = BN_GPU_BUF_SSM_QKV, .buf_out = -1, .buf_aux = -1,
+                .p = { (uint32_t)qkv_dim_ssm, (uint32_t)kern, (uint32_t)conv_off, (uint32_t)((kern-1)*qkv_dim_ssm), 0, 0, 0, 0 } };
+            // 5. Split Q from SSM_QKV -> Q buf
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_COPY, .type = -1, .W_buf = NULL,
+                .buf_in = BN_GPU_BUF_SSM_QKV, .buf_out = BN_GPU_BUF_Q, .buf_aux = -1,
+                .p = { 0, 0, (uint32_t)key_dim, 0, 0, 0, 0, 0 } };
+            // 6. Split K from SSM_QKV -> SCRATCH
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_COPY, .type = -1, .W_buf = NULL,
+                .buf_in = BN_GPU_BUF_SSM_QKV, .buf_out = BN_GPU_BUF_SCRATCH, .buf_aux = -1,
+                .p = { (uint32_t)key_dim, 0, (uint32_t)key_dim, 0, 0, 0, 0, 0 } };
+            // 7. Split V from SSM_QKV -> SSM_V
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_COPY, .type = -1, .W_buf = NULL,
+                .buf_in = BN_GPU_BUF_SSM_QKV, .buf_out = BN_GPU_BUF_SSM_V, .buf_aux = -1,
+                .p = { (uint32_t)(2*key_dim), 0, (uint32_t)value_dim, 0, 0, 0, 0, 0 } };
+            // 8. L2Norm Q (in Q buf) and K (in SCRATCH)
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_SSM_L2NORM, .type = -1, .W_buf = NULL,
+                .buf_in = BN_GPU_BUF_Q, .buf_out = -1, .buf_aux = BN_GPU_BUF_SCRATCH,
+                .rows = num_k_heads, .p = { (uint32_t)head_k_dim, 0, 0, 0, 0, 0, 0, 0 } };
+            // 9. Alpha matvec: XB -> SSM_ALPHA
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_MATVEC, .type = lw->ssm_alpha.type,
+                .W_buf = lw->ssm_alpha.gpu_buf, .buf_in = BN_GPU_BUF_XB, .buf_out = BN_GPU_BUF_SSM_ALPHA,
+                .buf_aux = -1, .rows = lw->ssm_alpha.rows, .cols = lw->ssm_alpha.cols,
+                .p = { (uint32_t)lw->ssm_alpha.rows, (uint32_t)lw->ssm_alpha.cols, 1, 0, 0, 0, 0, 0 } };
+            // 10. Beta matvec: XB -> SSM_BETA
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_MATVEC, .type = lw->ssm_beta.type,
+                .W_buf = lw->ssm_beta.gpu_buf, .buf_in = BN_GPU_BUF_XB, .buf_out = BN_GPU_BUF_SSM_BETA,
+                .buf_aux = -1, .rows = lw->ssm_beta.rows, .cols = lw->ssm_beta.cols,
+                .p = { (uint32_t)lw->ssm_beta.rows, (uint32_t)lw->ssm_beta.cols, 1, 0, 0, 0, 0, 0 } };
+            // 11. Alpha/Beta activation (softplus+exp, sigmoid)
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_SSM_ALPHA_BETA, .type = -1,
+                .W_buf = lw->ssm_dt_bias_a_gpu, .buf_in = BN_GPU_BUF_SSM_ALPHA,
+                .buf_out = -1, .buf_aux = BN_GPU_BUF_SSM_BETA,
+                .p = { (uint32_t)num_v_heads, 0, 0, 0, 0, 0, 0, 0 } };
+            // 12. Delta rule recurrence
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_SSM_DELTA, .type = -1, .W_buf = NULL,
+                .buf_in = BN_GPU_BUF_Q, .buf_out = BN_GPU_BUF_XB2, .buf_aux = BN_GPU_BUF_SCRATCH,
+                .rows = num_v_heads,
+                .p = { (uint32_t)head_k_dim, (uint32_t)head_v_dim, (uint32_t)num_k_heads,
+                       u_qscale, (uint32_t)(state_off * sizeof(float)),
+                       (uint32_t)(state_per * sizeof(float)), 0, 0 } };
+            // 13. Gate: per-head RMSNorm + SiLU gate
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_SSM_GATE, .type = -1,
+                .W_buf = lw->ssm_norm_gpu, .buf_in = BN_GPU_BUF_XB2, .buf_out = -1,
+                .buf_aux = BN_GPU_BUF_SSM_Z, .rows = num_v_heads,
+                .p = { (uint32_t)head_v_dim, u_eps, 0, 0, 0, 0, 0, 0 } };
+            // 14. Output projection: XB2 -> SCRATCH
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_MATVEC, .type = lw->ssm_out.type,
+                .W_buf = lw->ssm_out.gpu_buf, .buf_in = BN_GPU_BUF_XB2, .buf_out = BN_GPU_BUF_SCRATCH,
+                .buf_aux = -1, .rows = lw->ssm_out.rows, .cols = lw->ssm_out.cols,
+                .p = { (uint32_t)lw->ssm_out.rows, (uint32_t)lw->ssm_out.cols, 1, 0, 0, 0, 0, 0 } };
+            // 15. Fused residual + rmsnorm for FFN
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_RESIDUAL_RMSNORM, .type = -1,
+                .W_buf = lw->ffn_norm_gpu,
+                .buf_in = BN_GPU_BUF_X, .buf_out = BN_GPU_BUF_XB, .buf_aux = BN_GPU_BUF_SCRATCH,
+                .p = { (uint32_t)dim, u_eps, 0, 0, 0, 0, 0, 0 } };
+
+            // SSM layer's FFN (dense or MoE) — same as attention layer below
+            goto ffn_block;
         }
 
         // KV cache addressing
@@ -1385,31 +1469,127 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
         };
 
         // ---- FFN (MoE or dense) ----
+        ffn_block:;
         if (lw->router_weight) {
-            // MoE FFN: flush GPU, run on CPU, upload result
+            // MoE FFN: GPU expert matvecs with CPU-side routing
             GPU_FLUSH();
-            if (gpu->read_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
+
+            // Read back xb (normed input) for CPU routing — small: dim floats
+            float xb_cpu[dim];
+            if (gpu->read_activation(gpu->ctx, BN_GPU_BUF_XB, xb_cpu,
                                       (size_t)dim * sizeof(float), 0) != 0)
                 { free(ops); return NULL; }
-            // xb is the normed input (already computed by fused resid+rmsnorm above)
-            if (gpu->read_activation(gpu->ctx, BN_GPU_BUF_XB, s->xb,
-                                      (size_t)dim * sizeof(float), 0) != 0)
-                { free(ops); return NULL; }
-            bn_moe_forward(m, sess, lw, l);
-            // bn_moe_forward does norm + route + expert FFN + residual add to s->x
-            if (gpu->write_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
-                                       (size_t)dim * sizeof(float), 0) != 0)
-                { free(ops); return NULL; }
+
+            // CPU routing: select top-K experts
+            BnMoEState *ms = sess->moe_state;
+            int K = c->n_experts_active;
+            bn_moe_route(ms, xb_cpu, lw->router_weight, dim, c->n_experts, K, m->pool);
+
+            // Zero the MoE output accumulator on GPU
+            {
+                float zeros[dim];
+                memset(zeros, 0, sizeof(zeros));
+                if (gpu->write_activation(gpu->ctx, BN_GPU_BUF_MOE_OUT, zeros,
+                                           (size_t)dim * sizeof(float), 0) != 0)
+                    { free(ops); return NULL; }
+            }
+
+            // GPU expert dispatch: per-expert gate+up+silu+down+weighted_add
+            int moe_hidden = c->moe_intermediate_size;
+            const BnMoEExpertMap *em = &lw->expert_map;
+            for (int k = 0; k < K; k++) {
+                int eidx = ms->expert_indices[k];
+                if (eidx < 0) continue;
+                float ew = ms->expert_weights[k];
+                uint32_t u_ew; memcpy(&u_ew, &ew, 4);
+
+                // Load expert data from host (mmap/pread/cache)
+                const void *gate_data = bn_moe_get_expert_proj(&m->moe_io, ms, em, eidx, 0);
+                const void *up_data   = bn_moe_get_expert_proj(&m->moe_io, ms, em, eidx, 1);
+                const void *down_data = bn_moe_get_expert_proj(&m->moe_io, ms, em, eidx, 2);
+                if (!gate_data || !up_data || !down_data) continue;
+
+                // Upload expert weights to GPU (temporary per-token)
+                void *gate_gpu = gpu->buffer_create(gpu->ctx, gate_data, em->expert_gate_bytes,
+                    em->gate_type, em->gate_rows, em->gate_cols);
+                void *up_gpu = gpu->buffer_create(gpu->ctx, up_data, em->expert_up_bytes,
+                    em->up_type, em->up_rows, em->up_cols);
+                void *down_gpu = gpu->buffer_create(gpu->ctx, down_data, em->expert_down_bytes,
+                    em->down_type, em->down_rows, em->down_cols);
+                if (!gate_gpu || !up_gpu || !down_gpu) {
+                    if (gate_gpu) gpu->buffer_destroy(gpu->ctx, gate_gpu);
+                    if (up_gpu) gpu->buffer_destroy(gpu->ctx, up_gpu);
+                    if (down_gpu) gpu->buffer_destroy(gpu->ctx, down_gpu);
+                    continue;
+                }
+
+                // Gate matvec: XB -> MOE_HB
+                ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_MATVEC, .type = em->gate_type,
+                    .W_buf = gate_gpu, .buf_in = BN_GPU_BUF_XB, .buf_out = BN_GPU_BUF_MOE_HB,
+                    .buf_aux = -1, .rows = em->gate_rows, .cols = em->gate_cols,
+                    .p = { (uint32_t)em->gate_rows, (uint32_t)em->gate_cols, 1, 0, 0, 0, 0, 0 } };
+                // Up matvec: XB -> MOE_HB2
+                ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_MATVEC, .type = em->up_type,
+                    .W_buf = up_gpu, .buf_in = BN_GPU_BUF_XB, .buf_out = BN_GPU_BUF_MOE_HB2,
+                    .buf_aux = -1, .rows = em->up_rows, .cols = em->up_cols,
+                    .p = { (uint32_t)em->up_rows, (uint32_t)em->up_cols, 1, 0, 0, 0, 0, 0 } };
+                // SiLU gate: MOE_HB = silu(MOE_HB) * MOE_HB2
+                ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_SILU_GATE, .type = -1, .W_buf = NULL,
+                    .buf_in = BN_GPU_BUF_MOE_HB, .buf_out = -1, .buf_aux = BN_GPU_BUF_MOE_HB2,
+                    .p = { (uint32_t)moe_hidden, 0, 0, 0, 0, 0, 0, 0 } };
+                // Down matvec: MOE_HB -> XB2
+                ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_MATVEC, .type = em->down_type,
+                    .W_buf = down_gpu, .buf_in = BN_GPU_BUF_MOE_HB, .buf_out = BN_GPU_BUF_XB2,
+                    .buf_aux = -1, .rows = em->down_rows, .cols = em->down_cols,
+                    .p = { (uint32_t)em->down_rows, (uint32_t)em->down_cols, 1, 0, 0, 0, 0, 0 } };
+                // Weighted add: MOE_OUT += weight * XB2
+                ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_WEIGHTED_ADD, .type = -1, .W_buf = NULL,
+                    .buf_in = BN_GPU_BUF_MOE_OUT, .buf_out = -1, .buf_aux = BN_GPU_BUF_XB2,
+                    .p = { (uint32_t)dim, u_ew, 0, 0, 0, 0, 0, 0 } };
+
+                // Flush this expert's ops, then destroy temporary GPU buffers
+                GPU_FLUSH();
+                gpu->buffer_destroy(gpu->ctx, gate_gpu);
+                gpu->buffer_destroy(gpu->ctx, up_gpu);
+                gpu->buffer_destroy(gpu->ctx, down_gpu);
+            }
+
+            // Shared expert (if present, weights pre-uploaded at init)
+            if (lw->shared_gate.data && lw->shared_gate.gpu_buf) {
+                ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_MATVEC, .type = lw->shared_gate.type,
+                    .W_buf = lw->shared_gate.gpu_buf, .buf_in = BN_GPU_BUF_XB, .buf_out = BN_GPU_BUF_HB,
+                    .buf_aux = -1, .rows = lw->shared_gate.rows, .cols = lw->shared_gate.cols,
+                    .p = { (uint32_t)lw->shared_gate.rows, (uint32_t)lw->shared_gate.cols, 1, 0, 0, 0, 0, 0 } };
+                ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_MATVEC, .type = lw->shared_up.type,
+                    .W_buf = lw->shared_up.gpu_buf, .buf_in = BN_GPU_BUF_XB, .buf_out = BN_GPU_BUF_HB2,
+                    .buf_aux = -1, .rows = lw->shared_up.rows, .cols = lw->shared_up.cols,
+                    .p = { (uint32_t)lw->shared_up.rows, (uint32_t)lw->shared_up.cols, 1, 0, 0, 0, 0, 0 } };
+                ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_SILU_GATE, .type = -1, .W_buf = NULL,
+                    .buf_in = BN_GPU_BUF_HB, .buf_out = -1, .buf_aux = BN_GPU_BUF_HB2,
+                    .p = { (uint32_t)lw->shared_gate.rows, 0, 0, 0, 0, 0, 0, 0 } };
+                ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_MATVEC, .type = lw->shared_down.type,
+                    .W_buf = lw->shared_down.gpu_buf, .buf_in = BN_GPU_BUF_HB, .buf_out = BN_GPU_BUF_XB2,
+                    .buf_aux = -1, .rows = lw->shared_down.rows, .cols = lw->shared_down.cols,
+                    .p = { (uint32_t)lw->shared_down.rows, (uint32_t)lw->shared_down.cols, 1, 0, 0, 0, 0, 0 } };
+                // TODO: shared expert sigmoid gate (requires dot product shader)
+                // For now, add shared expert output with weight=1.0
+                uint32_t u_one; { float one = 1.0f; memcpy(&u_one, &one, 4); }
+                ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_WEIGHTED_ADD, .type = -1, .W_buf = NULL,
+                    .buf_in = BN_GPU_BUF_MOE_OUT, .buf_out = -1, .buf_aux = BN_GPU_BUF_XB2,
+                    .p = { (uint32_t)dim, u_one, 0, 0, 0, 0, 0, 0 } };
+            }
+
+            // Residual: X += MOE_OUT
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_RESIDUAL_ADD, .type = -1, .W_buf = NULL,
+                .buf_in = BN_GPU_BUF_X, .buf_out = -1, .buf_aux = BN_GPU_BUF_MOE_OUT,
+                .p = { (uint32_t)dim, 0, 0, 0, 0, 0, 0, 0 } };
+
             // RMSNorm for next layer
             void *next_norm = (l + 1 < c->n_layers)
                 ? w->layers[l + 1].attn_norm_gpu : w->output_norm_gpu;
-            ops[n++] = (BnGPUOp){
-                .shader = BN_GPU_SHADER_RMSNORM, .type = -1,
-                .W_buf = next_norm,
-                .buf_in = BN_GPU_BUF_X, .buf_out = BN_GPU_BUF_XB, .buf_aux = -1,
-                .rows = 0, .cols = 0,
-                .p = { (uint32_t)dim, u_eps, 0, 0, 0, 0, 0, 0 }
-            };
+            ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_RMSNORM, .type = -1,
+                .W_buf = next_norm, .buf_in = BN_GPU_BUF_X, .buf_out = BN_GPU_BUF_XB, .buf_aux = -1,
+                .p = { (uint32_t)dim, u_eps, 0, 0, 0, 0, 0, 0 } };
             continue;  // skip dense FFN below
         }
         if (c->has_ffn_gate && lw->ffn_gate.data) {

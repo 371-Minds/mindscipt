@@ -47,6 +47,12 @@ void bn_moe_prefetch_destroy(BnMoEIO *io);
 int bn_moe_forward_batch(BnModel *m, BnSession *sess, BnLayerWeights *lw, int l,
                           float *act, float *xb_scratch, int n_tokens);
 
+// Get host pointer to expert projection data (gate=0, up=1, down=2).
+// Returns NULL on failure. Used by GPU path for per-token expert upload.
+const void *bn_moe_get_expert_proj(BnMoEIO *io, BnMoEState *ms,
+                                    const BnMoEExpertMap *em,
+                                    int expert_idx, int proj);
+
 // Unit test for LRU cache internals. Returns 0 on success, -1 on failure.
 int bn_moe_cache_test(void);
 

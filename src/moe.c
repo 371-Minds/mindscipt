@@ -607,6 +607,13 @@ static const void *moe_load_expert_proj(const BnMoEIO *io, BnMoEState *ms,
                                       ms->buf, ms->buf_size);
 }
 
+// Public accessor for GPU path — wraps static moe_load_expert_proj.
+const void *bn_moe_get_expert_proj(BnMoEIO *io, BnMoEState *ms,
+                                    const BnMoEExpertMap *em,
+                                    int expert_idx, int proj) {
+    return moe_load_expert_proj(io, ms, em, expert_idx, proj);
+}
+
 // Build a temporary BnQWeight from pread'd expert data
 static BnQWeight moe_make_qweight(const void *data, int type, int rows, int cols) {
     BnQWeight w = {0};
