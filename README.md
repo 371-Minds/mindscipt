@@ -259,8 +259,11 @@ bitnet.c/
 │   ├── gguf.h                  # GGUF v3 reader API
 │   ├── quant.h                 # Public quant API: block structs, matvec, dequant
 │   ├── quant_internal.h        # Quant backend context structs + range function decls
+│   ├── quant_neon_helpers.h    # Shared NEON helpers for quant kernels
 │   ├── iq_tables.h             # IQ codebook lookup tables (shared across backends)
+│   ├── turboquant.h            # TurboQuant KV compression: RHT + Lloyd-Max + QJL
 │   ├── model.h                 # Config, Weights, model loading, session arena helpers
+│   ├── moe.h                   # MoE expert routing, loading, LRU cache
 │   ├── session.h               # BnSession: per-request KV cache + activation buffers
 │   ├── prompt_cache.h          # BnPromptCache: shared KV prefix cache
 │   ├── gpu_backend.h           # BnGPUBackend: GPU compute vtable
@@ -282,12 +285,16 @@ bitnet.c/
 │   │   ├── dispatch.c          # Format dispatch + batch matvec
 │   │   ├── dequant.c           # Dequantization functions
 │   │   ├── fp16.c              # FP16/BF16 ↔ FP32 conversion
-│   │   └── {format}_{backend}.c # ~80 backend kernel files
+│   │   └── {format}_{backend}.c # ~97 backend kernel files
 │   ├── transformer/            # Per-backend transformer kernels
 │   │   ├── rmsnorm_{neon,avx2,wasm,scalar}.c
-│   │   ├── gqa_{neon,avx2,wasm,scalar}.c
-│   │   └── logits_{neon,avx2,wasm,scalar}.c
+│   │   ├── gqa_{neon,avx2,wasm,scalar}.c      # Standard GQA attention
+│   │   ├── gqa_tq_{neon,scalar}.c              # TurboQuant GQA attention
+│   │   ├── logits_{neon,avx2,wasm,scalar}.c
+│   │   └── ssm_{neon,avx2,wasm,scalar}.c       # Gated DeltaNet SSM kernels
+│   ├── turboquant.c            # TurboQuant: RHT (NEON/scalar), QJL, Lloyd-Max
 │   ├── model.c                 # GGUF → Config/Weights mapping, GPU weight upload
+│   ├── moe.c                   # MoE routing, pread + LRU cache, expert dispatch
 │   ├── session.c               # BnSession create/free/reset
 │   ├── prompt_cache.c          # Shared KV prefix cache with FIFO eviction
 │   ├── gpu_wgpu.c              # wgpu-native WebGPU backend (optional)
@@ -323,27 +330,31 @@ Each module depends only on those above it:
 ```
 platform
     ↓
-  gguf           ← standalone, testable in isolation
+  gguf              ← standalone, testable in isolation
     ↓
-  quant          ← standalone, testable with synthetic data
+  quant             ← standalone, testable with synthetic data
     ↓
-  model          ← depends on gguf + quant
+turboquant          ← standalone: RHT rotation, Lloyd-Max quantization, QJL
     ↓
-tokenizer        ← depends on gguf
+  model             ← depends on gguf + quant + turboquant
     ↓
- session         ← depends on model (per-request KV cache + buffers)
+tokenizer           ← depends on gguf
     ↓
-transformer      ← depends on model + session + quant
+  moe               ← depends on model + quant (expert routing, pread + LRU cache)
     ↓
- sampler         ← standalone, testable in isolation
+ session            ← depends on model (per-request KV cache + TQ buffers)
     ↓
-prompt_cache     ← depends on model + session
+transformer         ← depends on model + session + quant + moe + turboquant
     ↓
- generate        ← depends on model + session + transformer + tokenizer + sampler
+ sampler            ← standalone, testable in isolation
     ↓
-gpu_wgpu         ← optional GPU backend (BN_ENABLE_GPU=1)
+prompt_cache        ← depends on model + session + turboquant
     ↓
-  main           ← wires everything together
+ generate           ← depends on model + session + transformer + tokenizer + sampler
+    ↓
+gpu_wgpu            ← optional GPU backend (BN_ENABLE_GPU=1)
+    ↓
+  main              ← wires everything together
 ```
 
 ## Library API
@@ -355,12 +366,13 @@ bitnet.c can be used as a library. The model/session split enables concurrent re
 #include "session.h"
 
 // Load model (shared, immutable after load)
+// Last arg: kv_tq_bits (0=off, 3=TurboQuant 3-bit KV compression)
 BnModel model;
-bn_model_load(&model, gf, 0, 0);
+bn_model_load(&model, gf, 0, 0, 3);  // TQ-3 for 8.9x KV compression
 model.file = mf;
 model.pool = bn_tp_create(7);
 
-// Create independent sessions
+// Create independent sessions (each gets its own compressed KV cache)
 BnSession *s1 = bn_session_create(&model, NULL);
 BnSession *s2 = bn_session_create(&model, NULL);
 
