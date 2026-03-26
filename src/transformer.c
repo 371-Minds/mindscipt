@@ -1187,7 +1187,8 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
 
     // Max ops per batch. MoE/SSM flush between layers, so single-layer max suffices.
     // Max ops: ~32 per layer (26 base + 2 Q/K norms + 2 sub-norms + 2 Q-gated)
-    int max_ops = has_moe || has_ssm ? 36 + 4 : 34 * c->n_layers + 4;
+    // MoE: 8 experts × 5 ops + shared (5) + residual + rmsnorm + attention (~20) = ~70
+    int max_ops = has_moe || has_ssm ? 80 : 34 * c->n_layers + 4;
     BnGPUOp *ops = (BnGPUOp *)malloc((size_t)max_ops * sizeof(BnGPUOp));
     if (!ops) return NULL;
     int n = 0;
@@ -1682,13 +1683,6 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
                     .buf_in = BN_GPU_BUF_MOE_OUT, .buf_out = -1, .buf_aux = BN_GPU_BUF_XB2,
                     .p = { (uint32_t)dim, u_ew, 0, 0, 0, 0, 0, 0 } };
 
-                GPU_FLUSH();
-                // No buffer_destroy — cache owns the handles (or they leak if no cache)
-                if (!gpu_cache) {
-                    gpu->buffer_destroy(gpu->ctx, gate_gpu);
-                    gpu->buffer_destroy(gpu->ctx, up_gpu);
-                    gpu->buffer_destroy(gpu->ctx, down_gpu);
-                }
             }
 
             // Shared expert (if present, weights pre-uploaded at init)
@@ -1727,6 +1721,8 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
             ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_RMSNORM, .type = -1,
                 .W_buf = next_norm, .buf_in = BN_GPU_BUF_X, .buf_out = BN_GPU_BUF_XB, .buf_aux = -1,
                 .p = { (uint32_t)dim, u_eps, 0, 0, 0, 0, 0, 0 } };
+            // Flush all expert ops as ONE GPU submission (instead of per-expert)
+            GPU_FLUSH();
             continue;  // skip dense FFN below
         }
         if (c->has_ffn_gate && lw->ffn_gate.data) {

@@ -718,16 +718,24 @@ static void *wgpu_buffer_create(void *vctx, const void *data, size_t size,
         }
     }
 
-    /* Fallback: standalone buffer */
+    /* Fallback: standalone buffer with mappedAtCreation (zero-copy on unified memory).
+     * Creates buffer already mapped to CPU → memcpy → unmap.
+     * On Apple Silicon (Metal): mapped pointer IS GPU shared memory, no staging copy.
+     * On discrete GPUs: single DMA at unmap instead of command-queue staging. */
     size_t standalone_aligned = (size + 3) & ~(size_t)3;
     WGPUBufferDescriptor desc = {
         .label = sv("bn_weight"),
         .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
         .size  = standalone_aligned,
+        .mappedAtCreation = 1,
     };
     WGPUBuffer buf = wgpuDeviceCreateBuffer(ctx->device, &desc);
     if (!buf) return NULL;
-    wgpuQueueWriteBuffer(ctx->queue, buf, 0, data, size);
+    void *mapped = wgpuBufferGetMappedRange(buf, 0, standalone_aligned);
+    if (mapped) {
+        memcpy(mapped, data, size);
+    }
+    wgpuBufferUnmap(buf);
 
     BnWgpuBuf *handle = malloc(sizeof(BnWgpuBuf));
     if (!handle) { wgpuBufferDestroy(buf); wgpuBufferRelease(buf); return NULL; }
