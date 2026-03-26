@@ -109,7 +109,7 @@ static CLIArgs parse_args(int argc, char **argv) {
     args.seed = 42;
     args.max_seq_len = 0;
     args.cache_mb = 4096;
-    args.gpu_cache_mb = 512;
+    args.gpu_cache_mb = 2048;
     args.draft_k = 5;
 
     if (argc < 2) {

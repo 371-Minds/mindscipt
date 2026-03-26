@@ -1635,6 +1635,7 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
                 void *gate_gpu, *up_gpu, *down_gpu;
                 int cached = bn_gpu_moe_cache_lookup(gpu_cache, l, eidx,
                                                       &gate_gpu, &up_gpu, &down_gpu);
+                (void)0;
                 if (!cached) {
                     // Cache miss: load from host + upload to GPU
                     const void *gate_data = bn_moe_get_expert_proj(&m->moe_io, ms, em, eidx, 0);
