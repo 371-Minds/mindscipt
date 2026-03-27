@@ -1163,7 +1163,9 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
         if (!is_attn) { has_ssm = 1; continue; }
         if (lw->router_weight) { has_moe = 1; }
         if (!lw->wq.data) return NULL;
-        // Q-gated: reject on GPU (SSM shader precision still causes incoherence on hybrid models)
+        // Q-gated: reject on GPU. Q4_K integer accum achieves exact matvec match,
+        // but SSM delta (0.002/layer) × MoE amplification (18x) = 0.036/layer
+        // compounds to garbage over 40 layers. Needs Metal backend for shared-memory precision.
         if (lw->wq.rows > q_dim) return NULL;
         if (lw->q_norm && !lw->q_norm_gpu) return NULL;
         if (lw->k_norm && !lw->k_norm_gpu) return NULL;

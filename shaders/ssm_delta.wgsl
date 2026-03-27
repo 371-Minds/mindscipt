@@ -52,13 +52,16 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     }
     workgroupBarrier();
 
-    // Step 2: sk[v] = sum_k S[k,v] * k[k] (matrix-vector product)
-    // Each thread computes one or more v-elements
+    // Step 2: sk[v] = sum_k S[k,v] * k[k] (Kahan compensated summation for precision)
     var vi = tid;
     while (vi < hv) {
         var sum: f32 = 0.0;
+        var comp: f32 = 0.0;
         for (var ki: u32 = 0u; ki < hk; ki++) {
-            sum += state[state_base + ki * hv + vi] * k[hk_idx * hk + ki];
+            let y = state[state_base + ki * hv + vi] * k[hk_idx * hk + ki] - comp;
+            let t = sum + y;
+            comp = (t - sum) - y;
+            sum = t;
         }
         sk[vi] = sum;
         vi += 256u;
@@ -77,12 +80,16 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     }
     workgroupBarrier();
 
-    // Step 4: out[v] = sum_k S[k,v] * q[k] * q_scale
+    // Step 4: out[v] = sum_k S[k,v] * q[k] * q_scale (Kahan compensated)
     vi = tid;
     while (vi < hv) {
         var sum: f32 = 0.0;
+        var comp: f32 = 0.0;
         for (var ki: u32 = 0u; ki < hk; ki++) {
-            sum += state[state_base + ki * hv + vi] * q[hk_idx * hk + ki];
+            let y = state[state_base + ki * hv + vi] * q[hk_idx * hk + ki] - comp;
+            let t = sum + y;
+            comp = (t - sum) - y;
+            sum = t;
         }
         out[hv_idx * hv + vi] = sum * q_scale;
         vi += 256u;
