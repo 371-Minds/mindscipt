@@ -2096,24 +2096,109 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens, i
                     act[(size_t)t * dim + d] += Xb2[(size_t)t * dim + d];
 
         } else if (!is_attn) {
-            // --- SSM block: must process sequentially ---
+            // --- SSM block: batched projections + sequential recurrence ---
+            // SSM config
+            int num_k_heads = c->ssm_group_count;
+            int head_k_dim  = c->ssm_state_size;
+            int num_v_heads = c->ssm_time_step_rank;
+            int head_v_dim  = c->ssm_inner_size / (num_v_heads > 0 ? num_v_heads : 1);
+            int key_dim_ssm = num_k_heads * head_k_dim;
+            int value_dim   = c->ssm_inner_size;
+            int qkv_dim_ssm = key_dim_ssm * 2 + value_dim;
+            int kern_ssm    = c->ssm_conv_kernel > 0 ? c->ssm_conv_kernel : 4;
+
+            int ssm_idx = l - (l + 1) / c->full_attn_interval;
+            size_t state_per_layer = (size_t)num_v_heads * head_k_dim * head_v_dim;
+            float *ssm_state = s->ssm_state + (size_t)ssm_idx * state_per_layer;
+            size_t conv_per_layer = (size_t)(kern_ssm - 1) * qkv_dim_ssm;
+            float *conv_state = s->ssm_conv_state + (size_t)ssm_idx * conv_per_layer;
+
+            // 1. Batch RMSNorm
+            for (int t = 0; t < n_tokens; t++)
+                rmsnorm(Xb + (size_t)t * dim, act + (size_t)t * dim, lw->attn_norm, dim, c->norm_eps);
+
+            // 2. Batch matmul: wqkv and wz (the two big projections)
+            // QKV_all[n_tokens * qkv_dim_ssm], Z_all[n_tokens * value_dim]
+            // Reuse Q_buf and K_new/V_new scratch from batch_buf
+            float *QKV_all = Q_buf;   // large enough: q_buf_stride >= qkv_dim_ssm for this model
+            float *Z_all   = Xb2;     // [nt * dim] >= [nt * value_dim]
+            float *Out_all = Hb;      // [nt * hidden_dim] >= [nt * value_dim]
+
+            bn_quant_matmul_gpu(QKV_all, &lw->wqkv, Xb, n_tokens, s->x_q, m->pool, m->gpu);
+            bn_quant_matmul_gpu(Z_all, &lw->wz, Xb, n_tokens, s->x_q, m->pool, m->gpu);
+
+            // 3. Sequential per-token: conv1d + L2norm + alpha/beta + delta + gate
             for (int t = 0; t < n_tokens; t++) {
-                memcpy(s->x, act + (size_t)t * dim, dim * sizeof(float));
-                float rope_cos_t[half_rope], rope_sin_t[half_rope];
-                int pos = pos0 + t;
-                for (int i = 0; i < half_rope; i++) {
-                    float angle = pos * s->rope_freq[i];
-                    rope_cos_t[i] = cosf(angle);
-                    rope_sin_t[i] = sinf(angle);
+                float *qkv_t = QKV_all + (size_t)t * lw->wqkv.rows;
+                float *z_t   = Z_all + (size_t)t * lw->wz.rows;
+                float *out_t = Out_all + (size_t)t * value_dim;
+                float *xb_t  = Xb + (size_t)t * dim;  // normed input for alpha/beta
+
+                // Conv1d + SiLU
+                {
+                    BnSSMConvCtx conv_ctx = { qkv_t, conv_state, lw->ssm_conv1d, qkv_dim_ssm, kern_ssm };
+                    BnTPTask conv_task = { ssm_conv_silu, &conv_ctx, qkv_dim_ssm };
+                    bn_tp_dispatch(m->pool, &conv_task, 1);
                 }
-                int cache_pos = pos % c->seq_len;
-                if (forward_single_layer(m, sess, l, pos, cache_pos, rope_dims,
-                                         rope_cos_t, rope_sin_t) != 0) {
-                    sh_arena_free(pf_arena); return NULL;
+
+                // Split QKV
+                float *q_raw = qkv_t;
+                float *k_raw = qkv_t + key_dim_ssm;
+                float *v_raw = qkv_t + 2 * key_dim_ssm;
+
+                // L2 normalize Q and K
+                {
+                    BnSSML2NormCtx norm_ctx = { q_raw, k_raw, head_k_dim };
+                    BnTPTask norm_task = { ssm_l2norm, &norm_ctx, num_k_heads };
+                    bn_tp_dispatch(m->pool, &norm_task, 1);
                 }
-                memcpy(act + (size_t)t * dim, s->x, dim * sizeof(float));
+
+                // Alpha + Beta (small matvecs: xb_t → num_v_heads)
+                float alpha_arr[num_v_heads > 0 ? num_v_heads : 1];
+                float beta_arr[num_v_heads > 0 ? num_v_heads : 1];
+                {
+                    BnMatvecTask ab[2] = {
+                        { alpha_arr, &lw->ssm_alpha },
+                        { beta_arr,  &lw->ssm_beta  },
+                    };
+                    bn_quant_matvec_batch(ab, 2, xb_t, s->x_q, m->pool);
+                }
+                for (int h = 0; h < num_v_heads; h++) {
+                    float dt = alpha_arr[h] + lw->ssm_dt_bias[h];
+                    float dt_sp = (dt > 20.0f) ? dt : logf(1.0f + expf(dt));
+                    alpha_arr[h] = expf(dt_sp * lw->ssm_a[h]);
+                    beta_arr[h] = 1.0f / (1.0f + expf(-beta_arr[h]));
+                }
+
+                // Delta rule recurrence
+                {
+                    float q_scale = 1.0f / sqrtf((float)head_k_dim);
+                    BnSSMDeltaCtx delta_ctx = {
+                        ssm_state, out_t, q_raw, k_raw, v_raw,
+                        alpha_arr, beta_arr,
+                        num_k_heads, head_k_dim, head_v_dim, q_scale
+                    };
+                    BnTPTask delta_task = { ssm_delta, &delta_ctx, num_v_heads };
+                    bn_tp_dispatch(m->pool, &delta_task, 1);
+                }
+
+                // Per-head RMSNorm + SiLU gate
+                {
+                    BnSSMGateCtx gate_ctx = { out_t, z_t, lw->ssm_norm, c->norm_eps, head_v_dim };
+                    BnTPTask gate_task = { ssm_gate, &gate_ctx, num_v_heads };
+                    bn_tp_dispatch(m->pool, &gate_task, 1);
+                }
             }
-            continue;  // SSM already did FFN
+
+            // 4. Batch matmul: ssm_out (all tokens)
+            bn_quant_matmul_gpu(Xb, &lw->ssm_out, Out_all, n_tokens, s->x_q, m->pool, m->gpu);
+
+            // 5. Batch residual add
+            for (int t = 0; t < n_tokens; t++)
+                for (int d = 0; d < dim; d++)
+                    act[(size_t)t * dim + d] += Xb[(size_t)t * dim + d];
+
+            // Fall through to FFN block (not continue — SSM no longer includes FFN)
         }
 
         // --- FFN block ---
