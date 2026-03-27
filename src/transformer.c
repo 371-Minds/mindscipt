@@ -1162,10 +1162,8 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
         if (!is_attn) { has_ssm = 1; continue; }
         if (lw->router_weight) { has_moe = 1; }
         if (!lw->wq.data) return NULL;
-        // Q-gated: reject entire GPU forward pass — attention on CPU, MoE on CPU
-        // The Q-gated attention with head_size=256 on hybrid SSM+attention models
-        // produces incorrect GPU output. Root cause unidentified after extensive
-        // debugging (deinterleave, norms, sigmoid_gate all verified on CPU side).
+        // Q-gated: reject on GPU until SSM shaders produce coherent output.
+        // Attention ops verified correct, but SSM delta/conv_silu have remaining issues.
         if (lw->wq.rows > q_dim) return NULL;
         if (lw->q_norm && !lw->q_norm_gpu) return NULL;
         if (lw->k_norm && !lw->k_norm_gpu) return NULL;

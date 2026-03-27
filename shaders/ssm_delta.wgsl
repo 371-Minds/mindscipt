@@ -21,7 +21,7 @@ struct Uniforms {
 @group(0) @binding(7) var<uniform> u: Uniforms;
 
 // p0 = head_k_dim, p1 = head_v_dim, p2 = num_k_heads,
-// p3 = q_scale (bitcast to f32)
+// p3 = q_scale (bitcast to f32), p4 = state_offset (bytes), p5 = state_layer_size (bytes)
 
 // Shared memory for sk (head_v_dim elements, max 256 for typical models)
 var<workgroup> sk: array<f32, 256>;
@@ -35,9 +35,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let hv = u.p1;
     let num_k_heads = u.p2;
     let q_scale = bitcast<f32>(u.p3);
+    let state_layer_off = u.p4 / 4u;  // byte offset → float offset
 
     let hk_idx = hv_idx % num_k_heads;
-    let state_base = hv_idx * hk * hv;
+    let state_base = state_layer_off + hv_idx * hk * hv;
     let decay = alpha[hv_idx];
     let b = beta[hv_idx];
 
