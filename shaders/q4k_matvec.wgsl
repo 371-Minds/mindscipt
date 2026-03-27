@@ -84,32 +84,44 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
             let qs_base = base + 16u;
             let elem_base = bi * QK_K;
 
-            // Each thread handles 32 elements (256 / 8)
+            // Each thread handles one 32-element sub-block.
+            // Integer accumulation: quantize x to int8, exact integer dot product,
+            // single float conversion per sub-block (matches CPU NEON SDOT precision).
             let my_start = local_elem * ELEMS_PER_THREAD;
+            let group = my_start / 64u;
+            let is_high = (my_start % 64u) / 32u;
+            let sub = group * 2u + is_high;
+            let sm = get_scale_min(sub, scales_base);
+            let q_off_base = qs_base + group * 32u;
 
-            for (var i = 0u; i < ELEMS_PER_THREAD; i++) {
-                let elem = my_start + i;
-                // 256 elements in 4 groups of 64, each group has low 32 + high 32
-                let group = elem / 64u;          // 0..3
-                let in_group = elem % 64u;
-                let is_high = in_group / 32u;     // 0=low nibble, 1=high nibble
-                let pos = in_group % 32u;         // 0..31
+            // Find amax of 32 x values for quantization
+            var amax: f32 = 0.0;
+            for (var i = 0u; i < 32u; i++) {
+                amax = max(amax, abs(x[x_base + elem_base + my_start + i]));
+            }
 
-                let sub = group * 2u + is_high;
-                let sm = get_scale_min(sub, scales_base);
-                let ds = d * f32(sm.x);
-                let dm = dmin * f32(sm.y);
+            if (amax > 0.0) {
+                let x_scale = amax / 127.0;
+                let inv_scale = 127.0 / amax;
 
-                let q_off = qs_base + group * 32u + pos;
-                let qbyte = read_u8(q_off);
-                var qval: u32;
-                if (is_high == 0u) {
-                    qval = qbyte & 0xFu;
-                } else {
-                    qval = qbyte >> 4u;
+                // Integer dot product: sum(qval * xq) and sum(xq) for bsums correction
+                var sumi: i32 = 0;
+                var bsumi: i32 = 0;
+                for (var i = 0u; i < 32u; i++) {
+                    let xq = i32(round(x[x_base + elem_base + my_start + i] * inv_scale));
+                    let qbyte = read_u8(q_off_base + i);
+                    var qval: i32;
+                    if (is_high == 0u) {
+                        qval = i32(qbyte & 0xFu);
+                    } else {
+                        qval = i32(qbyte >> 4u);
+                    }
+                    sumi += qval * xq;  // exact integer arithmetic
+                    bsumi += xq;
                 }
 
-                acc += (ds * f32(qval) - dm) * x[x_base + elem_base + elem];
+                // Single float conversion per sub-block
+                acc += x_scale * (d * f32(sm.x) * f32(sumi) - dmin * f32(sm.y) * f32(bsumi));
             }
         }
     }

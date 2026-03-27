@@ -1163,8 +1163,7 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
         if (!is_attn) { has_ssm = 1; continue; }
         if (lw->router_weight) { has_moe = 1; }
         if (!lw->wq.data) return NULL;
-        // Q-gated: reject on GPU until SSM shaders produce coherent output.
-        // Attention ops verified correct, but SSM delta/conv_silu have remaining issues.
+        // Q-gated: reject on GPU (SSM shader precision still causes incoherence on hybrid models)
         if (lw->wq.rows > q_dim) return NULL;
         if (lw->q_norm && !lw->q_norm_gpu) return NULL;
         if (lw->k_norm && !lw->k_norm_gpu) return NULL;
