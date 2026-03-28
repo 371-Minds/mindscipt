@@ -46,7 +46,7 @@ Modules are organized in strict dependency order — each depends only on those 
 10. `sampler` — sampling strategies (standalone)
 11. `threadpool` — persistent pthread pool with atomic work-stealing
 12. `bn_alloc` — vtable allocator interface (standalone, Hull-compatible with `KlAllocator`)
-13. `prompt_cache` — shared KV prefix cache: longest-prefix matching, FIFO eviction, thread-safe (depends on model + session + bn_alloc + turboquant)
+13. `prompt_cache` — shared KV prefix cache: longest-prefix matching, FIFO eviction, thread-safe, TQ-aware (depends on model + session + bn_alloc + turboquant)
 14. `generate` — library API: generation, prefill, chat formatting, SSE streaming, logprobs, stop strings (depends on model + session + tokenizer + sampler + transformer + bn_alloc)
 15. `gpu_wgpu` — wgpu-native WebGPU backend, optional with `BN_ENABLE_GPU=1` (depends on model + gpu_backend)
 16. `main` — CLI wiring (depends on generate + all above)
@@ -75,7 +75,7 @@ Headers live in `include/`, implementations in `src/`, tests in `test/`.
 - `BnMoEIO` — shared MoE I/O control plane (fd, mmap_base, prefetch threads, LRU cache) on BnModel
 - `BnMoEState` — per-session MoE compute buffers + pread staging + stats
 - `BnPromptCache` — shared KV prefix cache with longest-prefix matching and FIFO eviction
-- `BnPromptCacheEntry` — cached KV snapshot: token sequence + compact KV data
+- `BnPromptCacheEntry` — cached KV snapshot: token sequence + compact KV data (FP32/FP16 or TQ packed)
 - `BnGPUBackend` — GPU compute vtable (buffer_create/destroy, matvec, matmul, matvec_batch, execute, init_activations)
 - `BnMoEExpertMap` — file offsets for gate/up/down expert tensors per layer
 - `BnTokenizer` — BPE vocab + sorted index for encoding
@@ -131,7 +131,7 @@ Persistent pthread pool with atomic work-stealing dispatch (`include/threadpool.
 
 ### Speculative Decoding
 
-Optional `--draft <model.gguf>` flag loads a small draft model to generate K candidate tokens (default K=5 via `--draft-k`), then verifies with the target model. Greedy only (temp=0). Draft and target must share the same tokenizer (same vocab_size). Two `BnModel` instances coexist with shared thread pool; each has its own `BnSession` with independent KV cache and activation buffers. No KV cache rollback needed (attention window bounded by pos). Best with dense targets + same-family small draft; MoE targets verify sequentially (no batch speedup yet).
+Optional `--draft <model.gguf>` flag loads a small draft model to generate K candidate tokens (default K=5 via `--draft-k`), then verifies with the target model. Greedy only (temp=0). Draft and target must share the same tokenizer (same vocab_size). Two `BnModel` instances coexist with shared thread pool; each has its own `BnSession` with independent KV cache and activation buffers. No KV cache rollback needed (attention window bounded by pos). Best with dense targets + same-family small draft; MoE targets verify sequentially (no batch speedup yet). `--kv-tq` applies to both target and draft sessions, shrinking the draft's KV cache too.
 
 ### TurboQuant KV Cache Compression
 
@@ -183,6 +183,25 @@ bn_session_free(s, NULL);
 
 All forward pass and generation functions take both `BnModel *` and `BnSession *`. The model provides weights and shared resources; the session provides mutable state.
 
+### Prompt Cache
+
+`BnPromptCache` stores KV prefix snapshots keyed by token sequences. Supports longest-prefix matching for efficient KV reuse across requests or chat turns.
+
+**TQ-aware**: When `--kv-tq` is enabled, prompt cache stores TQ-compressed packed bytes instead of FP32/FP16 data. Entry sizes shrink ~8.7x (TQ-3), store/restore run ~8-10x faster (memcpy-bound). Format validation prevents mismatches (TQ-3 entry won't match FP32 query).
+
+**Chat mode**: Tracks full token history and caches KV state after each complete turn (user prompt + assistant response + end-of-turn token). On `/reset`, restores the longest matching prefix. On context overflow, resets with history tracking for future prefix reuse.
+
+**API:**
+```c
+BnPromptCache *pc = bn_prompt_cache_create(max_bytes, NULL);
+bn_prompt_cache_store(pc, &model, session, tokens, n_tokens);    // snapshot KV
+int restored = bn_prompt_cache_restore(pc, &model, session, tokens, n);  // longest prefix
+bn_prompt_cache_clear(pc);
+bn_prompt_cache_free(pc);
+```
+
+**Entry layout**: `BnPromptCacheEntry` holds separate `key_cache_bytes` and `val_cache_bytes` (split for TQ where key and value have different packed sizes), plus `kv_tq_bits` for format validation. Thread-safe via pthread mutex.
+
 ## Testing
 
 Tests use assert-based checks with synthetic data — no real model files needed for unit tests. Each test file is self-contained and can be compiled independently with its module dependencies.
@@ -220,7 +239,7 @@ Optional GPU inference via wgpu-native. Build with `make BN_ENABLE_GPU=1 WGPU_LI
 - **Integrate as a library**: `#include "generate.h"` and `#include "session.h"` — load model with `bn_model_load`, create session with `bn_session_create`, then use `bn_prefill`, `bn_generate`, `bn_chat_format_messages`. Pass custom `BnAllocator` or NULL for stdlib.
 - **Add concurrent sessions**: Create multiple `BnSession` from the same `BnModel` — each gets independent KV cache and activation buffers. Sessions are not thread-safe individually, but different sessions can be used from different threads concurrently (they share only immutable model data).
 - **Add a chat template**: add case to `BnChatFormat` enum, implement in `encode_*_turn` in `src/generate.c`
-- **Prompt caching**: use `bn_prompt_cache_store`/`bn_prompt_cache_restore` for KV prefix reuse across requests
+- **Prompt caching**: use `bn_prompt_cache_store`/`bn_prompt_cache_restore` for KV prefix reuse across requests. TQ-aware: stores compressed packed bytes when `--kv-tq` is enabled (8.7x smaller entries)
 - **GPU inference**: `bn_gpu_wgpu_create`, `bn_model_upload_weights`, `--gpu` flag
 - **SSE streaming**: `bn_format_sse_chunk` / `bn_format_sse_done` for OpenAI-compatible server-sent events
 - **Logprobs**: `bn_logprobs_compute` for top-K log probabilities from logits

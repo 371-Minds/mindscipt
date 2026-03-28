@@ -482,7 +482,7 @@ int main(int argc, char **argv) {
             bn_gguf_free(gf);
             return 1;
         }
-        if (bn_model_load(&draft_model, draft_gf, args.max_seq_len, args.kv_f16, 0) != 0) {
+        if (bn_model_load(&draft_model, draft_gf, args.max_seq_len, args.kv_f16, args.kv_tq_bits) != 0) {
             SH_LOG_ERROR("Failed to load draft model");
             bn_gguf_free(draft_gf);
             bn_platform_unload_file(&draft_mf);
