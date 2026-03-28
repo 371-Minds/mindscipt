@@ -160,9 +160,15 @@ bench_layers: CFLAGS += -DBN_BENCH_LAYERS
 bench_layers: $(BENCH_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-.PHONY: debug asan bench bench_scalar bench_avx2 bench_layers test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 test_q2k test_ssm test_gguf_fuzz test_moe test_generate test_session test_prompt_cache test_turboquant test_gpu_backend test_gpu_wgpu test_gpu_validate test_coherence pgo avx2-check fetch-wgpu clean
+.PHONY: debug asan bench bench_suite bench_kernels_run bench_scalar bench_avx2 bench_layers test test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 test_q2k test_ssm test_gguf_fuzz test_moe test_generate test_session test_prompt_cache test_turboquant test_gpu_backend test_gpu_wgpu test_gpu_validate test_coherence pgo avx2-check fetch-wgpu clean
 
-bench: bench_kernels
+bench: $(MAIN_TARGET)
+	./bench/bench_suite.sh
+
+bench_suite: $(MAIN_TARGET)
+	./bench/bench_suite.sh
+
+bench_kernels_run: bench_kernels
 
 test: test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_ssm test_gguf_fuzz test_moe test_generate test_session test_prompt_cache test_turboquant test_gpu_backend
 

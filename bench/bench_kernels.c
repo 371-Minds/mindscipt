@@ -5,6 +5,7 @@
 #include "platform.h"
 #include "gguf.h"
 #include "model.h"
+#include "session.h"
 #include "quant.h"
 #include "transformer.h"
 #include "sampler.h"
@@ -213,7 +214,7 @@ static void bench_logits_real(const BnModel *m, int n_iters, BnThreadPool *pool)
     free(x_q);
 }
 
-static void bench_toks(BnModel *m, int n_gen) {
+static void bench_toks(BnModel *m, BnSession *s, int n_gen) {
     // Generate tokens and measure throughput
     int warmup = 4;
     int total = warmup + n_gen;
@@ -222,7 +223,7 @@ static void bench_toks(BnModel *m, int n_gen) {
     bn_sampler_init(&sampler, m->config.vocab_size, 0.0f, 0.9f, 42);
 
     // Feed BOS token at pos 0
-    float *logits = bn_transformer_forward(m, 1, 0);  // token 1 = BOS for most models
+    float *logits = bn_transformer_forward(m, s, 1, 0);  // token 1 = BOS for most models
     if (!logits) {
         fprintf(stderr, "Forward pass failed\n");
         bn_sampler_free(&sampler);
@@ -234,7 +235,7 @@ static void bench_toks(BnModel *m, int n_gen) {
     double t_start = 0;
     for (int i = 0; i < total; i++) {
         if (i == warmup) t_start = bn_platform_time_ms();
-        logits = bn_transformer_forward(m, next, i + 1);
+        logits = bn_transformer_forward(m, s, next, i + 1);
         if (!logits) break;
         next = bn_sampler_sample(&sampler, logits);
     }
@@ -283,7 +284,7 @@ int main(int argc, char **argv) {
 
     BnModel model = {0};
     model.file = mf;
-    if (bn_model_load(&model, gf, 32, 0) != 0) {
+    if (bn_model_load(&model, gf, 32, 0, 0) != 0) {
         fprintf(stderr, "Failed to load model\n");
         bn_gguf_free(gf);
         bn_platform_unload_file(&mf);
@@ -355,7 +356,13 @@ int main(int argc, char **argv) {
 
     // Tok/s benchmark (forward pass)
     model.pool = pool;
-    bench_toks(&model, n_toks);
+    BnSession *session = bn_session_create(&model, NULL);
+    if (session) {
+        bench_toks(&model, session, n_toks);
+        bn_session_free(session, NULL);
+    } else {
+        fprintf(stderr, "Failed to create session for tok/s benchmark\n");
+    }
     model.pool = NULL;  // don't double-free
 
     // Cleanup
