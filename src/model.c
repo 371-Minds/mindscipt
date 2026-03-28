@@ -1,4 +1,5 @@
 #include "model.h"
+#include "gpu_backend.h"
 #include "moe.h"
 #include "sh_arena.h"
 #include "sh_log.h"
@@ -1106,6 +1107,13 @@ int bn_model_alloc_session_buffers(const BnConfig *c, const BnWeights *w,
 void bn_model_free(BnModel *m) {
     if (!m) return;
     bn_model_release_gpu(m);
+    // Free cached GPU op list (Phase 4)
+    if (m->gpu_graph) {
+        BnGPUGraph *g = (BnGPUGraph *)m->gpu_graph;
+        free(g->ops);
+        free(g);
+        m->gpu_graph = NULL;
+    }
     bn_moe_prefetch_destroy(&m->moe_io);
     bn_tp_free(m->pool);
     if (m->tq_state) {

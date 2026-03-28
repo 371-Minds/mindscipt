@@ -16,7 +16,7 @@
 #define BN_GPU_SHADER_SILU_GATE    6
 #define BN_GPU_SHADER_RELU2_GATE   7
 #define BN_GPU_SHADER_RESIDUAL_ADD 8
-#define BN_GPU_SHADER_COPY         9  // pseudo-op: buffer-to-buffer copy (no shader)
+#define BN_GPU_SHADER_COPY         9  // compute-shader buffer copy (stays in encoder)
 #define BN_GPU_SHADER_BIAS_ADD     10 // x[i] += bias[i], bias from W_buf
 #define BN_GPU_SHADER_RESIDUAL_RMSNORM 11 // fused residual_add + rmsnorm
 #define BN_GPU_SHADER_WEIGHTED_ADD   12 // x[i] += weight * r[i] (MoE expert accum)
@@ -28,7 +28,8 @@
 #define BN_GPU_SHADER_PER_HEAD_RMSNORM  18 // Per-head RMSNorm (Q/K norms)
 #define BN_GPU_SHADER_DEINTERLEAVE_Q    19 // Extract Q from interleaved [Q,Gate] layout
 #define BN_GPU_SHADER_SIGMOID_GATE      20 // out *= sigmoid(gate) for gated Q
-#define BN_GPU_SHADER_COUNT             21
+#define BN_GPU_SHADER_FLASH_ATTN       21 // Fused Q·K softmax att·V (online softmax)
+#define BN_GPU_SHADER_COUNT             22
 
 // GPU-resident activation buffer indices
 #define BN_GPU_BUF_X           0
@@ -145,6 +146,18 @@ typedef struct {
                            size_t size, size_t offset);
 
     void *ctx;  // opaque backend context
+
+    // Capability flags (set by backend, checked by transformer)
+    uint32_t caps;
 } BnGPUBackend;
+
+// Backend capability bits
+#define BN_GPU_CAP_FLASH_ATTN  (1u << 0)  // fused flash attention shader available
+
+// Pre-compiled GPU op list for dense models (Phase 4: eliminates per-token malloc)
+typedef struct {
+    BnGPUOp *ops;       // pre-allocated op array
+    int cap;            // capacity (max ops)
+} BnGPUGraph;
 
 #endif // BN_GPU_BACKEND_H

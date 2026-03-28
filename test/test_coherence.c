@@ -24,6 +24,9 @@
 #ifdef BN_ENABLE_GPU
 #include "gpu_wgpu.h"
 #endif
+#ifdef BN_ENABLE_METAL
+#include "gpu_metal.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -187,21 +190,22 @@ static int test_matvec_weight(const char *name, const BnQWeight *W, BnThreadPool
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <model.gguf> [--gpu]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <model.gguf> [--gpu] [--metal]\n", argv[0]);
         fprintf(stderr, "Coherence test: GPU vs CPU forward pass, SIMD vs scalar matvec\n");
         return 1;
     }
 
-    int use_gpu = 0;
+    int use_gpu = 0, use_metal = 0;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--gpu") == 0) use_gpu = 1;
+        if (strcmp(argv[i], "--metal") == 0) use_metal = 1;
     }
 
     int total_pass = 0, total_fail = 0, total_skip = 0;
 
     printf("=== Coherence Test ===\n");
     printf("Model: %s\n", argv[1]);
-    printf("GPU:   %s\n\n", use_gpu ? "requested" : "off");
+    printf("GPU:   %s\n\n", use_gpu ? "wgpu" : use_metal ? "metal" : "off");
 
     /* ── Load model ──────────────────────────────────────────────── */
 
@@ -378,9 +382,89 @@ int main(int argc, char **argv) {
         }
     } else
 #endif
+#ifdef BN_ENABLE_METAL
+    if (use_metal) {
+        BnGPUBackend *gpu = bn_gpu_metal_create("shaders/metal/");
+        if (!gpu) {
+            printf("  Metal: not available, skipping Phase 1 Metal comparison\n");
+            total_skip++;
+        } else {
+            if (bn_model_upload_weights(&model, gpu) != 0) {
+                printf("  Metal: weight upload failed, skipping\n");
+                bn_gpu_metal_destroy(gpu);
+                total_skip++;
+            } else {
+                if (gpu->init_activations)
+                    gpu->init_activations(gpu->ctx, &model.config);
+
+                int gpu_tokens[N_DECODE_STEPS];
+
+                BnSession *s = bn_session_create(&model, NULL);
+                if (!s) {
+                    fprintf(stderr, "Failed to create Metal session\n");
+                    return 1;
+                }
+
+                BnSampler sampler;
+                bn_sampler_init(&sampler, model.config.vocab_size, 0.0f, 0.0f, 42);
+
+                int token = prompt_tokens[0];
+                int pos = 0;
+
+                for (int i = 0; i < n_prompt; i++) {
+                    float *logits = bn_transformer_forward(&model, s, token, pos);
+                    (void)logits;
+                    if (i < n_prompt - 1)
+                        token = prompt_tokens[i + 1];
+                    pos++;
+                }
+
+                for (int i = 0; i < N_DECODE_STEPS; i++) {
+                    float *logits = bn_transformer_forward(&model, s, token, pos);
+                    token = bn_sampler_sample(&sampler, logits);
+                    gpu_tokens[i] = token;
+                    pos++;
+                }
+
+                printf("  Metal tokens: ");
+                for (int i = 0; i < N_DECODE_STEPS; i++) {
+                    const char *piece = bn_tokenizer_decode(&tok, gpu_tokens[i]);
+                    printf("[%d]=%d(\"%s\") ", i, gpu_tokens[i], piece ? piece : "?");
+                }
+                printf("\n");
+
+                for (int i = 0; i < N_DECODE_STEPS; i++) {
+                    int match = (cpu_tokens[i] == gpu_tokens[i]);
+                    int required = (i < N_MATCH_REQUIRED);
+                    if (match) {
+                        printf("  token[%d]: PASS (cpu=%d metal=%d)\n",
+                               i, cpu_tokens[i], gpu_tokens[i]);
+                        total_pass++;
+                    } else if (required) {
+                        printf("  token[%d]: FAIL (cpu=%d metal=%d) [REQUIRED]\n",
+                               i, cpu_tokens[i], gpu_tokens[i]);
+                        total_fail++;
+                    } else {
+                        printf("  token[%d]: DRIFT (cpu=%d metal=%d) [allowed]\n",
+                               i, cpu_tokens[i], gpu_tokens[i]);
+                        total_pass++;
+                    }
+                }
+
+                bn_sampler_free(&sampler);
+                bn_session_free(s, NULL);
+
+                if (gpu->free_activations)
+                    gpu->free_activations(gpu->ctx);
+                bn_model_release_gpu(&model);
+                bn_gpu_metal_destroy(gpu);
+            }
+        }
+    } else
+#endif
     {
-        if (use_gpu)
-            printf("  GPU: not compiled (BN_ENABLE_GPU not set), skipping\n");
+        if (use_gpu || use_metal)
+            printf("  GPU: not compiled, skipping\n");
         else
             printf("  GPU: not requested, skipping GPU vs CPU comparison\n");
         total_skip += N_DECODE_STEPS;
@@ -495,9 +579,77 @@ int main(int argc, char **argv) {
         }
     } else
 #endif
+#ifdef BN_ENABLE_METAL
+    if (use_metal) {
+        BnGPUBackend *gpu = bn_gpu_metal_create("shaders/metal/");
+        if (!gpu) {
+            printf("  Metal: not available, skipping Phase 3\n");
+            total_skip++;
+        } else {
+            const BnQWeight *W = &L0->wq;
+            if (!W->data || W->rows == 0) {
+                printf("  SKIP: wq has no data\n");
+                total_skip++;
+            } else {
+                int rows = W->rows;
+                int cols = W->cols;
+
+                size_t sz = bn_qweight_data_size(W);
+                void *gpu_buf = gpu->buffer_create(gpu->ctx, W->data, sz,
+                                                    W->type, rows, cols);
+                if (!gpu_buf) {
+                    printf("  SKIP: buffer_create failed\n");
+                    total_skip++;
+                } else {
+                    float *x = malloc((size_t)cols * sizeof(float));
+                    uint64_t rng = 99999;
+                    for (int j = 0; j < cols; j++)
+                        x[j] = rand_float(&rng);
+
+                    float *out_cpu = calloc((size_t)rows, sizeof(float));
+                    int max_dim = cols > rows ? cols : rows;
+                    int8_t *x_q = calloc((size_t)max_dim, 1);
+                    bn_quant_matvec(out_cpu, W, x, x_q, NULL);
+
+                    float *out_gpu = calloc((size_t)rows, sizeof(float));
+                    int rc = gpu->matvec(gpu->ctx, out_gpu, gpu_buf, x,
+                                          rows, cols, W->type);
+                    if (rc != 0) {
+                        printf("  SKIP: Metal matvec dispatch error %d\n", rc);
+                        total_skip++;
+                    } else {
+                        float max_diff = 0.0f;
+                        for (int i = 0; i < rows; i++) {
+                            float diff = fabsf(out_gpu[i] - out_cpu[i]);
+                            if (diff > max_diff) max_diff = diff;
+                        }
+
+                        int pass = max_diff < MATVEC_TOL;
+                        printf("  wq Metal vs CPU: %-6s max_diff=%.4f (rows=%d cols=%d type=%s)\n",
+                               pass ? "PASS" : "FAIL", max_diff, rows, cols, type_name(W->type));
+                        if (pass)
+                            total_pass++;
+                        else {
+                            total_fail++;
+                            for (int i = 0; i < rows && i < 8; i++) {
+                                printf("    [%d] cpu=%.6f metal=%.6f diff=%.6f\n",
+                                       i, out_cpu[i], out_gpu[i],
+                                       fabsf(out_gpu[i] - out_cpu[i]));
+                            }
+                        }
+                    }
+
+                    free(x); free(out_cpu); free(out_gpu); free(x_q);
+                    gpu->buffer_destroy(gpu->ctx, gpu_buf);
+                }
+            }
+            bn_gpu_metal_destroy(gpu);
+        }
+    } else
+#endif
     {
-        if (use_gpu)
-            printf("  GPU: not compiled (BN_ENABLE_GPU not set), skipping\n");
+        if (use_gpu || use_metal)
+            printf("  GPU: not compiled, skipping\n");
         else
             printf("  GPU: not requested, skipping\n");
         total_skip++;

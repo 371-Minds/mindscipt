@@ -1365,6 +1365,7 @@ static int wgpu_init_activations(void *vctx, const void *config_ptr)
         { BN_GPU_SHADER_PER_HEAD_RMSNORM, "per_head_rmsnorm" },
         { BN_GPU_SHADER_DEINTERLEAVE_Q,   "deinterleave_q"   },
         { BN_GPU_SHADER_SIGMOID_GATE,     "sigmoid_gate"     },
+        { BN_GPU_SHADER_COPY,             "buf_copy"         },
     };
     int n_fwd = (int)(sizeof(fwd_shaders) / sizeof(fwd_shaders[0]));
     int compiled = 0;
@@ -1533,29 +1534,7 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
     for (int i = 0; i < n_ops; i++) {
         const BnGPUOp *op = &ops[i];
 
-        /* Handle COPY pseudo-op: forces pass boundary + buffer copy */
-        if (op->shader == BN_GPU_SHADER_COPY) {
-            /* End current pass if open */
-            if (cur_pass) {
-                wgpuComputePassEncoderEnd(cur_pass);
-                wgpuComputePassEncoderRelease(cur_pass);
-                cur_pass = NULL;
-                pass_reads = pass_writes = 0;
-                n_passes++;
-            }
-            int src = op->buf_in, dst = op->buf_out;
-            if (src < 0 || src >= BN_GPU_BUF_COUNT || !ctx->act_bufs[src]) continue;
-            if (dst < 0 || dst >= BN_GPU_BUF_COUNT || !ctx->act_bufs[dst]) continue;
-            size_t src_off = (size_t)op->p[0] * sizeof(float);
-            size_t dst_off = (size_t)op->p[1] * sizeof(float);
-            size_t copy_sz = (size_t)op->p[2] * sizeof(float);
-            if (copy_sz == 0) continue;
-            wgpuCommandEncoderCopyBufferToBuffer(encoder,
-                ctx->act_bufs[src], src_off,
-                ctx->act_bufs[dst], dst_off,
-                copy_sz);
-            continue;
-        }
+        /* COPY is now a compute shader — no pass boundary needed */
 
         /* Determine pipeline and layout */
         WGPUComputePipeline pipeline = NULL;
@@ -1651,6 +1630,10 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
         case BN_GPU_SHADER_SIGMOID_GATE:
             op_reads = BUF_BIT(op->buf_in) | BUF_BIT(op->buf_aux);
             op_writes = BUF_BIT(op->buf_in);  /* in-place */
+            break;
+        case BN_GPU_SHADER_COPY:
+            op_reads = BUF_BIT(op->buf_in);
+            op_writes = BUF_BIT(op->buf_out);
             break;
         default: continue;
         }
@@ -2005,6 +1988,20 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
             n_entries = 3;
             break;
         }
+        case BN_GPU_SHADER_COPY: {
+            /* src(ro), dst(rw), uniforms */
+            entries[0] = (WGPUBindGroupEntry){
+                .binding = 0, .buffer = ctx->act_bufs[op->buf_in],
+                .offset = 0, .size = ctx->act_sizes[op->buf_in]};
+            entries[1] = (WGPUBindGroupEntry){
+                .binding = 1, .buffer = ctx->act_bufs[op->buf_out],
+                .offset = 0, .size = ctx->act_sizes[op->buf_out]};
+            entries[2] = (WGPUBindGroupEntry){
+                .binding = 2, .buffer = ctx->uniform_ring,
+                .offset = uni_offset, .size = 32};
+            n_entries = 3;
+            break;
+        }
         default: continue;
         }
 
@@ -2030,16 +2027,14 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
         uint32_t wg_x = 1, wg_y = 1;
         switch (op->shader) {
         case BN_GPU_SHADER_MATVEC: {
-            /* Tiled dispatch: Q4_0 uses TILE_ROWS=8 (simdgroup-coalesced),
-             * others use TILE_ROWS=32 */
-            uint32_t tile_rows = (op->type == BN_GGUF_TENSOR_Q4_0) ? 8 : 32;
+            /* Tiled dispatch: all types use TILE_ROWS=32 */
             if (op->p[3] > 0) {
                 /* Large-vocab tiling: extra = wg_x per slice, rows split across Y */
-                uint32_t tiled_rows = ((uint32_t)op->rows + tile_rows - 1) / tile_rows;
+                uint32_t tiled_rows = ((uint32_t)op->rows + 31) / 32;
                 wg_x = op->p[3];
                 wg_y = (tiled_rows + op->p[3] - 1) / op->p[3];
             } else {
-                wg_x = ((uint32_t)op->rows + tile_rows - 1) / tile_rows;
+                wg_x = ((uint32_t)op->rows + 31) / 32;
                 wg_y = op->p[2];  /* n_tokens */
                 if (wg_y == 0) wg_y = 1;
             }
@@ -2088,6 +2083,9 @@ static int wgpu_execute(void *vctx, const BnGPUOp *ops, int n_ops,
         case BN_GPU_SHADER_DEINTERLEAVE_Q:
         case BN_GPU_SHADER_SIGMOID_GATE:
             wg_x = (op->p[0] + 255) / 256;  /* ceil(q_dim / 256) */
+            break;
+        case BN_GPU_SHADER_COPY:
+            wg_x = (op->p[2] + 255) / 256;  /* ceil(count / 256) */
             break;
         }
 

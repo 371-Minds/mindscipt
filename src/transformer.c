@@ -1200,14 +1200,25 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
     // MoE: K*5 + shared(5) + residual + rmsnorm = up to BN_MAX_MOE_K*5 + 7
     // Total worst case: 20 + BN_MAX_MOE_K*5 + 7 = 107 for K=16
     int max_ops = has_moe || has_ssm ? (5 * BN_MAX_MOE_K + 40) : 34 * c->n_layers + 4;
-    BnGPUOp *ops = (BnGPUOp *)malloc((size_t)max_ops * sizeof(BnGPUOp));
-    if (!ops) return NULL;
+
+    // Phase 4: reuse cached op array to avoid per-token malloc
+    BnGPUGraph *graph = (BnGPUGraph *)m->gpu_graph;
+    if (!graph || graph->cap < max_ops) {
+        if (graph) free(graph->ops);
+        else graph = (BnGPUGraph *)calloc(1, sizeof(BnGPUGraph));
+        if (!graph) return NULL;
+        graph->ops = (BnGPUOp *)malloc((size_t)max_ops * sizeof(BnGPUOp));
+        if (!graph->ops) { free(graph); return NULL; }
+        graph->cap = max_ops;
+        m->gpu_graph = graph;
+    }
+    BnGPUOp *ops = graph->ops;
     int n = 0;
 
     // Helper: flush current ops (no readback), reset counter
     #define GPU_FLUSH() do { \
         if (n > 0) { \
-            if (gpu->execute(gpu->ctx, ops, n, -1, NULL, 0) != 0) { free(ops); return NULL; } \
+            if (gpu->execute(gpu->ctx, ops, n, -1, NULL, 0) != 0) return NULL; \
             n = 0; \
         } \
     } while(0)
@@ -1238,7 +1249,7 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
                 GPU_FLUSH();
                 if (gpu->read_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
                                           (size_t)dim * sizeof(float), 0) != 0)
-                    { free(ops); return NULL; }
+                    { return NULL; }
                 forward_ssm_block(m, sess, lw, l);
                 residual_add(s->x, s->xb, dim);
                 if (lw->router_weight)
@@ -1247,7 +1258,7 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
                     forward_ffn_block(m, sess, lw);
                 if (gpu->write_activation(gpu->ctx, BN_GPU_BUF_X, s->x,
                                            (size_t)dim * sizeof(float), 0) != 0)
-                    { free(ops); return NULL; }
+                    { return NULL; }
                 void *nn = (l + 1 < c->n_layers) ? w->layers[l + 1].attn_norm_gpu : w->output_norm_gpu;
                 ops[n++] = (BnGPUOp){ .shader = BN_GPU_SHADER_RMSNORM, .type = -1,
                     .W_buf = nn, .buf_in = BN_GPU_BUF_X, .buf_out = BN_GPU_BUF_XB, .buf_aux = -1,
@@ -1547,35 +1558,46 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
                    (uint32_t)pos, (uint32_t)rope_dims, 0, 0, 0, 0 }
         };
 
-        // ---- GQA: scores, softmax, combine ----
+        // ---- GQA: fused flash attention or 3-dispatch fallback ----
         {
             float inv_sqrt_hs = 1.0f / sqrtf((float)head_size);
             uint32_t u_inv_sqrt_hs;
             memcpy(&u_inv_sqrt_hs, &inv_sqrt_hs, 4);
-            ops[n++] =(BnGPUOp){
-                .shader = BN_GPU_SHADER_GQA_SCORES, .type = -1, .W_buf = NULL,
-                .buf_in = BN_GPU_BUF_Q, .buf_out = -1, .buf_aux = -1,
-                .rows = 0, .cols = 0,
-                .p = { (uint32_t)n_heads, (uint32_t)head_size, (uint32_t)n_kv,
-                       (uint32_t)c->kv_mul, (uint32_t)kv_dim, (uint32_t)c->seq_len,
-                       (uint32_t)loff, u_inv_sqrt_hs }
-            };
+            if (gpu->caps & BN_GPU_CAP_FLASH_ATTN) {
+                ops[n++] =(BnGPUOp){
+                    .shader = BN_GPU_SHADER_FLASH_ATTN, .type = -1, .W_buf = NULL,
+                    .buf_in = BN_GPU_BUF_Q, .buf_out = BN_GPU_BUF_XB, .buf_aux = -1,
+                    .rows = 0, .cols = 0,
+                    .p = { (uint32_t)n_heads, (uint32_t)head_size, (uint32_t)n_kv,
+                           (uint32_t)c->kv_mul, (uint32_t)kv_dim, (uint32_t)c->seq_len,
+                           (uint32_t)loff, u_inv_sqrt_hs }
+                };
+            } else {
+                ops[n++] =(BnGPUOp){
+                    .shader = BN_GPU_SHADER_GQA_SCORES, .type = -1, .W_buf = NULL,
+                    .buf_in = BN_GPU_BUF_Q, .buf_out = -1, .buf_aux = -1,
+                    .rows = 0, .cols = 0,
+                    .p = { (uint32_t)n_heads, (uint32_t)head_size, (uint32_t)n_kv,
+                           (uint32_t)c->kv_mul, (uint32_t)kv_dim, (uint32_t)c->seq_len,
+                           (uint32_t)loff, u_inv_sqrt_hs }
+                };
+                ops[n++] =(BnGPUOp){
+                    .shader = BN_GPU_SHADER_SOFTMAX, .type = -1, .W_buf = NULL,
+                    .buf_in = -1, .buf_out = -1, .buf_aux = -1,
+                    .rows = 0, .cols = 0,
+                    .p = { (uint32_t)n_heads, (uint32_t)n_kv, (uint32_t)c->seq_len,
+                           0, 0, 0, 0, 0 }
+                };
+                ops[n++] =(BnGPUOp){
+                    .shader = BN_GPU_SHADER_GQA_COMBINE, .type = -1, .W_buf = NULL,
+                    .buf_in = -1, .buf_out = BN_GPU_BUF_XB, .buf_aux = -1,
+                    .rows = 0, .cols = 0,
+                    .p = { (uint32_t)n_heads, (uint32_t)head_size, (uint32_t)n_kv,
+                           (uint32_t)c->kv_mul, (uint32_t)kv_dim, (uint32_t)c->seq_len,
+                           (uint32_t)loff, 0 }
+                };
+            }
         }
-        ops[n++] =(BnGPUOp){
-            .shader = BN_GPU_SHADER_SOFTMAX, .type = -1, .W_buf = NULL,
-            .buf_in = -1, .buf_out = -1, .buf_aux = -1,
-            .rows = 0, .cols = 0,
-            .p = { (uint32_t)n_heads, (uint32_t)n_kv, (uint32_t)c->seq_len,
-                   0, 0, 0, 0, 0 }
-        };
-        ops[n++] =(BnGPUOp){
-            .shader = BN_GPU_SHADER_GQA_COMBINE, .type = -1, .W_buf = NULL,
-            .buf_in = -1, .buf_out = BN_GPU_BUF_XB, .buf_aux = -1,
-            .rows = 0, .cols = 0,
-            .p = { (uint32_t)n_heads, (uint32_t)head_size, (uint32_t)n_kv,
-                   (uint32_t)c->kv_mul, (uint32_t)kv_dim, (uint32_t)c->seq_len,
-                   (uint32_t)loff, 0 }
-        };
 
         // ---- Sigmoid gate (Q-gated only): xb *= sigmoid(gate) ----
         {
@@ -1623,7 +1645,7 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
             float xb_cpu[dim];
             if (gpu->read_activation(gpu->ctx, BN_GPU_BUF_XB, xb_cpu,
                                       (size_t)dim * sizeof(float), 0) != 0)
-                { free(ops); return NULL; }
+                { return NULL; }
 
             /* no-op */
             // CPU routing: select top-K experts
@@ -1637,7 +1659,7 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
                 memset(zeros, 0, sizeof(zeros));
                 if (gpu->write_activation(gpu->ctx, BN_GPU_BUF_MOE_OUT, zeros,
                                            (size_t)dim * sizeof(float), 0) != 0)
-                    { free(ops); return NULL; }
+                    { return NULL; }
             }
 
             // GPU expert dispatch with LRU cache for GPU buffer reuse
@@ -1845,12 +1867,11 @@ static float *forward_gpu(BnModel *m, BnSession *sess, int token, int pos) {
     }
 
     // Safety: verify we didn't overflow the ops array
-    if (n > max_ops) { free(ops); return NULL; }
+    if (n > max_ops) { return NULL; }
 
     // Execute final batch (logits + any remaining layer ops)
     int rc = gpu->execute(gpu->ctx, ops, n, BN_GPU_BUF_LOGITS,
                           s->logits, c->vocab_size);
-    free(ops);
     #undef GPU_FLUSH
     return (rc == 0) ? s->logits : NULL;
 }

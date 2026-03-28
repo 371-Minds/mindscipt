@@ -200,6 +200,8 @@ typedef struct {
     int expert_fd;           // file descriptor for expert pread, -1 if unused
     BnGPUBackend *gpu;       // GPU compute backend (NULL = CPU only)
     BnTQState *tq_state;     // TurboQuant state (NULL = no TQ compression)
+    // Cached GPU op list (Phase 4: eliminates per-token malloc)
+    void *gpu_graph;         // BnGPUGraph* (opaque, allocated by forward_gpu)
 } BnModel;
 
 int  bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv_tq_bits);

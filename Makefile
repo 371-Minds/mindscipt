@@ -105,12 +105,25 @@ else
   GPU_OBJS :=
 endif
 
+# --- Metal (optional: BN_ENABLE_METAL=1, macOS only) ---
+ifdef BN_ENABLE_METAL
+  METAL_CFLAGS := -DBN_ENABLE_METAL
+  METAL_FRAMEWORKS := -framework Metal -framework Foundation
+  METAL_SRCS := src/gpu_metal.m
+  METAL_OBJS := src/gpu_metal.o
+else
+  METAL_CFLAGS :=
+  METAL_FRAMEWORKS :=
+  METAL_SRCS :=
+  METAL_OBJS :=
+endif
+
 SRCS = src/platform.c src/gguf.c $(QUANT_SRCS) src/turboquant.c src/model.c src/moe.c \
        $(TRANSFORMER_SRCS) src/tokenizer.c src/sampler.c \
        src/threadpool.c src/sh_arena.c src/sh_log.c src/bn_alloc.c src/session.c src/prompt_cache.c src/generate.c $(GPU_SRCS) src/main.c
-CFLAGS += $(GPU_CFLAGS)
-LDFLAGS += $(WGPU_LIB) $(WGPU_FRAMEWORKS)
-OBJS = $(SRCS:.c=.o)
+CFLAGS += $(GPU_CFLAGS) $(METAL_CFLAGS)
+LDFLAGS += $(WGPU_LIB) $(WGPU_FRAMEWORKS) $(METAL_FRAMEWORKS)
+OBJS = $(SRCS:.c=.o) $(METAL_OBJS)
 
 # Default target
 bitnet: $(OBJS)
@@ -134,6 +147,10 @@ src/quant/%.o: src/quant/%.c
 
 src/transformer/%.o: src/transformer/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Objective-C pattern rule for Metal backend
+src/%.o: src/%.m
+	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 
 # --- Tests ---
 # --- Benchmark ---
@@ -399,9 +416,20 @@ COHERENCE_SRCS = test/test_coherence.c $(QUANT_SRCS) src/turboquant.c src/model.
 ifdef BN_ENABLE_GPU
 COHERENCE_SRCS += src/gpu_wgpu.c
 endif
+ifdef BN_ENABLE_METAL
+COHERENCE_OBJS = $(COHERENCE_SRCS:.c=.o) src/gpu_metal.o
+else
+COHERENCE_OBJS =
+endif
 
+ifdef BN_ENABLE_METAL
+test_coherence: $(COHERENCE_SRCS) src/gpu_metal.m
+	$(CC) $(CFLAGS) -c -o /tmp/bn_coherence_metal.o src/gpu_metal.m -fobjc-arc
+	$(CC) $(CFLAGS) -o $@ $(COHERENCE_SRCS) /tmp/bn_coherence_metal.o $(LDFLAGS)
+else
 test_coherence: $(COHERENCE_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+endif
 
 clean:
-	rm -f bitnet bench_kernels bench_scalar bench_avx2 bench_layers src/*.o src/quant/*.o src/transformer/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_q2k test_ssm test_gguf_fuzz test_moe test_generate test_session test_prompt_cache test_turboquant test_gpu_backend test_gpu_wgpu test_gpu_validate test_coherence test_e2e test_prefill test_kv_f16 default.profraw default.profdata src/*.gcda src/quant/*.gcda src/transformer/*.gcda
+	rm -f bitnet bench_kernels bench_scalar bench_avx2 bench_layers src/*.o src/quant/*.o src/transformer/*.o test_gguf test_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_q2k test_ssm test_gguf_fuzz test_moe test_generate test_session test_prompt_cache test_turboquant test_gpu_backend test_gpu_wgpu test_gpu_validate test_coherence test_e2e test_prefill test_kv_f16 default.profraw default.profdata src/*.gcda src/quant/*.gcda src/transformer/*.gcda src/gpu_metal.o

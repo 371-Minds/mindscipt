@@ -11,6 +11,7 @@ bitnet.c is a pure C11 inference engine for BitNet b1.58 transformer models. It 
 ```bash
 make                    # build the main binary (CPU)
 make BN_ENABLE_GPU=1    # build with GPU backend (requires make fetch-wgpu first)
+make BN_ENABLE_METAL=1  # build with native Metal backend (macOS only)
 make debug              # build with -DDEBUG -g -O0
 make asan               # sanitizer build
 make clean              # remove artifacts
@@ -26,8 +27,10 @@ GPU-specific test targets (require `BN_ENABLE_GPU=1`): `make test_gpu_wgpu`, `ma
 Coherence test (requires a real GGUF model file):
 ```bash
 make BN_ENABLE_GPU=1 test_coherence
-./test_coherence models/bitnet-b1.58-2B-4T.gguf --gpu   # GPU vs CPU forward pass + matvec
-./test_coherence models/qwen2.5-3b-instruct-q4_0.gguf   # CPU-only: SIMD vs scalar matvec
+./test_coherence models/bitnet-b1.58-2B-4T.gguf --gpu     # wgpu GPU vs CPU forward pass + matvec
+make BN_ENABLE_METAL=1 test_coherence
+./test_coherence models/bitnet-b1.58-2B-4T.gguf --metal   # Metal vs CPU forward pass + matvec
+./test_coherence models/qwen2.5-3b-instruct-q4_0.gguf     # CPU-only: SIMD vs scalar matvec
 ```
 
 ## Architecture
@@ -49,7 +52,8 @@ Modules are organized in strict dependency order — each depends only on those 
 13. `prompt_cache` — shared KV prefix cache: longest-prefix matching, FIFO eviction, thread-safe, TQ-aware (depends on model + session + bn_alloc + turboquant)
 14. `generate` — library API: generation, prefill, chat formatting, SSE streaming, logprobs, stop strings (depends on model + session + tokenizer + sampler + transformer + bn_alloc)
 15. `gpu_wgpu` — wgpu-native WebGPU backend, optional with `BN_ENABLE_GPU=1` (depends on model + gpu_backend)
-16. `main` — CLI wiring (depends on generate + all above)
+16. `gpu_metal` — native Metal compute backend, optional with `BN_ENABLE_METAL=1` (depends on model + gpu_backend). Objective-C `.m` file.
+17. `main` — CLI wiring (depends on generate + all above)
 
 Headers live in `include/`, implementations in `src/`, tests in `test/`.
 
@@ -216,7 +220,7 @@ WASM build requires Emscripten. Run `./wasm/build.sh`. The API wrapper in `wasm/
 
 Optional GPU inference via wgpu-native. Build with `make BN_ENABLE_GPU=1 WGPU_LIB_DIR=vendor/wgpu` (run `make fetch-wgpu` first to download wgpu-native v27).
 
-- 41 WGSL shaders in `shaders/` (23 matvec + 10 forward-pass + 3 MoE + 5 SSM)
+- 42 WGSL shaders in `shaders/` (23 matvec + 11 forward-pass including buf_copy + 3 MoE + 5 SSM)
 - `BnGPUBackend` vtable in `include/gpu_backend.h` — buffer_create/destroy, matvec, matmul, matvec_batch, execute, init_activations
 - wgpu-native runtime in `src/gpu_wgpu.c`
 - `--gpu` CLI flag enables GPU inference
@@ -225,6 +229,27 @@ Optional GPU inference via wgpu-native. Build with `make BN_ENABLE_GPU=1 WGPU_LI
 - WSL2 requires a patched Mesa dzn driver — see `patches/` directory and `patches/build-dzn.sh`
 - WSL2 GPU run: `LD_LIBRARY_PATH=/usr/lib/wsl/lib VK_ICD_FILENAMES=/tmp/mesa-dzn/build/src/microsoft/vulkan/dzn_devenv_icd.x86_64.json ./bitnet model.gguf --gpu --maxseq 4096`
 - `--maxseq` is recommended on GPU to cap KV cache VRAM (models with 256K context will OOM otherwise)
+
+## Metal Backend (Native)
+
+Optional native Metal compute backend for macOS. Build with `make BN_ENABLE_METAL=1`. No external dependencies — uses system Metal.framework and Foundation.framework.
+
+- 43 MSL shaders in `shaders/metal/` (22 matvec + 21 forward-pass including buf_copy + flash_attn)
+- Same `BnGPUBackend` vtable — transformer.c checks `gpu->caps` for flash attention
+- `src/gpu_metal.m` (Objective-C) wraps Metal API
+- `include/gpu_metal.h` — C API: `bn_gpu_metal_create`, `bn_gpu_metal_destroy`, `bn_gpu_metal_init_slab`, `bn_gpu_metal_set_mmap_range`
+- `--metal` CLI flag enables Metal inference (mutually exclusive with `--gpu`)
+- **Unified memory** (`storageModeShared`): no staging buffers, `write_activation`/`read_activation` = direct `memcpy`
+- **`setBytes` for uniforms**: 32-byte `p[8]` params passed inline per dispatch (no ring buffer)
+- **Runtime shader compilation**: `.metal` source → `newLibraryWithSource:` at init
+- **`precise` transcendentals**: SSM shaders use `precise::exp`, `precise::log` for IEEE compliance (fixes SSM divergence that's irreducible in WebGPU)
+- **Coexistence**: `BN_ENABLE_METAL` independent from `BN_ENABLE_GPU`. Both can compile simultaneously.
+- Slab allocator for MoE expert weight suballocation (mirrors wgpu slab)
+- **Q4_0 matvec**: 32 rows/tile, 8 threads/row, simd_shuffle_xor reduction (0 barriers, 0 shared memory)
+- **Compute-shader COPY**: `buf_copy.metal` replaces blit encoder transitions (stays in compute encoder)
+- **Flash attention**: fused Q·K + softmax + V combine, 1 simdgroup per head, simd_sum for dot product (0 barriers). Metal-only via `BN_GPU_CAP_FLASH_ATTN`.
+- **Precompiled op list**: `BnGPUGraph` cached on `BnModel` eliminates per-token malloc
+- **Zero-copy weights**: `newBufferWithBytesNoCopy` on mmap'd GGUF data for non-repacked types (halves peak RSS at load)
 
 ## Common Tasks
 
@@ -240,7 +265,8 @@ Optional GPU inference via wgpu-native. Build with `make BN_ENABLE_GPU=1 WGPU_LI
 - **Add concurrent sessions**: Create multiple `BnSession` from the same `BnModel` — each gets independent KV cache and activation buffers. Sessions are not thread-safe individually, but different sessions can be used from different threads concurrently (they share only immutable model data).
 - **Add a chat template**: add case to `BnChatFormat` enum, implement in `encode_*_turn` in `src/generate.c`
 - **Prompt caching**: use `bn_prompt_cache_store`/`bn_prompt_cache_restore` for KV prefix reuse across requests. TQ-aware: stores compressed packed bytes when `--kv-tq` is enabled (8.7x smaller entries)
-- **GPU inference**: `bn_gpu_wgpu_create`, `bn_model_upload_weights`, `--gpu` flag
+- **GPU inference (wgpu)**: `bn_gpu_wgpu_create`, `bn_model_upload_weights`, `--gpu` flag
+- **Metal inference**: `bn_gpu_metal_create`, `bn_model_upload_weights`, `--metal` flag. Add Metal shaders to `shaders/metal/`
 - **SSE streaming**: `bn_format_sse_chunk` / `bn_format_sse_done` for OpenAI-compatible server-sent events
 - **Logprobs**: `bn_logprobs_compute` for top-K log probabilities from logits
 - **Add a GPU shader**: create `shaders/<name>.wgsl`, wire in `src/gpu_wgpu.c`

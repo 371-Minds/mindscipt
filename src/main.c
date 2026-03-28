@@ -14,6 +14,9 @@
 #include "gpu_wgpu.h"
 #include "gpu_moe_cache.h"
 #endif
+#ifdef BN_ENABLE_METAL
+#include "gpu_metal.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,7 +53,9 @@ typedef struct {
     int draft_k;        // --draft-k: number of draft tokens (default 5)
     int threads;        // 0 = auto-detect
     int gpu;            // use GPU backend for matvec (requires BN_ENABLE_GPU)
+    int metal;          // use Metal backend (requires BN_ENABLE_METAL)
     const char *shader_dir; // --shader-dir for GPU WGSL shaders
+    const char *metal_shader_dir; // --metal-shader-dir for Metal shaders
     int kv_tq_bits;     // TurboQuant KV compression (0=disabled, 2-4=bits)
     int gpu_cache_mb;   // GPU expert buffer cache in MB (default 512, 0 to disable)
 } CLIArgs;
@@ -165,8 +170,12 @@ static CLIArgs parse_args(int argc, char **argv) {
             args.kv_tq_bits = parse_int(argv[++i], "--kv-tq");
         } else if (strcmp(argv[i], "--gpu") == 0) {
             args.gpu = 1;
+        } else if (strcmp(argv[i], "--metal") == 0) {
+            args.metal = 1;
         } else if (strcmp(argv[i], "--shader-dir") == 0 && i + 1 < argc) {
             args.shader_dir = argv[++i];
+        } else if (strcmp(argv[i], "--metal-shader-dir") == 0 && i + 1 < argc) {
+            args.metal_shader_dir = argv[++i];
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -209,10 +218,16 @@ int main(int argc, char **argv) {
             fprintf(stderr, "--kv-tq and --kv16 are mutually exclusive\n");
             return 1;
         }
-        if (args.gpu) {
-            fprintf(stderr, "--kv-tq and --gpu are mutually exclusive (GPU TQ not yet supported)\n");
+        if (args.gpu || args.metal) {
+            fprintf(stderr, "--kv-tq and --gpu/--metal are mutually exclusive (GPU TQ not yet supported)\n");
             return 1;
         }
+    }
+
+    // Validate --gpu and --metal mutual exclusion
+    if (args.gpu && args.metal) {
+        fprintf(stderr, "--gpu and --metal are mutually exclusive\n");
+        return 1;
     }
 
     // Determine thread count: -t flag > Apple P-core detect > sysconf > 1
@@ -401,6 +416,41 @@ int main(int argc, char **argv) {
 #else
     if (args.gpu) {
         SH_LOG_WARN("--gpu requires BN_ENABLE_GPU=1 build, falling back to CPU");
+    }
+#endif
+
+    // Metal backend (optional)
+#ifdef BN_ENABLE_METAL
+    if (args.metal) {
+        const char *sd = args.metal_shader_dir ? args.metal_shader_dir : "shaders/metal/";
+        BnGPUBackend *gpu = bn_gpu_metal_create(sd);
+        if (gpu) {
+            // Zero-copy: let Metal wrap mmap'd weight data (Phase 5)
+            if (mf.is_mmap && mf.data)
+                bn_gpu_metal_set_mmap_range(gpu, mf.data, mf.size);
+            double gpu_t0 = bn_platform_time_ms();
+            if (bn_model_upload_weights(&model, gpu) == 0) {
+                char ms[16];
+                snprintf(ms, sizeof(ms), "%.0f", bn_platform_time_ms() - gpu_t0);
+                SH_LOG_INFO("Metal weights uploaded", "ms", ms);
+                if (gpu->init_activations) {
+                    if (gpu->init_activations(gpu->ctx, &model.config) == 0) {
+                        SH_LOG_INFO("Metal forward pass ready");
+                        if (model.config.n_experts > 0)
+                            bn_gpu_metal_init_slab(gpu, (size_t)args.gpu_cache_mb);
+                    }
+                }
+            } else {
+                SH_LOG_WARN("Metal weight upload failed, falling back to CPU");
+                bn_gpu_metal_destroy(gpu);
+            }
+        } else {
+            SH_LOG_WARN("No Metal device available, falling back to CPU");
+        }
+    }
+#else
+    if (args.metal) {
+        SH_LOG_WARN("--metal requires BN_ENABLE_METAL=1 build, falling back to CPU");
     }
 #endif
 
