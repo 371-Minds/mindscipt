@@ -993,9 +993,9 @@ void bn_quant_matvec_batch_preq8k(const BnMatvecTask *tasks, int n_tasks,
                                     const int16_t *x_bsums, const float *x_float,
                                     BnThreadPool *pool) {
     if (n_tasks <= 0) return;
-    int type0 = tasks[0].W->type;
 
 #ifdef __AVX2__
+    int type0 = tasks[0].W->type;
     if ((type0 == BN_GGUF_TENSOR_Q4_K || type0 == BN_GGUF_TENSOR_Q6_K)
         && n_tasks <= BN_MAX_BATCH) {
         int all_same = 1;
@@ -1017,6 +1017,8 @@ void bn_quant_matvec_batch_preq8k(const BnMatvecTask *tasks, int n_tasks,
             return;
         }
     }
+#else
+    (void)x_d; (void)x_bsums;
 #endif
 
     // Fallback: use float path (x_float must be provided)

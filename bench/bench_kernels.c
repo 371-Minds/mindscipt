@@ -260,11 +260,11 @@ int main(int argc, char **argv) {
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc)
-            n_iters = atoi(argv[++i]);
+            n_iters = (int)strtol(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc)
-            n_threads = atoi(argv[++i]);
+            n_threads = (int)strtol(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--toks") == 0 && i + 1 < argc)
-            n_toks = atoi(argv[++i]);
+            n_toks = (int)strtol(argv[++i], NULL, 10);
     }
 
     // Load model

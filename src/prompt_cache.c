@@ -1,5 +1,6 @@
 #include "prompt_cache.h"
 #include "session.h"
+#include "turboquant.h"
 #include <string.h>
 
 #if !defined(__EMSCRIPTEN__)
@@ -53,22 +54,23 @@ static void entry_free(BnPromptCacheEntry *e, BnAllocator *a) {
         e->tokens = NULL;
     }
     if (e->key_cache) {
-        bn_free(a, e->key_cache, e->kv_bytes);
+        bn_free(a, e->key_cache, e->key_cache_bytes);
         e->key_cache = NULL;
     }
     if (e->value_cache) {
-        bn_free(a, e->value_cache, e->kv_bytes);
+        bn_free(a, e->value_cache, e->val_cache_bytes);
         e->value_cache = NULL;
     }
     e->n_tokens = 0;
-    e->kv_bytes = 0;
+    e->key_cache_bytes = 0;
+    e->val_cache_bytes = 0;
 }
 
 // Evict the oldest entry (index 0, shift left)
 static void evict_oldest(BnPromptCache *c) {
     if (c->n_entries == 0) return;
     BnPromptCacheEntry *e = &c->entries[0];
-    c->used_bytes -= e->kv_bytes * 2 + (size_t)e->n_tokens * sizeof(int);
+    c->used_bytes -= e->key_cache_bytes + e->val_cache_bytes + (size_t)e->n_tokens * sizeof(int);
     entry_free(e, &c->alloc);
     // Shift remaining entries down
     for (int i = 1; i < c->n_entries; i++)
@@ -126,10 +128,24 @@ int bn_prompt_cache_store(BnPromptCache *cache, const BnModel *model,
 
     int n_attn = config_n_attn(cfg);
     int kv_dim = cfg->kv_dim;
-    size_t elem_size = cfg->kv_f16 ? sizeof(uint16_t) : sizeof(float);
-    size_t kv_bytes = (size_t)n_attn * (size_t)n_tokens * (size_t)kv_dim * elem_size;
+    int tq_bits = cfg->kv_tq_bits;
+
+    // Compute per-cache byte sizes
+    size_t key_bytes, val_bytes;
+    if (tq_bits > 0 && model->tq_state) {
+        // TQ path: packed bytes per head, n_kv_heads heads per position
+        int kb = bn_tq_key_bytes(model->tq_state);
+        int vb = bn_tq_value_bytes(model->tq_state);
+        key_bytes = (size_t)n_attn * (size_t)n_tokens * (size_t)cfg->n_kv_heads * (size_t)kb;
+        val_bytes = (size_t)n_attn * (size_t)n_tokens * (size_t)cfg->n_kv_heads * (size_t)vb;
+    } else {
+        // FP32/FP16 path
+        size_t elem_size = cfg->kv_f16 ? sizeof(uint16_t) : sizeof(float);
+        key_bytes = (size_t)n_attn * (size_t)n_tokens * (size_t)kv_dim * elem_size;
+        val_bytes = key_bytes;
+    }
     size_t tok_bytes = (size_t)n_tokens * sizeof(int);
-    size_t entry_total = kv_bytes * 2 + tok_bytes;
+    size_t entry_total = key_bytes + val_bytes + tok_bytes;
 
     cache_lock(cache);
 
@@ -145,12 +161,12 @@ int bn_prompt_cache_store(BnPromptCache *cache, const BnModel *model,
 
     // Allocate entry buffers
     int *tok_copy = (int *)bn_malloc(&cache->alloc, tok_bytes);
-    void *kc = bn_malloc(&cache->alloc, kv_bytes);
-    void *vc = bn_malloc(&cache->alloc, kv_bytes);
+    void *kc = bn_malloc(&cache->alloc, key_bytes);
+    void *vc = bn_malloc(&cache->alloc, val_bytes);
     if (!tok_copy || !kc || !vc) {
         if (tok_copy) bn_free(&cache->alloc, tok_copy, tok_bytes);
-        if (kc) bn_free(&cache->alloc, kc, kv_bytes);
-        if (vc) bn_free(&cache->alloc, vc, kv_bytes);
+        if (kc) bn_free(&cache->alloc, kc, key_bytes);
+        if (vc) bn_free(&cache->alloc, vc, val_bytes);
         cache_unlock(cache);
         return -2;
     }
@@ -158,18 +174,40 @@ int bn_prompt_cache_store(BnPromptCache *cache, const BnModel *model,
     // Copy token sequence
     memcpy(tok_copy, tokens, tok_bytes);
 
-    // Copy KV prefix: strided copy from session's [n_attn * seq_len * kv_dim] into
-    // compact [n_attn * n_tokens * kv_dim] layout
-    size_t layer_stride_src = (size_t)cfg->seq_len * kv_dim * elem_size;
-    size_t layer_stride_dst = (size_t)n_tokens * kv_dim * elem_size;
-    const uint8_t *src_k = (const uint8_t *)session->state.key_cache;
-    const uint8_t *src_v = (const uint8_t *)session->state.value_cache;
-    uint8_t *dst_k = (uint8_t *)kc;
-    uint8_t *dst_v = (uint8_t *)vc;
+    if (tq_bits > 0 && model->tq_state) {
+        // TQ path: copy from session's TQ packed caches
+        int kb = bn_tq_key_bytes(model->tq_state);
+        int vb = bn_tq_value_bytes(model->tq_state);
+        size_t pos_stride_k = (size_t)cfg->n_kv_heads * kb;
+        size_t pos_stride_v = (size_t)cfg->n_kv_heads * vb;
+        size_t layer_stride_src_k = (size_t)cfg->seq_len * pos_stride_k;
+        size_t layer_stride_src_v = (size_t)cfg->seq_len * pos_stride_v;
+        size_t layer_stride_dst_k = (size_t)n_tokens * pos_stride_k;
+        size_t layer_stride_dst_v = (size_t)n_tokens * pos_stride_v;
 
-    for (int a = 0; a < n_attn; a++) {
-        memcpy(dst_k + a * layer_stride_dst, src_k + a * layer_stride_src, layer_stride_dst);
-        memcpy(dst_v + a * layer_stride_dst, src_v + a * layer_stride_src, layer_stride_dst);
+        const uint8_t *src_k = session->state.key_cache_tq;
+        const uint8_t *src_v = session->state.value_cache_tq;
+        uint8_t *dst_k = (uint8_t *)kc;
+        uint8_t *dst_v = (uint8_t *)vc;
+
+        for (int a = 0; a < n_attn; a++) {
+            memcpy(dst_k + a * layer_stride_dst_k, src_k + a * layer_stride_src_k, layer_stride_dst_k);
+            memcpy(dst_v + a * layer_stride_dst_v, src_v + a * layer_stride_src_v, layer_stride_dst_v);
+        }
+    } else {
+        // FP32/FP16 path: strided copy from session's [n_attn * seq_len * kv_dim]
+        size_t elem_size = cfg->kv_f16 ? sizeof(uint16_t) : sizeof(float);
+        size_t layer_stride_src = (size_t)cfg->seq_len * kv_dim * elem_size;
+        size_t layer_stride_dst = (size_t)n_tokens * kv_dim * elem_size;
+        const uint8_t *src_k = (const uint8_t *)session->state.key_cache;
+        const uint8_t *src_v = (const uint8_t *)session->state.value_cache;
+        uint8_t *dst_k = (uint8_t *)kc;
+        uint8_t *dst_v = (uint8_t *)vc;
+
+        for (int a = 0; a < n_attn; a++) {
+            memcpy(dst_k + a * layer_stride_dst, src_k + a * layer_stride_src, layer_stride_dst);
+            memcpy(dst_v + a * layer_stride_dst, src_v + a * layer_stride_src, layer_stride_dst);
+        }
     }
 
     // Insert entry
@@ -179,8 +217,10 @@ int bn_prompt_cache_store(BnPromptCache *cache, const BnModel *model,
     e->hash = fnv1a_tokens(tokens, n_tokens);
     e->key_cache = kc;
     e->value_cache = vc;
-    e->kv_bytes = kv_bytes;
+    e->key_cache_bytes = key_bytes;
+    e->val_cache_bytes = val_bytes;
     e->kv_f16 = cfg->kv_f16;
+    e->kv_tq_bits = tq_bits;
     e->n_attn_layers = n_attn;
     e->kv_dim = kv_dim;
     cache->n_entries++;
@@ -201,7 +241,7 @@ int bn_prompt_cache_restore(BnPromptCache *cache, const BnModel *model,
 
     int n_attn = config_n_attn(cfg);
     int kv_dim = cfg->kv_dim;
-    size_t elem_size = cfg->kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    int tq_bits = cfg->kv_tq_bits;
 
     cache_lock(cache);
 
@@ -212,9 +252,10 @@ int bn_prompt_cache_restore(BnPromptCache *cache, const BnModel *model,
     for (int i = 0; i < cache->n_entries; i++) {
         BnPromptCacheEntry *e = &cache->entries[i];
 
-        // Config validation
-        if (e->kv_f16 != cfg->kv_f16 || e->n_attn_layers != n_attn || e->kv_dim != kv_dim)
-            continue;
+        // Config validation: format must match
+        if (e->kv_tq_bits != tq_bits) continue;
+        if (tq_bits == 0 && e->kv_f16 != cfg->kv_f16) continue;
+        if (e->n_attn_layers != n_attn || e->kv_dim != kv_dim) continue;
 
         // Quick reject: entry can't match more than its own length or query length
         int max_match = e->n_tokens < n_tokens ? e->n_tokens : n_tokens;
@@ -244,18 +285,45 @@ int bn_prompt_cache_restore(BnPromptCache *cache, const BnModel *model,
 
     // Copy KV prefix from cache entry into session
     BnPromptCacheEntry *e = &cache->entries[best_idx];
-    size_t layer_stride_src = (size_t)e->n_tokens * kv_dim * elem_size;
-    size_t layer_stride_dst = (size_t)cfg->seq_len * kv_dim * elem_size;
-    size_t copy_per_layer = (size_t)best_len * kv_dim * elem_size;
 
-    uint8_t *dst_k = (uint8_t *)session->state.key_cache;
-    uint8_t *dst_v = (uint8_t *)session->state.value_cache;
-    const uint8_t *src_k = (const uint8_t *)e->key_cache;
-    const uint8_t *src_v = (const uint8_t *)e->value_cache;
+    if (tq_bits > 0 && model->tq_state) {
+        // TQ path: copy packed bytes into session's TQ caches
+        int kb = bn_tq_key_bytes(model->tq_state);
+        int vb = bn_tq_value_bytes(model->tq_state);
+        size_t pos_stride_k = (size_t)cfg->n_kv_heads * kb;
+        size_t pos_stride_v = (size_t)cfg->n_kv_heads * vb;
+        size_t layer_stride_src_k = (size_t)e->n_tokens * pos_stride_k;
+        size_t layer_stride_src_v = (size_t)e->n_tokens * pos_stride_v;
+        size_t layer_stride_dst_k = (size_t)cfg->seq_len * pos_stride_k;
+        size_t layer_stride_dst_v = (size_t)cfg->seq_len * pos_stride_v;
+        size_t copy_per_layer_k = (size_t)best_len * pos_stride_k;
+        size_t copy_per_layer_v = (size_t)best_len * pos_stride_v;
 
-    for (int a = 0; a < n_attn; a++) {
-        memcpy(dst_k + a * layer_stride_dst, src_k + a * layer_stride_src, copy_per_layer);
-        memcpy(dst_v + a * layer_stride_dst, src_v + a * layer_stride_src, copy_per_layer);
+        uint8_t *dst_k = session->state.key_cache_tq;
+        uint8_t *dst_v = session->state.value_cache_tq;
+        const uint8_t *src_k = (const uint8_t *)e->key_cache;
+        const uint8_t *src_v = (const uint8_t *)e->value_cache;
+
+        for (int a = 0; a < n_attn; a++) {
+            memcpy(dst_k + a * layer_stride_dst_k, src_k + a * layer_stride_src_k, copy_per_layer_k);
+            memcpy(dst_v + a * layer_stride_dst_v, src_v + a * layer_stride_src_v, copy_per_layer_v);
+        }
+    } else {
+        // FP32/FP16 path
+        size_t elem_size = cfg->kv_f16 ? sizeof(uint16_t) : sizeof(float);
+        size_t layer_stride_src = (size_t)e->n_tokens * kv_dim * elem_size;
+        size_t layer_stride_dst = (size_t)cfg->seq_len * kv_dim * elem_size;
+        size_t copy_per_layer = (size_t)best_len * kv_dim * elem_size;
+
+        uint8_t *dst_k = (uint8_t *)session->state.key_cache;
+        uint8_t *dst_v = (uint8_t *)session->state.value_cache;
+        const uint8_t *src_k = (const uint8_t *)e->key_cache;
+        const uint8_t *src_v = (const uint8_t *)e->value_cache;
+
+        for (int a = 0; a < n_attn; a++) {
+            memcpy(dst_k + a * layer_stride_dst, src_k + a * layer_stride_src, copy_per_layer);
+            memcpy(dst_v + a * layer_stride_dst, src_v + a * layer_stride_src, copy_per_layer);
+        }
     }
 
     session->pos = best_len;

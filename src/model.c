@@ -1034,8 +1034,8 @@ int bn_model_alloc_session_buffers(const BnConfig *c, const BnWeights *w,
         if (bn_tq_init(&tq_tmp, c->head_size, c->kv_tq_bits, 0) == 0) {
             int key_bytes = bn_tq_key_bytes(&tq_tmp);
             int val_bytes = bn_tq_value_bytes(&tq_tmp);
-            size_t tq_key_total = (size_t)n_attn_layers * c->seq_len * c->n_kv_heads * key_bytes;
-            size_t tq_val_total = (size_t)n_attn_layers * c->seq_len * c->n_kv_heads * val_bytes;
+            size_t tq_key_total = (size_t)n_attn_layers * (size_t)c->seq_len * (size_t)c->n_kv_heads * (size_t)key_bytes;
+            size_t tq_val_total = (size_t)n_attn_layers * (size_t)c->seq_len * (size_t)c->n_kv_heads * (size_t)val_bytes;
             s->key_cache_tq   = (uint8_t *)sh_arena_calloc(arena, tq_key_total, 1);
             s->value_cache_tq = (uint8_t *)sh_arena_calloc(arena, tq_val_total, 1);
             s->q_rotated      = (float *)sh_arena_calloc(arena, c->n_heads * c->head_size, sizeof(float));

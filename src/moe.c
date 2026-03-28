@@ -4,6 +4,7 @@
 #include "quant.h"
 #include "simd_helpers.h"
 #include "sh_log.h"
+#include "bn_alloc.h"
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
@@ -1205,32 +1206,43 @@ int bn_moe_forward_batch(BnModel *m, BnSession *sess, BnLayerWeights *lw, int l,
 
     // 2. Batch routing: route each token individually (reuse existing router)
     // Allocate routing results: [n_tokens][K] indices and weights
-    int *all_indices = (int *)malloc((size_t)n_tokens * K * sizeof(int));
-    float *all_weights = (float *)malloc((size_t)n_tokens * K * sizeof(float));
+    BnAllocator a = bn_allocator_default();
+    size_t sz_idx = (size_t)n_tokens * K * sizeof(int);
+    size_t sz_wts = (size_t)n_tokens * K * sizeof(float);
+    int *all_indices = (int *)bn_malloc(&a, sz_idx);
+    float *all_weights = (float *)bn_malloc(&a, sz_wts);
     if (!all_indices || !all_weights) {
-        free(all_indices); free(all_weights);
+        if (all_indices) bn_free(&a, all_indices, sz_idx);
+        if (all_weights) bn_free(&a, all_weights, sz_wts);
         return -1;
     }
+    memset(all_indices, 0, sz_idx);
+    memset(all_weights, 0, sz_wts);
 
     for (int t = 0; t < n_tokens; t++) {
         bn_moe_route(ms, Xb + (size_t)t * dim, lw->router_weight,
                      dim, n_experts, K, m->pool);
-        memcpy(all_indices + t * K, ms->expert_indices, K * sizeof(int));
-        memcpy(all_weights + t * K, ms->expert_weights, K * sizeof(float));
+        memcpy(all_indices + (size_t)t * K, ms->expert_indices, (size_t)K * sizeof(int));
+        memcpy(all_weights + (size_t)t * K, ms->expert_weights, (size_t)K * sizeof(float));
     }
 
     // 3. Build token-expert grouping (two-pass)
     // Pass 1: count tokens per expert
-    int *expert_counts = (int *)calloc(n_experts, sizeof(int));
-    int *expert_offsets = (int *)malloc(n_experts * sizeof(int));
+    size_t sz_ecnt = (size_t)n_experts * sizeof(int);
+    int *expert_counts = (int *)bn_malloc(&a, sz_ecnt);
+    int *expert_offsets = (int *)bn_malloc(&a, sz_ecnt);
     if (!expert_counts || !expert_offsets) {
-        free(all_indices); free(all_weights); free(expert_counts); free(expert_offsets);
+        if (expert_counts) bn_free(&a, expert_counts, sz_ecnt);
+        if (expert_offsets) bn_free(&a, expert_offsets, sz_ecnt);
+        bn_free(&a, all_indices, sz_idx); bn_free(&a, all_weights, sz_wts);
         return -1;
     }
+    memset(expert_counts, 0, sz_ecnt);
+    memset(expert_offsets, 0, sz_ecnt);
 
     for (int t = 0; t < n_tokens; t++)
         for (int k = 0; k < K; k++) {
-            int eidx = all_indices[t * K + k];
+            int eidx = all_indices[(size_t)t * K + k];
             if (eidx >= 0) expert_counts[eidx]++;
         }
 
@@ -1242,22 +1254,31 @@ int bn_moe_forward_batch(BnModel *m, BnSession *sess, BnLayerWeights *lw, int l,
     }
 
     // Pass 2: fill flat arrays
-    int *group_token_ids = (int *)malloc(total_assignments * sizeof(int));
-    float *group_weights = (float *)malloc(total_assignments * sizeof(float));
-    int *fill_pos = (int *)calloc(n_experts, sizeof(int));  // current fill position per expert
+    size_t sz_gtid = (size_t)total_assignments * sizeof(int);
+    size_t sz_gwts = (size_t)total_assignments * sizeof(float);
+    size_t sz_fill = (size_t)n_experts * sizeof(int);
+    int *group_token_ids = (int *)bn_malloc(&a, sz_gtid);
+    float *group_weights = (float *)bn_malloc(&a, sz_gwts);
+    int *fill_pos = (int *)bn_malloc(&a, sz_fill);
     if (!group_token_ids || !group_weights || !fill_pos) {
-        free(all_indices); free(all_weights); free(expert_counts);
-        free(expert_offsets); free(group_token_ids); free(group_weights); free(fill_pos);
+        if (group_token_ids) bn_free(&a, group_token_ids, sz_gtid);
+        if (group_weights) bn_free(&a, group_weights, sz_gwts);
+        if (fill_pos) bn_free(&a, fill_pos, sz_fill);
+        bn_free(&a, expert_counts, sz_ecnt); bn_free(&a, expert_offsets, sz_ecnt);
+        bn_free(&a, all_indices, sz_idx); bn_free(&a, all_weights, sz_wts);
         return -1;
     }
+    memset(group_token_ids, 0, sz_gtid);
+    memset(group_weights, 0, sz_gwts);
+    memset(fill_pos, 0, sz_fill);
 
     for (int t = 0; t < n_tokens; t++)
         for (int k = 0; k < K; k++) {
-            int eidx = all_indices[t * K + k];
+            int eidx = all_indices[(size_t)t * K + k];
             if (eidx < 0) continue;
             int pos = expert_offsets[eidx] + fill_pos[eidx];
             group_token_ids[pos] = t;
-            group_weights[pos] = all_weights[t * K + k];
+            group_weights[pos] = all_weights[(size_t)t * K + k];
             fill_pos[eidx]++;
         }
 
@@ -1267,20 +1288,32 @@ int bn_moe_forward_batch(BnModel *m, BnSession *sess, BnLayerWeights *lw, int l,
     for (int e = 0; e < n_experts; e++)
         if (expert_counts[e] > T_max) T_max = expert_counts[e];
 
-    float *gather_buf = (float *)malloc((size_t)T_max * dim * sizeof(float));
-    float *gate_buf   = (float *)malloc((size_t)T_max * moe_hidden * sizeof(float));
-    float *up_buf     = (float *)malloc((size_t)T_max * moe_hidden * sizeof(float));
-    float *down_buf   = (float *)malloc((size_t)T_max * dim * sizeof(float));
-    float *moe_out    = (float *)calloc((size_t)n_tokens * dim, sizeof(float));
-    int8_t *x_q_scratch = (int8_t *)malloc((size_t)T_max *
-        (size_t)(dim > moe_hidden ? dim : moe_hidden));
+    size_t sz_gather = (size_t)T_max * dim * sizeof(float);
+    size_t sz_gate   = (size_t)T_max * moe_hidden * sizeof(float);
+    size_t sz_up     = sz_gate;
+    size_t sz_down   = sz_gather;
+    size_t sz_mout   = (size_t)n_tokens * dim * sizeof(float);
+    size_t sz_xq     = (size_t)T_max * (size_t)(dim > moe_hidden ? dim : moe_hidden);
+    float *gather_buf   = (float *)bn_malloc(&a, sz_gather);
+    float *gate_buf     = (float *)bn_malloc(&a, sz_gate);
+    float *up_buf       = (float *)bn_malloc(&a, sz_up);
+    float *down_buf     = (float *)bn_malloc(&a, sz_down);
+    float *moe_out      = (float *)bn_malloc(&a, sz_mout);
+    int8_t *x_q_scratch = (int8_t *)bn_malloc(&a, sz_xq);
     if (!gather_buf || !gate_buf || !up_buf || !down_buf || !moe_out || !x_q_scratch) {
-        free(gather_buf); free(gate_buf); free(up_buf); free(down_buf);
-        free(moe_out); free(x_q_scratch);
-        free(all_indices); free(all_weights); free(expert_counts);
-        free(expert_offsets); free(group_token_ids); free(group_weights); free(fill_pos);
+        if (gather_buf) bn_free(&a, gather_buf, sz_gather);
+        if (gate_buf) bn_free(&a, gate_buf, sz_gate);
+        if (up_buf) bn_free(&a, up_buf, sz_up);
+        if (down_buf) bn_free(&a, down_buf, sz_down);
+        if (moe_out) bn_free(&a, moe_out, sz_mout);
+        if (x_q_scratch) bn_free(&a, x_q_scratch, sz_xq);
+        bn_free(&a, group_token_ids, sz_gtid); bn_free(&a, group_weights, sz_gwts);
+        bn_free(&a, fill_pos, sz_fill); bn_free(&a, expert_counts, sz_ecnt);
+        bn_free(&a, expert_offsets, sz_ecnt);
+        bn_free(&a, all_indices, sz_idx); bn_free(&a, all_weights, sz_wts);
         return -1;
     }
+    memset(moe_out, 0, sz_mout);
 
     // 5. Per-expert batch compute
     for (int e = 0; e < n_experts; e++) {
@@ -1358,9 +1391,11 @@ int bn_moe_forward_batch(BnModel *m, BnSession *sess, BnLayerWeights *lw, int l,
         // If shared_hidden > moe_hidden * T_max, we'd need bigger buffers.
         // For safety, allocate if needed.
         int need_sh = (size_t)n_tokens * shared_hidden > (size_t)T_max * moe_hidden;
-        float *sh_g = need_sh ? (float *)malloc((size_t)n_tokens * shared_hidden * sizeof(float)) : sh_gate;
-        float *sh_u = need_sh ? (float *)malloc((size_t)n_tokens * shared_hidden * sizeof(float)) : sh_up;
-        float *sh_d = need_sh ? (float *)malloc((size_t)n_tokens * dim * sizeof(float)) : sh_down;
+        size_t sz_shg = (size_t)n_tokens * shared_hidden * sizeof(float);
+        size_t sz_shd = (size_t)n_tokens * dim * sizeof(float);
+        float *sh_g = need_sh ? (float *)bn_malloc(&a, sz_shg) : sh_gate;
+        float *sh_u = need_sh ? (float *)bn_malloc(&a, sz_shg) : sh_up;
+        float *sh_d = need_sh ? (float *)bn_malloc(&a, sz_shd) : sh_down;
 
         if (sh_g && sh_u && sh_d) {
             bn_quant_matmul(sh_g, &lw->shared_gate, Xb, n_tokens, x_q_scratch, m->pool);
@@ -1393,7 +1428,11 @@ int bn_moe_forward_batch(BnModel *m, BnSession *sess, BnLayerWeights *lw, int l,
             SH_LOG_ERROR("Failed to allocate shared expert batch buffers");
         }
 
-        if (need_sh) { free(sh_g); free(sh_u); free(sh_d); }
+        if (need_sh) {
+            if (sh_g) bn_free(&a, sh_g, sz_shg);
+            if (sh_u) bn_free(&a, sh_u, sz_shg);
+            if (sh_d) bn_free(&a, sh_d, sz_shd);
+        }
     }
 
     // 7. Residual add: act += moe_out
@@ -1402,10 +1441,13 @@ int bn_moe_forward_batch(BnModel *m, BnSession *sess, BnLayerWeights *lw, int l,
             act[(size_t)t * dim + d] += moe_out[(size_t)t * dim + d];
 
     // Cleanup
-    free(gather_buf); free(gate_buf); free(up_buf); free(down_buf);
-    free(moe_out); free(x_q_scratch);
-    free(all_indices); free(all_weights); free(expert_counts);
-    free(expert_offsets); free(group_token_ids); free(group_weights); free(fill_pos);
+    bn_free(&a, gather_buf, sz_gather); bn_free(&a, gate_buf, sz_gate);
+    bn_free(&a, up_buf, sz_up); bn_free(&a, down_buf, sz_down);
+    bn_free(&a, moe_out, sz_mout); bn_free(&a, x_q_scratch, sz_xq);
+    bn_free(&a, all_indices, sz_idx); bn_free(&a, all_weights, sz_wts);
+    bn_free(&a, expert_counts, sz_ecnt); bn_free(&a, expert_offsets, sz_ecnt);
+    bn_free(&a, group_token_ids, sz_gtid); bn_free(&a, group_weights, sz_gwts);
+    bn_free(&a, fill_pos, sz_fill);
 
     return 0;
 }

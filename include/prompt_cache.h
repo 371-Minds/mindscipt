@@ -14,10 +14,12 @@ typedef struct {
     int *tokens;            // [n_tokens] token IDs (owned)
     int n_tokens;           // number of cached prefix tokens
     uint64_t hash;          // FNV-1a hash for fast reject
-    void *key_cache;        // [n_attn_layers * n_tokens * kv_dim] compact KV data
-    void *value_cache;      // same layout
-    size_t kv_bytes;        // bytes per cache (key or value)
-    int kv_f16;             // FP16 or FP32
+    void *key_cache;        // compact KV key data (FP32/FP16 or TQ packed)
+    void *value_cache;      // compact KV value data (FP32/FP16 or TQ packed)
+    size_t key_cache_bytes; // total bytes for key_cache
+    size_t val_cache_bytes; // total bytes for value_cache
+    int kv_f16;             // FP16 or FP32 (ignored when kv_tq_bits > 0)
+    int kv_tq_bits;         // TurboQuant bits (0=disabled, 2-4=bits)
     int n_attn_layers;      // for config validation
     int kv_dim;             // for config validation
 } BnPromptCacheEntry;
@@ -28,7 +30,7 @@ typedef struct {
     BnPromptCacheEntry entries[BN_PROMPT_CACHE_MAX_ENTRIES];
     int n_entries;
     size_t max_bytes;       // eviction threshold (0 = no limit)
-    size_t used_bytes;      // sum of all entries' kv_bytes * 2 + token bytes
+    size_t used_bytes;      // sum of all entries' key_cache_bytes + val_cache_bytes + token bytes
     BnAllocator alloc;      // allocator for entry buffers
 #if !defined(__EMSCRIPTEN__)
     void *mtx;              // pthread_mutex_t* (opaque, NULL on single-threaded)

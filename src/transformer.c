@@ -491,8 +491,6 @@ static int forward_single_layer(BnModel *m, BnSession *sess, int l, int pos, int
         int attn_kquant = (lw->wq.type == BN_GGUF_TENSOR_Q4_K ||
                            lw->wq.type == BN_GGUF_TENSOR_Q6_K) &&
                           !m->gpu && dim % BN_QK_K == 0;
-#else
-        int attn_kquant = 0;
 #endif
         int n_sb_attn = dim / BN_QK_K;
         float attn_q8k_d[n_sb_attn > 0 ? n_sb_attn : 1];
