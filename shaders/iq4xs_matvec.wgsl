@@ -15,6 +15,10 @@ struct Uniforms {
     cols: u32,
     n_tokens: u32,
     extra: u32,
+    out_offset: u32,
+    _pad5: u32,
+    _pad6: u32,
+    _pad7: u32,
 }
 
 @group(0) @binding(0) var<storage, read> weights: array<u32>;
@@ -124,6 +128,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     workgroupBarrier();
 
     if (local_elem == 0u && global_row < uniforms.rows) {
-        out[token * uniforms.rows + global_row] = reduce_buf[row_base];
+        out[uniforms.out_offset + token * uniforms.rows + global_row] = reduce_buf[row_base];
     }
 }

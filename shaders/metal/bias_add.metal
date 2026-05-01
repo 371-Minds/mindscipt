@@ -9,6 +9,7 @@ kernel void bias_add(device float       *x    [[buffer(0)]],
                      uint3 wid [[threadgroup_position_in_grid]],
                      uint3 lid [[thread_position_in_threadgroup]]) {
     uint gid = wid.x * 256 + lid.x;
+    uint input_offset = p[1];
     if (gid >= p[0]) return;
-    x[gid] += bias[gid];
+    x[input_offset + gid] += bias[gid];
 }

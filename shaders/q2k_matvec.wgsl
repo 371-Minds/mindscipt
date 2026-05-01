@@ -11,7 +11,16 @@ const ELEMS_PER_THREAD: u32 = 256u / THREADS_PER_ROW;
 const QK_K: u32 = 256u;
 const BLOCK_BYTES: u32 = 84u;
 
-struct Uniforms { rows: u32, cols: u32, n_tokens: u32, extra: u32 }
+struct Uniforms {
+    rows: u32,
+    cols: u32,
+    n_tokens: u32,
+    extra: u32,
+    out_offset: u32,
+    _pad5: u32,
+    _pad6: u32,
+    _pad7: u32,
+}
 
 @group(0) @binding(0) var<storage, read> weights: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -112,6 +121,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     workgroupBarrier();
 
     if (local_elem == 0u && global_row < u.rows) {
-        out[token * u.rows + global_row] = reduce_buf[row_base];
+        out[u.out_offset + token * u.rows + global_row] = reduce_buf[row_base];
     }
 }

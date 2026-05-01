@@ -19,12 +19,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let head_size = u.p1;
     let pos = u.p2;
     let rope_dims = u.p3;
+    let input_offset = u.p4;
 
     if (h >= n_heads) {
         return;
     }
 
-    let base = h * head_size;
+    let base = input_offset + h * head_size;
     let half_rope = rope_dims / 2u;
 
     // Each thread handles pairs at stride 256

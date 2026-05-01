@@ -14,7 +14,8 @@ kernel void per_head_rmsnorm(device float       *x      [[buffer(0)]],
     uint hs = p[0];
     float eps = as_type<float>(p[1]);
     uint per_head = p[2];
-    uint x_base = head * hs;
+    uint input_offset = p[3];
+    uint x_base = input_offset + head * hs;
     uint w_base = (per_head != 0) ? head * hs : 0;
     uint simd_id = tid / 32;
     uint simd_lane = tid % 32;

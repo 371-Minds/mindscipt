@@ -14,10 +14,11 @@ kernel void rope(device float       *vec   [[buffer(0)]],
     uint head_size = p[1];
     uint pos = p[2];
     uint rope_dims = p[3];
+    uint input_offset = p[4];
 
     if (h >= n_heads) return;
 
-    uint base = h * head_size;
+    uint base = input_offset + h * head_size;
     uint half_rope = rope_dims / 2;
 
     for (uint i = tid; i < half_rope; i += 256) {

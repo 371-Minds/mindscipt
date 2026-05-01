@@ -18,10 +18,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
     let gid = wid.x * 256u + lid.x;
     let dim = u.p0;
+    let input_offset = u.p1;
 
     if (gid >= dim) {
         return;
     }
 
-    x[gid] += bias[gid];
+    x[input_offset + gid] += bias[gid];
 }

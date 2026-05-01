@@ -12,6 +12,7 @@ kernel void q4_1_matvec(device const uchar *weights [[buffer(0)]],
                         uint3 wid [[threadgroup_position_in_grid]],
                         uint3 lid [[thread_position_in_threadgroup]]) {
     uint rows = p[0], cols = p[1], extra = p[3];
+    uint out_offset = p[5];
     uint tile_start = (extra > 0) ? (wid.x + wid.y * extra) * TILE_ROWS : wid.x * TILE_ROWS;
     uint token = (extra > 0) ? 0 : wid.y;
     uint tid = lid.x;
@@ -47,5 +48,5 @@ kernel void q4_1_matvec(device const uchar *weights [[buffer(0)]],
     val += simd_shuffle_xor(val, 1);
 
     if (local_elem == 0 && global_row < rows)
-        out[token * rows + global_row] = val;
+        out[out_offset + token * rows + global_row] = val;
 }

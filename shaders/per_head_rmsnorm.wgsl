@@ -23,7 +23,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let hs = u.p0;
     let eps = bitcast<f32>(u.p1);
     let per_head = u.p2;
-    let x_base = head * hs;
+    let input_offset = u.p3;
+    let x_base = input_offset + head * hs;
     let w_base = select(0u, head * hs, per_head != 0u);
 
     // Accumulate sum of squares
