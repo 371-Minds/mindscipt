@@ -16,6 +16,8 @@
 #include <string.h>
 #include <math.h>
 
+#define BENCH_MS_PER_SECOND 1000.0
+
 static const char *type_name(int type) {
     switch (type) {
         case BN_GGUF_TENSOR_F32:     return "F32";
@@ -271,7 +273,9 @@ static void bench_tq_suite(int n_iters, int n_heads, int head_dim, int ctx_len, 
     float *out = calloc((size_t)head_dim, sizeof(float));
     uint8_t *q_signs = calloc((size_t)head_dim / 8, 1);
     float *q_rot = calloc((size_t)head_dim, sizeof(float));
-    if (!query || !key || !value || !packed_keys || !packed_vals || !weights || !scores || !out || !q_signs || !q_rot) {
+    int alloc_ok = query && key && value && packed_keys && packed_vals &&
+                   weights && scores && out && q_signs && q_rot;
+    if (!alloc_ok) {
         fprintf(stderr, "Failed to allocate TurboQuant benchmark buffers\n");
         goto cleanup;
     }
@@ -320,7 +324,7 @@ static void bench_tq_suite(int n_iters, int n_heads, int head_dim, int ctx_len, 
             bn_tq_attention_combine_head(&tq, h, packed_vals, ctx_len, vb, weights, out, 0);
         double combine_ms = bn_platform_time_ms() - t0;
 
-        double tok_s = (double)n_iters / ((score_ms + combine_ms) / 1000.0);
+        double tok_s = (double)n_iters / ((score_ms + combine_ms) / BENCH_MS_PER_SECOND);
         printf("%-6d | %9.2f | %9.2f | %9.2f | %9.2f | %9.1f\n",
                h,
                (key_ms * 1000.0) / ((double)n_iters * ctx_len),

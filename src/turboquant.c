@@ -4,6 +4,14 @@
 #include <math.h>
 
 #define TQ_HEADER_BYTES 2
+#define TQ_OUTLIER_CLIP_FACTOR 2.0f
+#define TQ_CONSERVATIVE_CLIP_FACTOR 1.5f
+#define TQ_CALIBRATED_QJL_WEIGHT 0.85f
+#define TQ_CONSERVATIVE_ERROR_THRESHOLD 0.35f
+#define TQ_OUTLIER_RATIO_THRESHOLD 0.12f
+#define TQ_OUTLIER_VARIANCE_THRESHOLD 3.5f
+#define TQ_CALIBRATED_ERROR_THRESHOLD 0.15f
+#define TQ_EPSILON 1e-6f
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -12,6 +20,12 @@ static inline float tq_neon_hsum(float32x4_t v) {
     return vget_lane_f32(vpadd_f32(r, r), 0);
 }
 #endif
+
+static const BnTQHeadRuntime tq_default_runtime = {
+    .strategy = BN_TQ_STRATEGY_BASELINE,
+    .clip_threshold = 0.0f,
+    .qjl_weight = 1.0f,
+};
 
 // --- xoshiro256** PRNG (deterministic, seeded, thread-safe via local state) ---
 
@@ -179,7 +193,6 @@ static void rht_inverse(const BnTQState *st, const float *in, float *out, int d)
 // Precondition: d % 8 == 0 (enforced by bn_tq_init).
 static void qjl_project_signs(const BnTQState *st, const float *in, uint8_t *out_signs, int d) {
     float tmp[d];
-    size_t sign_bytes = (size_t)d / 8;
 #ifdef __ARM_NEON
     tq_apply_signs_neon(st->qjl_signs, in, tmp, d);
 #else
@@ -187,7 +200,7 @@ static void qjl_project_signs(const BnTQState *st, const float *in, uint8_t *out
         tmp[i] = st->qjl_signs[i] * in[i];
 #endif
     fwht_inplace(tmp, d);
-    memset(out_signs, 0, sign_bytes);
+    memset(out_signs, 0, (size_t)d / 8);
     for (int i = 0; i < d; i++)
         if (tmp[i] >= 0.0f)
             out_signs[i / 8] |= (1 << (i % 8));
@@ -292,13 +305,8 @@ static int index_bytes(int d, int bits) {
 }
 
 static inline const BnTQHeadRuntime *tq_runtime_head(const BnTQState *st, int head_idx) {
-    static const BnTQHeadRuntime fallback = {
-        .strategy = BN_TQ_STRATEGY_BASELINE,
-        .clip_threshold = 0.0f,
-        .qjl_weight = 1.0f,
-    };
     if (!st || !st->head_runtime || st->n_heads <= 0)
-        return &fallback;
+        return &tq_default_runtime;
     if (head_idx < 0) head_idx = 0;
     if (head_idx >= st->n_heads) head_idx = st->n_heads - 1;
     return &st->head_runtime[head_idx];
@@ -482,9 +490,7 @@ int bn_tq_configure_heads(BnTQState *state, int n_heads) {
     }
 
     for (int i = 0; i < n_heads; i++) {
-        run[i].strategy = BN_TQ_STRATEGY_BASELINE;
-        run[i].clip_threshold = 0.0f;
-        run[i].qjl_weight = 1.0f;
+        run[i] = tq_default_runtime;
     }
 
     free(state->head_calibration);
@@ -527,16 +533,16 @@ int bn_tq_set_head_strategy(BnTQState *state, int head_idx, BnTQStrategy strateg
             break;
         case BN_TQ_STRATEGY_CALIBRATED:
             rt->clip_threshold = 0.0f;
-            rt->qjl_weight = 0.9f;
+            rt->qjl_weight = TQ_CALIBRATED_QJL_WEIGHT;
             break;
         case BN_TQ_STRATEGY_OUTLIER:
             if (rt->clip_threshold <= 0.0f)
-                rt->clip_threshold = 2.0f * state->rht_scale;
+                rt->clip_threshold = TQ_OUTLIER_CLIP_FACTOR * state->rht_scale;
             rt->qjl_weight = 1.0f;
             break;
         case BN_TQ_STRATEGY_CONSERVATIVE:
             if (rt->clip_threshold <= 0.0f)
-                rt->clip_threshold = 1.5f * state->rht_scale;
+                rt->clip_threshold = TQ_CONSERVATIVE_CLIP_FACTOR * state->rht_scale;
             rt->qjl_weight = 0.0f;
             break;
         default:
@@ -776,7 +782,8 @@ void bn_tq_attention_combine_head(const BnTQState *st, int head_idx,
 
         // Read vec_norm
         uint16_t vec_norm_fp16;
-        memcpy(&vec_norm_fp16, pv + TQ_HEADER_BYTES + idx_sz, 2);
+        size_t norm_off = (size_t)TQ_HEADER_BYTES + (size_t)idx_sz;
+        memcpy(&vec_norm_fp16, pv + norm_off, 2);
         float val_norm = tq_fp16_to_fp32(vec_norm_fp16);
 
         // Build rotated vector from centroids, then inverse-rotate
@@ -925,7 +932,7 @@ int bn_tq_calibrate_head(BnTQState *state, int head_idx,
 
     int d = state->head_dim;
     int key_bytes = bn_tq_key_bytes(state);
-    float threshold = 2.0f * state->rht_scale;
+    float threshold = TQ_OUTLIER_CLIP_FACTOR * state->rht_scale;
     float q_rot[d];
     float k_rot[d];
     float *exact_scores = (float *)malloc((size_t)n_samples * sizeof(float));
@@ -959,7 +966,7 @@ int bn_tq_calibrate_head(BnTQState *state, int head_idx,
             mean_abs += a;
             if (a > threshold) outliers += 1.0f;
         }
-        cal->variance_ratio_sum += max_abs / (mean_abs / (float)d + 1e-6f);
+        cal->variance_ratio_sum += max_abs / (mean_abs / (float)d + TQ_EPSILON);
         cal->outlier_ratio_sum += outliers / (float)d;
         cal->residual_norm_sum += fabsf(sqrtf(kn) - sqrtf(vn));
         exact_scores[i] = 0.0f;
@@ -970,7 +977,7 @@ int bn_tq_calibrate_head(BnTQState *state, int head_idx,
     bn_tq_attention_scores(state, q_rot, packed_keys, n_samples, key_bytes, approx_scores);
     int best_exact = 0, best_approx = 0;
     for (int i = 0; i < n_samples; i++) {
-        float denom = fabsf(exact_scores[i]) + 1e-5f;
+        float denom = fabsf(exact_scores[i]) + TQ_EPSILON;
         cal->score_error_sum += fabsf(exact_scores[i] - approx_scores[i]) / denom;
         if (exact_scores[i] > exact_scores[best_exact]) best_exact = i;
         if (approx_scores[i] > approx_scores[best_approx]) best_approx = i;
@@ -981,18 +988,18 @@ int bn_tq_calibrate_head(BnTQState *state, int head_idx,
     float variance_ratio = cal->variance_ratio_sum / (float)n_samples;
     float outlier_ratio = cal->outlier_ratio_sum / (float)n_samples;
     float score_error = cal->score_error_sum / (float)n_samples;
-    if (score_error > 0.35f) {
+    if (score_error > TQ_CONSERVATIVE_ERROR_THRESHOLD) {
         rt->strategy = BN_TQ_STRATEGY_CONSERVATIVE;
-        rt->clip_threshold = 1.5f * state->rht_scale;
+        rt->clip_threshold = TQ_CONSERVATIVE_CLIP_FACTOR * state->rht_scale;
         rt->qjl_weight = 0.0f;
-    } else if (outlier_ratio > 0.12f || variance_ratio > 3.5f) {
+    } else if (outlier_ratio > TQ_OUTLIER_RATIO_THRESHOLD || variance_ratio > TQ_OUTLIER_VARIANCE_THRESHOLD) {
         rt->strategy = BN_TQ_STRATEGY_OUTLIER;
-        rt->clip_threshold = 2.0f * state->rht_scale;
+        rt->clip_threshold = TQ_OUTLIER_CLIP_FACTOR * state->rht_scale;
         rt->qjl_weight = 1.0f;
-    } else if (score_error > 0.15f) {
+    } else if (score_error > TQ_CALIBRATED_ERROR_THRESHOLD) {
         rt->strategy = BN_TQ_STRATEGY_CALIBRATED;
         rt->clip_threshold = 0.0f;
-        rt->qjl_weight = 0.85f;
+        rt->qjl_weight = TQ_CALIBRATED_QJL_WEIGHT;
     } else {
         rt->strategy = BN_TQ_STRATEGY_BASELINE;
         rt->clip_threshold = 0.0f;

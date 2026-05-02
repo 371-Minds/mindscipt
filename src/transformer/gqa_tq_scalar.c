@@ -23,6 +23,8 @@ void bn_transformer_gqa_tq_scalar_range(void *ctx, int h_start, int h_end) {
         float *q_h = s->q + h * head_size;
         float *att = s->att + h * seq_len;
         int kv_h = h / kv_mul;
+        // Reuse the session scratch buffer so the TQ path avoids per-head stack VLAs
+        // in the decode hot path and matches the lifetime of other attention scratch data.
         float *q_rot = s->q_rotated + h * head_size;
 
         // Step 1: Rotate query for this head
