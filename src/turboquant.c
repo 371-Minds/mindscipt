@@ -356,8 +356,9 @@ static inline float tq_qjl_weight_for_strategy(uint8_t strategy) {
             return 0.0f;
         case BN_TQ_STRATEGY_BASELINE:
         case BN_TQ_STRATEGY_OUTLIER:
-        default:
             return 1.0f;
+        default:
+            return 0.0f;
     }
 }
 
