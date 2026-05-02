@@ -348,6 +348,10 @@ static inline int tq_respects_qjl(uint8_t strategy) {
     return strategy != BN_TQ_STRATEGY_CONSERVATIVE;
 }
 
+static inline int tq_strategy_valid(uint8_t strategy) {
+    return strategy < BN_TQ_STRATEGY_COUNT;
+}
+
 static inline float tq_qjl_weight_for_strategy(uint8_t strategy) {
     switch (strategy) {
         case BN_TQ_STRATEGY_CALIBRATED:
@@ -691,6 +695,11 @@ void bn_tq_attention_scores(const BnTQState *st, const float *rotated_q,
             scores_out[k] = 0.0f;
             continue;
         }
+        uint8_t strategy = tq_read_strategy(pk);
+        if (!tq_strategy_valid(strategy)) {
+            scores_out[k] = 0.0f;
+            continue;
+        }
 
         // Unpack indices
         unpack_indices(pk + TQ_HEADER_BYTES, d, st->bits, indices);
@@ -723,7 +732,7 @@ void bn_tq_attention_scores(const BnTQState *st, const float *rotated_q,
         // QJL correction: XNOR popcount between q_signs and key qjl_signs
         const uint8_t *key_signs = pk + TQ_HEADER_BYTES + idx_sz;
         int agree = 0;
-        float qjl_weight = tq_qjl_weight_for_strategy(tq_read_strategy(pk));
+        float qjl_weight = tq_qjl_weight_for_strategy(strategy);
 #ifdef __ARM_NEON
         if (qjl_weight != 0.0f) {
             int b = 0;
@@ -848,6 +857,7 @@ float bn_tq_score_key_precomputed_head(const BnTQState *st, int head_idx, const 
     int qjl_sz = d / 8;
     if (tq_read_version(packed_key) != BN_TQ_FORMAT_VERSION) return 0.0f;
     uint8_t strategy = tq_read_strategy(packed_key);
+    if (!tq_strategy_valid(strategy)) return 0.0f;
     float qjl_weight = tq_qjl_weight_for_strategy(strategy);
 
     int indices[d];
