@@ -348,6 +348,19 @@ static inline int tq_respects_qjl(uint8_t strategy) {
     return strategy != BN_TQ_STRATEGY_CONSERVATIVE;
 }
 
+static inline float tq_qjl_weight_for_strategy(uint8_t strategy) {
+    switch (strategy) {
+        case BN_TQ_STRATEGY_CALIBRATED:
+            return TQ_CALIBRATED_QJL_WEIGHT;
+        case BN_TQ_STRATEGY_CONSERVATIVE:
+            return 0.0f;
+        case BN_TQ_STRATEGY_BASELINE:
+        case BN_TQ_STRATEGY_OUTLIER:
+        default:
+            return 1.0f;
+    }
+}
+
 static void tq_write_header(const BnTQState *st, uint8_t strategy, uint8_t *out) {
     out[0] = st ? st->format_version : BN_TQ_FORMAT_VERSION;
     out[1] = strategy;
@@ -526,24 +539,21 @@ int bn_tq_set_head_strategy(BnTQState *state, int head_idx, BnTQStrategy strateg
     rt = tq_runtime_head_mut(state, head_idx);
     if (!rt) return -1;
     rt->strategy = (uint8_t)strategy;
+    rt->qjl_weight = tq_qjl_weight_for_strategy((uint8_t)strategy);
     switch (strategy) {
         case BN_TQ_STRATEGY_BASELINE:
             rt->clip_threshold = 0.0f;
-            rt->qjl_weight = 1.0f;
             break;
         case BN_TQ_STRATEGY_CALIBRATED:
             rt->clip_threshold = 0.0f;
-            rt->qjl_weight = TQ_CALIBRATED_QJL_WEIGHT;
             break;
         case BN_TQ_STRATEGY_OUTLIER:
             if (rt->clip_threshold <= 0.0f)
                 rt->clip_threshold = TQ_OUTLIER_CLIP_FACTOR * state->rht_scale;
-            rt->qjl_weight = 1.0f;
             break;
         case BN_TQ_STRATEGY_CONSERVATIVE:
             if (rt->clip_threshold <= 0.0f)
                 rt->clip_threshold = TQ_CONSERVATIVE_CLIP_FACTOR * state->rht_scale;
-            rt->qjl_weight = 0.0f;
             break;
         default:
             return -1;
@@ -712,7 +722,7 @@ void bn_tq_attention_scores(const BnTQState *st, const float *rotated_q,
         // QJL correction: XNOR popcount between q_signs and key qjl_signs
         const uint8_t *key_signs = pk + TQ_HEADER_BYTES + idx_sz;
         int agree = 0;
-        float qjl_weight = tq_respects_qjl(tq_read_strategy(pk)) ? 1.0f : 0.0f;
+        float qjl_weight = tq_qjl_weight_for_strategy(tq_read_strategy(pk));
 #ifdef __ARM_NEON
         if (qjl_weight != 0.0f) {
             int b = 0;
@@ -822,26 +832,22 @@ void bn_tq_qjl_precompute(const BnTQState *st, const float *rotated_q,
 
 void bn_tq_qjl_precompute_head(const BnTQState *st, int head_idx,
                                const float *rotated_q, uint8_t *q_signs_out) {
-    const BnTQHeadRuntime *rt;
     if (!st || !rotated_q || !q_signs_out) return;
-    rt = tq_runtime_head(st, head_idx);
-    if (!tq_respects_qjl(rt->strategy)) {
-        memset(q_signs_out, 0, (size_t)st->head_dim / 8);
-        return;
-    }
+    (void)head_idx;
     qjl_project_signs(st, rotated_q, q_signs_out, st->head_dim);
 }
 
 float bn_tq_score_key_precomputed_head(const BnTQState *st, int head_idx, const float *rotated_q,
                                        const uint8_t *q_signs, const uint8_t *packed_key) {
-    const BnTQHeadRuntime *rt;
     if (!st) return 0.0f;
-    rt = tq_runtime_head(st, head_idx);
+    (void)head_idx;
     int d = st->head_dim;
     if (d <= 0 || d > BN_MAX_VLA_ELEMS) return 0.0f;
     int idx_sz = index_bytes(d, st->bits);
     int qjl_sz = d / 8;
     if (tq_read_version(packed_key) != BN_TQ_FORMAT_VERSION) return 0.0f;
+    uint8_t strategy = tq_read_strategy(packed_key);
+    float qjl_weight = tq_qjl_weight_for_strategy(strategy);
 
     int indices[d];
     unpack_indices(packed_key + TQ_HEADER_BYTES, d, st->bits, indices);
@@ -874,7 +880,7 @@ float bn_tq_score_key_precomputed_head(const BnTQState *st, int head_idx, const 
     const uint8_t *key_signs = packed_key + TQ_HEADER_BYTES + idx_sz;
     int agree = 0;
 #ifdef __ARM_NEON
-    if (tq_respects_qjl(rt->strategy)) {
+    if (qjl_weight != 0.0f) {
         int b = 0;
         for (; b + 16 <= qjl_sz; b += 16) {
             uint8x16_t xnor = vmvnq_u8(veorq_u8(vld1q_u8(q_signs + b),
@@ -895,7 +901,7 @@ float bn_tq_score_key_precomputed_head(const BnTQState *st, int head_idx, const 
         }
     }
 #else
-    if (tq_respects_qjl(rt->strategy)) {
+    if (qjl_weight != 0.0f) {
         for (int b = 0; b < qjl_sz; b++) {
             uint8_t xnor = ~(q_signs[b] ^ key_signs[b]);
             uint8_t v = xnor;
@@ -908,7 +914,7 @@ float bn_tq_score_key_precomputed_head(const BnTQState *st, int head_idx, const 
 #endif
 
     float qjl_scale = sqrtf(3.14159265f / 2.0f) / (float)d;
-    float qjl_correction = rt->qjl_weight * (float)(2 * agree - d) * res_norm * qjl_scale;
+    float qjl_correction = qjl_weight * (float)(2 * agree - d) * res_norm * qjl_scale;
     return vec_norm * (centroid_dot + qjl_correction);
 }
 

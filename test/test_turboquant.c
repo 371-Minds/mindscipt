@@ -282,6 +282,54 @@ static void test_calibration_selects_strategy(void) {
     printf(" PASS\n");
 }
 
+static void test_precompute_and_scoring_use_packed_strategy(void) {
+    printf("test_precompute_and_scoring_use_packed_strategy...");
+    BnTQState st;
+    assert(bn_tq_init(&st, 128, 3, 42) == 0);
+    assert(bn_tq_configure_heads(&st, 1) == 0);
+
+    float query[128];
+    float key[128];
+    for (int i = 0; i < 128; i++) {
+        query[i] = test_randn() * 0.1f;
+        key[i] = test_randn() * 0.1f;
+    }
+
+    int key_bytes = bn_tq_key_bytes(&st);
+    uint8_t packed_keys[2 * key_bytes];
+    uint8_t *packed_calibrated = packed_keys;
+    uint8_t *packed_conservative = packed_keys + key_bytes;
+
+    assert(bn_tq_set_head_strategy(&st, 0, BN_TQ_STRATEGY_CALIBRATED) == 0);
+    bn_tq_quantize_key_head(&st, 0, key, packed_calibrated);
+    assert(bn_tq_set_head_strategy(&st, 0, BN_TQ_STRATEGY_CONSERVATIVE) == 0);
+    bn_tq_quantize_key_head(&st, 0, key, packed_conservative);
+
+    float rotated_q[128];
+    bn_tq_rotate_query_head(&st, 0, query, rotated_q);
+
+    uint8_t q_signs_conservative[128 / 8];
+    uint8_t q_signs_baseline[128 / 8];
+    bn_tq_qjl_precompute_head(&st, 0, rotated_q, q_signs_conservative);
+    assert(bn_tq_set_head_strategy(&st, 0, BN_TQ_STRATEGY_BASELINE) == 0);
+    bn_tq_qjl_precompute_head(&st, 0, rotated_q, q_signs_baseline);
+    assert(memcmp(q_signs_conservative, q_signs_baseline, sizeof(q_signs_baseline)) == 0);
+
+    float scores[2];
+    bn_tq_attention_scores(&st, rotated_q, packed_keys, 2, key_bytes, scores);
+    float precomputed_calibrated =
+        bn_tq_score_key_precomputed_head(&st, 0, rotated_q, q_signs_baseline, packed_calibrated);
+    float precomputed_conservative =
+        bn_tq_score_key_precomputed_head(&st, 0, rotated_q, q_signs_baseline, packed_conservative);
+
+    assert(fabsf(scores[0] - precomputed_calibrated) < 1e-6f);
+    assert(fabsf(scores[1] - precomputed_conservative) < 1e-6f);
+    assert(fabsf(scores[0] - scores[1]) > 1e-6f);
+
+    bn_tq_free(&st);
+    printf(" PASS\n");
+}
+
 static void test_attention_combine_accumulate(void) {
     printf("test_attention_combine_accumulate...");
     BnTQState st;
@@ -345,6 +393,7 @@ int main(void) {
     test_deterministic();
     test_format_and_strategy_metadata();
     test_calibration_selects_strategy();
+    test_precompute_and_scoring_use_packed_strategy();
     test_value_roundtrip();
     test_score_accuracy();
     test_attention_combine();

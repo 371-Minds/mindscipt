@@ -795,6 +795,7 @@ int bn_model_load(BnModel *m, BnGGUFFile *f, int max_seq_len, int kv_f16, int kv
             goto fail_state;
         }
         if (bn_tq_configure_heads(m->tq_state, c->n_kv_heads) != 0) {
+            bn_tq_free(m->tq_state);
             free(m->tq_state);
             m->tq_state = NULL;
             goto fail_state;
