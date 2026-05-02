@@ -8,12 +8,15 @@
 #include "session.h"
 #include "quant.h"
 #include "transformer.h"
+#include "turboquant.h"
 #include "sampler.h"
 #include "threadpool.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+#define BENCH_MS_PER_SECOND 1000.0
 
 static const char *type_name(int type) {
     switch (type) {
@@ -248,9 +251,107 @@ static void bench_toks(BnModel *m, BnSession *s, int n_gen) {
     bn_sampler_free(&sampler);
 }
 
+static void bench_tq_suite(int n_iters, int n_heads, int head_dim, int ctx_len, int bits) {
+    BnTQState tq;
+    if (bn_tq_init(&tq, head_dim, bits, 0x5451303042ULL) != 0 ||
+        bn_tq_configure_heads(&tq, n_heads) != 0) {
+        fprintf(stderr, "Failed to initialize TurboQuant benchmark state\n");
+        bn_tq_free(&tq);
+        return;
+    }
+    bn_tq_set_flags(&tq, BN_TQ_FLAG_FUSED_ATTENTION);
+
+    int kb = bn_tq_key_bytes(&tq);
+    int vb = bn_tq_value_bytes(&tq);
+    float *query = calloc((size_t)head_dim, sizeof(float));
+    float *key = calloc((size_t)ctx_len * head_dim, sizeof(float));
+    float *value = calloc((size_t)ctx_len * head_dim, sizeof(float));
+    uint8_t *packed_keys = calloc((size_t)ctx_len, (size_t)kb);
+    uint8_t *packed_vals = calloc((size_t)ctx_len, (size_t)vb);
+    float *weights = calloc((size_t)ctx_len, sizeof(float));
+    float *scores = calloc((size_t)ctx_len, sizeof(float));
+    float *out = calloc((size_t)head_dim, sizeof(float));
+    uint8_t *q_signs = calloc((size_t)head_dim / 8, 1);
+    float *q_rot = calloc((size_t)head_dim, sizeof(float));
+    int alloc_ok = query && key && value && packed_keys && packed_vals &&
+                   weights && scores && out && q_signs && q_rot;
+    if (!alloc_ok) {
+        fprintf(stderr, "Failed to allocate TurboQuant benchmark buffers\n");
+        goto cleanup;
+    }
+
+    printf("\nTurboQuant synthetic benchmark: heads=%d dim=%d ctx=%d bits=%d iters=%d\n",
+           n_heads, head_dim, ctx_len, bits, n_iters);
+    printf("%-6s | %9s | %9s | %9s | %9s | %9s\n",
+           "head", "key_us", "value_us", "score_us", "combine_us", "tok/s");
+    printf("-------|-----------|-----------|-----------|-----------|----------\n");
+
+    for (int h = 0; h < n_heads; h++) {
+        for (int i = 0; i < head_dim; i++)
+            query[i] = bench_randf();
+        for (int t = 0; t < ctx_len; t++) {
+            for (int i = 0; i < head_dim; i++) {
+                key[(size_t)t * head_dim + i] = bench_randf();
+                value[(size_t)t * head_dim + i] = bench_randf();
+            }
+            weights[t] = 1.0f / (float)ctx_len;
+        }
+
+        double t0 = bn_platform_time_ms();
+        for (int iter = 0; iter < n_iters; iter++)
+            for (int t = 0; t < ctx_len; t++)
+                bn_tq_quantize_key_head(&tq, h, key + (size_t)t * head_dim, packed_keys + (size_t)t * kb);
+        double key_ms = bn_platform_time_ms() - t0;
+
+        t0 = bn_platform_time_ms();
+        for (int iter = 0; iter < n_iters; iter++)
+            for (int t = 0; t < ctx_len; t++)
+                bn_tq_quantize_value_head(&tq, h, value + (size_t)t * head_dim, packed_vals + (size_t)t * vb);
+        double value_ms = bn_platform_time_ms() - t0;
+
+        bn_tq_rotate_query_head(&tq, h, query, q_rot);
+        bn_tq_qjl_precompute_head(&tq, h, q_rot, q_signs);
+
+        t0 = bn_platform_time_ms();
+        for (int iter = 0; iter < n_iters; iter++) {
+            for (int t = 0; t < ctx_len; t++)
+                scores[t] = bn_tq_score_key_precomputed_head(&tq, h, q_rot, q_signs, packed_keys + (size_t)t * kb);
+        }
+        double score_ms = bn_platform_time_ms() - t0;
+
+        t0 = bn_platform_time_ms();
+        for (int iter = 0; iter < n_iters; iter++)
+            bn_tq_attention_combine_head(&tq, h, packed_vals, ctx_len, vb, weights, out, 0);
+        double combine_ms = bn_platform_time_ms() - t0;
+
+        double tok_s = (double)n_iters / ((score_ms + combine_ms) / BENCH_MS_PER_SECOND);
+        printf("%-6d | %9.2f | %9.2f | %9.2f | %9.2f | %9.1f\n",
+               h,
+               (key_ms * 1000.0) / ((double)n_iters * ctx_len),
+               (value_ms * 1000.0) / ((double)n_iters * ctx_len),
+               (score_ms * 1000.0) / ((double)n_iters * ctx_len),
+               (combine_ms * 1000.0) / (double)n_iters,
+               tok_s);
+    }
+
+cleanup:
+    free(query);
+    free(key);
+    free(value);
+    free(packed_keys);
+    free(packed_vals);
+    free(weights);
+    free(scores);
+    free(out);
+    free(q_signs);
+    free(q_rot);
+    bn_tq_free(&tq);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s model.gguf [--iters N] [--threads T] [--toks N]\n", argv[0]);
+        fprintf(stderr, "   or: %s --tq-only [--iters N] [--heads N] [--head-dim N] [--ctx-len N] [--bits N]\n", argv[0]);
         return 1;
     }
 
@@ -258,6 +359,15 @@ int main(int argc, char **argv) {
     int n_iters = 100;
     int n_threads = 1;
     int n_toks = 32;
+    int tq_only = 0;
+    int tq_heads = 4;
+    int tq_head_dim = 128;
+    int tq_ctx_len = 512;
+    int tq_bits = 3;
+    if (strcmp(argv[1], "--tq-only") == 0) {
+        tq_only = 1;
+        model_path = NULL;
+    }
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc)
@@ -266,6 +376,19 @@ int main(int argc, char **argv) {
             n_threads = (int)strtol(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--toks") == 0 && i + 1 < argc)
             n_toks = (int)strtol(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--heads") == 0 && i + 1 < argc)
+            tq_heads = (int)strtol(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--head-dim") == 0 && i + 1 < argc)
+            tq_head_dim = (int)strtol(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--ctx-len") == 0 && i + 1 < argc)
+            tq_ctx_len = (int)strtol(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--bits") == 0 && i + 1 < argc)
+            tq_bits = (int)strtol(argv[++i], NULL, 10);
+    }
+
+    if (tq_only) {
+        bench_tq_suite(n_iters, tq_heads, tq_head_dim, tq_ctx_len, tq_bits);
+        return 0;
     }
 
     // Load model

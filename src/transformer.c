@@ -85,8 +85,8 @@ static inline void tq_write_kv(const BnTQState *tq, BnRunState *s,
     uint8_t *kc_tq = s->key_cache_tq   + tq_loff_k + (size_t)cache_pos * n_kv_heads * key_bytes;
     uint8_t *vc_tq = s->value_cache_tq + tq_loff_v + (size_t)cache_pos * n_kv_heads * val_bytes;
     for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
-        bn_tq_quantize_key(tq, k_tmp + kv_h * head_size, kc_tq + kv_h * key_bytes);
-        bn_tq_quantize_value(tq, v_tmp + kv_h * head_size, vc_tq + kv_h * val_bytes);
+        bn_tq_quantize_key_head(tq, kv_h, k_tmp + kv_h * head_size, kc_tq + kv_h * key_bytes);
+        bn_tq_quantize_value_head(tq, kv_h, v_tmp + kv_h * head_size, vc_tq + kv_h * val_bytes);
     }
 }
 

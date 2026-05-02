@@ -49,6 +49,7 @@ Modules have strict, one-directional dependencies. When modifying a module, only
 - Unit tests use synthetic data — no model files required
 - Each test builds only its module + dependencies (not the whole project)
 - Tests use `assert()` — they crash on failure, print "PASSED" on success
+- TurboQuant microbenchmarks live in `bench/bench_kernels.c`; use `make bench_kernels && ./bench_kernels --tq-only --iters 50 --heads 4 --head-dim 128 --ctx-len 512 --bits 3` for per-head KV-path measurements
 - The e2e test (`test/test_e2e.c`) requires a real GGUF model file
 - The coherence test (`test/test_coherence.c`) requires a real GGUF model file:
   - Phase 1: GPU vs CPU forward pass — 5 greedy tokens, first 3 must match
@@ -77,6 +78,8 @@ Modules have strict, one-directional dependencies. When modifying a module, only
 - Batch prefill with fused Q4_K matmul kernel (dense models)
 - KV cache pre-allocated for max sequence length
 - TurboQuant KV compression: Randomized Hadamard Transform (O(d log d)), NEON vectorized FWHT + popcount + FMA, precomputed QJL to avoid per-key redundancy
+- TurboQuant runtime is split into shared quantization tables plus per-head calibration/runtime metadata; packed formats are versioned and strategy-aware for prompt-cache safety
+- Scalar TQ attention now has an optional fused packed-value accumulation path that acts as the correctness/perf reference before SIMD-specific tuning
 
 ## CLI Flags (key ones for agents)
 
@@ -88,6 +91,8 @@ Modules have strict, one-directional dependencies. When modifying a module, only
 - `--flash` — flash attention (online softmax)
 - `--kv16` — FP16 KV cache
 - `--kv-tq <bits>` — TurboQuant KV cache compression (2, 3, or 4 bits; recommended: 3). 8.9x per-session KV compression — the key benefit is multi-user serving: ~9x more concurrent sessions in the same RAM. Combine with `--pread --cache-mb 2048` for minimal footprint: 35B MoE + 64K context = 8.4 GB/session (vs 26 GB with FP32 KV).
+- `--kv-tq-adaptive` — opt into per-head adaptive TurboQuant strategy selection (baseline, calibrated, outlier-preserving, conservative)
+- `--kv-tq-fused` — opt into the fused scalar TurboQuant packed-value combine path for benchmarking and fallback comparisons
 - `--no-prefill` — disable batch prefill
 - `--gpu` — enable GPU inference (requires `BN_ENABLE_GPU=1` build)
 - `--maxseq N` — cap sequence length (recommended on GPU to limit KV cache VRAM)

@@ -20,6 +20,8 @@ typedef struct {
     size_t val_cache_bytes; // total bytes for value_cache
     int kv_f16;             // FP16 or FP32 (ignored when kv_tq_bits > 0)
     int kv_tq_bits;         // TurboQuant bits (0=disabled, 2-4=bits)
+    uint8_t tq_format_version; // TurboQuant packed format version
+    uint32_t tq_flags;         // TurboQuant runtime flags
     int n_attn_layers;      // for config validation
     int kv_dim;             // for config validation
 } BnPromptCacheEntry;

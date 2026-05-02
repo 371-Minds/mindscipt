@@ -433,6 +433,8 @@ static void test_tq_roundtrip(void) {
     // Initialize TQ state on the model
     BnTQState tq;
     assert(bn_tq_init(&tq, model.config.head_size, 3, 0x5451303042ULL) == 0);
+    assert(bn_tq_configure_heads(&tq, model.config.n_kv_heads) == 0);
+    bn_tq_set_flags(&tq, BN_TQ_FLAG_FUSED_ATTENTION);
     model.tq_state = &tq;
 
     BnSession *s1 = bn_session_create(&model, NULL);
@@ -468,6 +470,8 @@ static void test_tq_roundtrip(void) {
     int rc = bn_prompt_cache_store(pc, &model, s1, tokens, n);
     assert(rc == 0);
     assert(bn_prompt_cache_count(pc) == 1);
+    assert(pc->entries[0].tq_format_version == BN_TQ_FORMAT_VERSION);
+    assert(pc->entries[0].tq_flags == BN_TQ_FLAG_FUSED_ATTENTION);
 
     // Verify entry has TQ format
     // (used_bytes should reflect TQ sizes, not FP32 sizes)
@@ -510,11 +514,26 @@ static void test_tq_roundtrip(void) {
     int no_match = bn_prompt_cache_restore(pc, &model_fp32, s3, tokens, n);
     assert(no_match == 0);  // format mismatch: TQ entry vs FP32 query
 
+    BnModel model_tq_mismatch;
+    memset(&model_tq_mismatch, 0, sizeof(model_tq_mismatch));
+    init_test_config(&model_tq_mismatch.config);
+    model_tq_mismatch.config.kv_tq_bits = 3;
+    BnTQState tq_mismatch;
+    assert(bn_tq_init(&tq_mismatch, model_tq_mismatch.config.head_size, 3, 0x5451303042ULL) == 0);
+    assert(bn_tq_configure_heads(&tq_mismatch, model_tq_mismatch.config.n_kv_heads) == 0);
+    bn_tq_set_flags(&tq_mismatch, 0);
+    model_tq_mismatch.tq_state = &tq_mismatch;
+    BnSession *s4 = bn_session_create(&model_tq_mismatch, NULL);
+    assert(s4);
+    assert(bn_prompt_cache_restore(pc, &model_tq_mismatch, s4, tokens, n) == 0);
+
     bn_session_free(s1, NULL);
     bn_session_free(s2, NULL);
     bn_session_free(s3, NULL);
+    bn_session_free(s4, NULL);
     bn_prompt_cache_free(pc);
     bn_tq_free(&tq);
+    bn_tq_free(&tq_mismatch);
     printf("PASSED\n");
 }
 

@@ -187,22 +187,22 @@ static void test_byte_sizes(void) {
     printf("test_byte_sizes...");
     BnTQState st;
 
-    // 2-bit, d=128: idx=32B, qjl=16B, norms=4B → 52B key, 34B value
+    // 2-bit, d=128: hdr=2B, idx=32B, qjl=16B, norms=4B → 54B key, 36B value
     assert(bn_tq_init(&st, 128, 2, 42) == 0);
-    assert(bn_tq_key_bytes(&st) == 52);
-    assert(bn_tq_value_bytes(&st) == 34);
+    assert(bn_tq_key_bytes(&st) == 54);
+    assert(bn_tq_value_bytes(&st) == 36);
     bn_tq_free(&st);
 
-    // 3-bit, d=128: idx=48B, qjl=16B, norms=4B → 68B key, 50B value
+    // 3-bit, d=128: hdr=2B, idx=48B, qjl=16B, norms=4B → 70B key, 52B value
     assert(bn_tq_init(&st, 128, 3, 42) == 0);
-    assert(bn_tq_key_bytes(&st) == 68);
-    assert(bn_tq_value_bytes(&st) == 50);
+    assert(bn_tq_key_bytes(&st) == 70);
+    assert(bn_tq_value_bytes(&st) == 52);
     bn_tq_free(&st);
 
-    // 4-bit, d=128: idx=64B, qjl=16B, norms=4B → 84B key, 66B value
+    // 4-bit, d=128: hdr=2B, idx=64B, qjl=16B, norms=4B → 86B key, 68B value
     assert(bn_tq_init(&st, 128, 4, 42) == 0);
-    assert(bn_tq_key_bytes(&st) == 84);
-    assert(bn_tq_value_bytes(&st) == 66);
+    assert(bn_tq_key_bytes(&st) == 86);
+    assert(bn_tq_value_bytes(&st) == 68);
     bn_tq_free(&st);
 
     printf(" PASS\n");
@@ -222,9 +222,133 @@ static void test_deterministic(void) {
     // Same seed → same QJL signs
     for (int i = 0; i < 128; i++)
         assert(st1.qjl_signs[i] == st2.qjl_signs[i]);
+    assert(bn_tq_format_version(&st1) == BN_TQ_FORMAT_VERSION);
 
     bn_tq_free(&st1);
     bn_tq_free(&st2);
+    printf(" PASS\n");
+}
+
+static void test_format_and_strategy_metadata(void) {
+    printf("test_format_and_strategy_metadata...");
+    BnTQState st;
+    assert(bn_tq_init(&st, 128, 3, 42) == 0);
+    assert(bn_tq_configure_heads(&st, 4) == 0);
+    assert(bn_tq_set_head_strategy(&st, 2, BN_TQ_STRATEGY_OUTLIER) == 0);
+
+    int key_bytes = bn_tq_key_bytes(&st);
+    int val_bytes = bn_tq_value_bytes(&st);
+    uint8_t packed_key[key_bytes];
+    uint8_t packed_val[val_bytes];
+    float vec[128];
+    for (int i = 0; i < 128; i++) vec[i] = test_randn() * 0.1f;
+
+    bn_tq_quantize_key_head(&st, 2, vec, packed_key);
+    bn_tq_quantize_value_head(&st, 2, vec, packed_val);
+    assert(packed_key[0] == BN_TQ_FORMAT_VERSION);
+    assert(packed_key[1] == BN_TQ_STRATEGY_OUTLIER);
+    assert(packed_val[0] == BN_TQ_FORMAT_VERSION);
+    assert(packed_val[1] == BN_TQ_STRATEGY_OUTLIER);
+
+    bn_tq_free(&st);
+    printf(" PASS\n");
+}
+
+static void test_calibration_selects_strategy(void) {
+    printf("test_calibration_selects_strategy...");
+    BnTQState st;
+    assert(bn_tq_init(&st, 128, 3, 42) == 0);
+    assert(bn_tq_configure_heads(&st, 2) == 0);
+
+    enum { NS = 8 };
+    float queries[128] = {0};
+    float keys[NS][128];
+    float values[NS][128];
+    queries[0] = 1.0f;
+    for (int s = 0; s < NS; s++) {
+        for (int i = 0; i < 128; i++) {
+            keys[s][i] = (i == 0) ? (4.0f + (float)s) : 0.001f * (float)(i + 1);
+            values[s][i] = keys[s][i] * 0.5f;
+        }
+    }
+
+    assert(bn_tq_calibrate_head(&st, 1, queries, &keys[0][0], &values[0][0], NS, 128) == 0);
+    const BnTQHeadCalibration *cal = bn_tq_get_head_calibration(&st, 1);
+    assert(cal != NULL);
+    assert(cal->samples == NS);
+    assert(bn_tq_get_head_strategy(&st, 1) == BN_TQ_STRATEGY_OUTLIER);
+
+    bn_tq_free(&st);
+    printf(" PASS\n");
+}
+
+static void test_precompute_and_scoring_use_packed_strategy(void) {
+    printf("test_precompute_and_scoring_use_packed_strategy...");
+    BnTQState st;
+    assert(bn_tq_init(&st, 128, 3, 42) == 0);
+    assert(bn_tq_configure_heads(&st, 1) == 0);
+
+    float query[128];
+    float key[128];
+    for (int i = 0; i < 128; i++) {
+        query[i] = test_randn() * 0.1f;
+        key[i] = test_randn() * 0.1f;
+    }
+
+    int key_bytes = bn_tq_key_bytes(&st);
+    uint8_t packed_keys[2 * key_bytes];
+    uint8_t *packed_calibrated = packed_keys;
+    uint8_t *packed_conservative = packed_keys + key_bytes;
+
+    assert(bn_tq_set_head_strategy(&st, 0, BN_TQ_STRATEGY_CALIBRATED) == 0);
+    bn_tq_quantize_key_head(&st, 0, key, packed_calibrated);
+    assert(bn_tq_set_head_strategy(&st, 0, BN_TQ_STRATEGY_CONSERVATIVE) == 0);
+    bn_tq_quantize_key_head(&st, 0, key, packed_conservative);
+
+    float rotated_q[128];
+    bn_tq_rotate_query_head(&st, 0, query, rotated_q);
+
+    uint8_t q_signs_conservative[128 / 8];
+    uint8_t q_signs_baseline[128 / 8];
+    bn_tq_qjl_precompute_head(&st, 0, rotated_q, q_signs_conservative);
+    assert(bn_tq_set_head_strategy(&st, 0, BN_TQ_STRATEGY_BASELINE) == 0);
+    bn_tq_qjl_precompute_head(&st, 0, rotated_q, q_signs_baseline);
+    assert(memcmp(q_signs_conservative, q_signs_baseline, sizeof(q_signs_baseline)) == 0);
+
+    float scores[2];
+    bn_tq_attention_scores(&st, rotated_q, packed_keys, 2, key_bytes, scores);
+    float precomputed_calibrated =
+        bn_tq_score_key_precomputed_head(&st, 0, rotated_q, q_signs_baseline, packed_calibrated);
+    float precomputed_conservative =
+        bn_tq_score_key_precomputed_head(&st, 0, rotated_q, q_signs_baseline, packed_conservative);
+
+    assert(fabsf(scores[0] - precomputed_calibrated) < 1e-6f);
+    assert(fabsf(scores[1] - precomputed_conservative) < 1e-6f);
+    assert(fabsf(scores[0] - scores[1]) > 1e-6f);
+
+    bn_tq_free(&st);
+    printf(" PASS\n");
+}
+
+static void test_attention_combine_accumulate(void) {
+    printf("test_attention_combine_accumulate...");
+    BnTQState st;
+    assert(bn_tq_init(&st, 128, 3, 42) == 0);
+    int val_bytes = bn_tq_value_bytes(&st);
+    uint8_t packed[4 * val_bytes];
+    float values[4][128];
+    float weights[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+    float out_full[128], out_split[128];
+    for (int k = 0; k < 4; k++) {
+        for (int i = 0; i < 128; i++) values[k][i] = test_randn() * 0.1f;
+        bn_tq_quantize_value_head(&st, 0, values[k], packed + k * val_bytes);
+    }
+    bn_tq_attention_combine_head(&st, 0, packed, 4, val_bytes, weights, out_full, 0);
+    bn_tq_attention_combine_head(&st, 0, packed, 2, val_bytes, weights, out_split, 0);
+    bn_tq_attention_combine_head(&st, 0, packed + 2 * val_bytes, 2, val_bytes, weights + 2, out_split, 1);
+    for (int i = 0; i < 128; i++)
+        assert(fabsf(out_full[i] - out_split[i]) < 1e-5f);
+    bn_tq_free(&st);
     printf(" PASS\n");
 }
 
@@ -267,9 +391,13 @@ int main(void) {
     test_norm_preservation();
     test_byte_sizes();
     test_deterministic();
+    test_format_and_strategy_metadata();
+    test_calibration_selects_strategy();
+    test_precompute_and_scoring_use_packed_strategy();
     test_value_roundtrip();
     test_score_accuracy();
     test_attention_combine();
+    test_attention_combine_accumulate();
     test_bit_widths();
     printf("=== All TurboQuant tests passed ===\n");
     return 0;

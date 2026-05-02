@@ -24,7 +24,7 @@ bitnet.c takes the opposite approach:
 - **Full transformer forward pass** — RoPE, GQA, RMSNorm, sub-norms, tied/untied embeddings
 - **Hybrid SSM + Attention** — Gated DeltaNet SSM layers (conv1d, SiLU, delta rule recurrence) alongside standard GQA attention layers
 - **Flash GQA attention** — online softmax with KV-head grouping, single-pass over KV cache
-- **TurboQuant KV cache compression** — `--kv-tq 3` compresses KV cache to 3-bit (8.9x smaller than FP32) via Randomized Hadamard Transform + Lloyd-Max quantization + QJL residual correction. NEON SIMD vectorized. Dramatically reduces per-session memory: serve ~9x more concurrent users, or fit 256K context in 15 GB for a 35B MoE model.
+- **TurboQuant KV cache compression** — `--kv-tq 3` compresses KV cache to 3-bit (8.9x smaller than FP32) via Randomized Hadamard Transform + Lloyd-Max quantization + QJL residual correction. The packed format is versioned, prompt-cache aware, and can opt into per-head adaptive strategies (`--kv-tq-adaptive`) plus a fused scalar attention path (`--kv-tq-fused`).
 - **Optional F16 KV cache** — `--kv16` halves attention DRAM bandwidth with minimal precision loss
 - **5 SIMD backends** — ARM NEON/SDOT, AVX2, WASM SIMD128, scalar fallback (auto-selected at compile time), plus optional WebGPU
 - **Mixture of Experts (MoE)** — sparse MoE with top-K routing, batched expert dispatch, 3 I/O modes (mmap, pread+LRU cache, madvise)
@@ -136,6 +136,8 @@ Usage: ./bitnet <model.gguf> [options]
   --repeat-penalty <float>  Repetition penalty (default: 1.0, chat: 1.1)
   --kv16          Store KV cache in FP16 (halves attention DRAM bandwidth)
   --kv-tq <bits>  TurboQuant KV compression (2, 3, or 4 bits; recommended: 3)
+  --kv-tq-adaptive  Enable adaptive per-head TurboQuant strategy selection
+  --kv-tq-fused     Enable fused TurboQuant scalar attention combine path
   --no-prefill    Disable batch prompt prefill (compute logits for every token)
   --pread         Force pread for MoE expert loading (lower RSS than mmap)
   --cache-mb <N>  Expert LRU cache budget in MB (default: 4096, 0 to disable)
@@ -152,7 +154,7 @@ Usage: ./bitnet <model.gguf> [options]
 
 Chat mode defaults to `--temp 0.5 --topp 0.9 --repeat-penalty 1.1` for more natural conversation. Override with explicit flags.
 
-**Prompt caching**: Chat mode tracks full token history and caches KV state after each complete turn. On `/reset`, the longest matching prefix is restored from cache, skipping re-prefill. On context overflow, the session resets cleanly. With `--kv-tq 3`, cached entries are 8.7x smaller and restore ~10x faster.
+**Prompt caching**: Chat mode tracks full token history and caches KV state after each complete turn. On `/reset`, the longest matching prefix is restored from cache, skipping re-prefill. On context overflow, the session resets cleanly. With `--kv-tq 3`, cached entries are 8.7x smaller and restore ~10x faster, and restore now rejects mismatched TurboQuant format versions or runtime flags.
 
 ### MoE Expert I/O Modes
 
@@ -177,7 +179,7 @@ For Mixture of Experts models (Qwen3-MoE, OLMoE, Mixtral), expert weights can be
 
 `--kv-tq 3` compresses the KV cache from FP32 to 3-bit — an **8.9x reduction in per-session memory**. The KV cache is the dominant memory cost in multi-user serving: each concurrent session needs its own KV cache, so compressing it means proportionally more users in the same RAM.
 
-Based on the TurboQuant paper (arXiv 2504.19874), using Randomized Hadamard Transform for O(d log d) rotation, Lloyd-Max scalar quantization, and QJL residual correction for keys. NEON SIMD vectorized on ARM with scalar fallback.
+Based on the TurboQuant paper (arXiv 2504.19874), using Randomized Hadamard Transform for O(d log d) rotation, Lloyd-Max scalar quantization, and QJL residual correction for keys. The runtime now separates shared quantization tables from per-head calibration/runtime metadata, so the default `--kv-tq` path stays stable while optional adaptive routing can choose between baseline, calibrated, outlier-preserving, and conservative strategies per KV head.
 
 ```bash
 # Enable 3-bit TQ KV compression
@@ -185,6 +187,9 @@ Based on the TurboQuant paper (arXiv 2504.19874), using Randomized Hadamard Tran
 
 # Minimal memory: pread + small expert cache + TQ-3
 ./bitnet models/Qwen3.5-35B-A3B-Q4_K_M.gguf --pread --cache-mb 2048 --kv-tq 3 -p "Hello" -n 256
+
+# Opt into adaptive per-head routing plus the fused scalar TQ attention path
+./bitnet model.gguf -p "Hello" -n 256 --kv-tq 3 --kv-tq-adaptive --kv-tq-fused
 ```
 
 **Per-session KV cache size (Qwen3.5-35B-A3B, 40 layers, 4 KV heads):**
@@ -224,6 +229,17 @@ At 64K context with FP32, you can barely fit **1 session** (20 GB KV + 6.1 GB ba
 | 1401 tokens | 0.45 tok/s | 0.47 tok/s | 1.04x |
 
 TQ overhead vanishes at longer context — at 500+ tokens it's within 5% of baseline. The per-token write cost amortizes as context grows and KV read bandwidth savings dominate.
+
+### TurboQuant Benchmark Harness
+
+The repository-level kernel benchmark now includes a synthetic TurboQuant mode for per-head KV-path measurements:
+
+```bash
+make bench_kernels
+./bench_kernels --tq-only --iters 50 --heads 4 --head-dim 128 --ctx-len 512 --bits 3
+```
+
+This reports per-head key quantization cost, value quantization cost, packed-key scoring cost, packed-value combine cost, and an effective fused-attention tok/s metric so adaptive strategies can be justified head-by-head before changing the decode path.
 
 ## Getting a Model
 
@@ -416,7 +432,7 @@ int restored = bn_prompt_cache_restore(pc, &model, session, tokens, n);  // long
 bn_prompt_cache_free(pc);
 ```
 
-Format validation prevents mismatches — a TQ-3 cached entry won't match a FP32 restore request, and vice versa.
+Format validation prevents mismatches — a TQ-3 cached entry won't match a FP32 restore request, and TurboQuant restores also validate packed-format version and runtime flags so adaptive/fused cache entries are not reused unsafely.
 
 ### SSE Streaming & Logprobs
 
