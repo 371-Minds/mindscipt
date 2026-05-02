@@ -179,6 +179,7 @@ static void rht_inverse(const BnTQState *st, const float *in, float *out, int d)
 // Precondition: d % 8 == 0 (enforced by bn_tq_init).
 static void qjl_project_signs(const BnTQState *st, const float *in, uint8_t *out_signs, int d) {
     float tmp[d];
+    size_t sign_bytes = (size_t)d / 8;
 #ifdef __ARM_NEON
     tq_apply_signs_neon(st->qjl_signs, in, tmp, d);
 #else
@@ -186,7 +187,7 @@ static void qjl_project_signs(const BnTQState *st, const float *in, uint8_t *out
         tmp[i] = st->qjl_signs[i] * in[i];
 #endif
     fwht_inplace(tmp, d);
-    memset(out_signs, 0, d / 8);
+    memset(out_signs, 0, sign_bytes);
     for (int i = 0; i < d; i++)
         if (tmp[i] >= 0.0f)
             out_signs[i / 8] |= (1 << (i % 8));
