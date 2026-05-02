@@ -129,6 +129,8 @@ int bn_prompt_cache_store(BnPromptCache *cache, const BnModel *model,
     int n_attn = config_n_attn(cfg);
     int kv_dim = cfg->kv_dim;
     int tq_bits = cfg->kv_tq_bits;
+    uint8_t tq_format_version = model->tq_state ? bn_tq_format_version(model->tq_state) : 0;
+    uint32_t tq_flags = model->tq_state ? bn_tq_get_flags(model->tq_state) : 0;
 
     // Compute per-cache byte sizes
     size_t key_bytes, val_bytes;
@@ -221,6 +223,8 @@ int bn_prompt_cache_store(BnPromptCache *cache, const BnModel *model,
     e->val_cache_bytes = val_bytes;
     e->kv_f16 = cfg->kv_f16;
     e->kv_tq_bits = tq_bits;
+    e->tq_format_version = tq_format_version;
+    e->tq_flags = tq_flags;
     e->n_attn_layers = n_attn;
     e->kv_dim = kv_dim;
     cache->n_entries++;
@@ -242,6 +246,8 @@ int bn_prompt_cache_restore(BnPromptCache *cache, const BnModel *model,
     int n_attn = config_n_attn(cfg);
     int kv_dim = cfg->kv_dim;
     int tq_bits = cfg->kv_tq_bits;
+    uint8_t tq_format_version = model->tq_state ? bn_tq_format_version(model->tq_state) : 0;
+    uint32_t tq_flags = model->tq_state ? bn_tq_get_flags(model->tq_state) : 0;
 
     cache_lock(cache);
 
@@ -255,6 +261,8 @@ int bn_prompt_cache_restore(BnPromptCache *cache, const BnModel *model,
         // Config validation: format must match
         if (e->kv_tq_bits != tq_bits) continue;
         if (tq_bits == 0 && e->kv_f16 != cfg->kv_f16) continue;
+        if (tq_bits > 0 && e->tq_format_version != tq_format_version) continue;
+        if (tq_bits > 0 && e->tq_flags != tq_flags) continue;
         if (e->n_attn_layers != n_attn || e->kv_dim != kv_dim) continue;
 
         // Quick reject: entry can't match more than its own length or query length

@@ -57,6 +57,8 @@ typedef struct {
     const char *shader_dir; // --shader-dir for GPU WGSL shaders
     const char *metal_shader_dir; // --metal-shader-dir for Metal shaders
     int kv_tq_bits;     // TurboQuant KV compression (0=disabled, 2-4=bits)
+    int kv_tq_adaptive; // enable adaptive TQ strategies
+    int kv_tq_fused;    // enable fused TQ attention combine path
     int gpu_cache_mb;   // GPU expert buffer cache in MB (default 512, 0 to disable)
 } CLIArgs;
 
@@ -74,6 +76,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --repeat-penalty <float>  Repetition penalty (default: 1.1)\n");
     fprintf(stderr, "  --kv16          Store KV cache in FP16 (halves attention DRAM bandwidth)\n");
     fprintf(stderr, "  --kv-tq <bits>  TurboQuant KV compression (2, 3, or 4 bits)\n");
+    fprintf(stderr, "  --kv-tq-adaptive  Enable adaptive per-head TurboQuant strategies\n");
+    fprintf(stderr, "  --kv-tq-fused     Enable fused TurboQuant attention combine path\n");
     fprintf(stderr, "  --no-prefill    Disable batch prompt prefill (compute logits for every token)\n");
     fprintf(stderr, "  --pread         Force pread for MoE expert loading (measure SSD streaming speed)\n");
     fprintf(stderr, "  --cache-mb <int>  Expert cache budget in MB (default: 4096, 0 to disable)\n");
@@ -168,6 +172,10 @@ static CLIArgs parse_args(int argc, char **argv) {
             args.repeat_set = 1;
         } else if (strcmp(argv[i], "--kv-tq") == 0 && i + 1 < argc) {
             args.kv_tq_bits = parse_int(argv[++i], "--kv-tq");
+        } else if (strcmp(argv[i], "--kv-tq-adaptive") == 0) {
+            args.kv_tq_adaptive = 1;
+        } else if (strcmp(argv[i], "--kv-tq-fused") == 0) {
+            args.kv_tq_fused = 1;
         } else if (strcmp(argv[i], "--gpu") == 0) {
             args.gpu = 1;
         } else if (strcmp(argv[i], "--metal") == 0) {
@@ -222,6 +230,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "--kv-tq and --gpu/--metal are mutually exclusive (GPU TQ not yet supported)\n");
             return 1;
         }
+    } else if (args.kv_tq_adaptive || args.kv_tq_fused) {
+        fprintf(stderr, "--kv-tq-adaptive/--kv-tq-fused require --kv-tq\n");
+        return 1;
     }
 
     // Validate --gpu and --metal mutual exclusion
@@ -321,6 +332,16 @@ int main(int argc, char **argv) {
     }
     model.file = mf;  // keep mmap alive
     model.config.flash_attn = args.flash_attn;
+    if (model.tq_state) {
+        uint32_t tq_flags = 0;
+        if (args.kv_tq_adaptive) tq_flags |= BN_TQ_FLAG_ADAPTIVE;
+        if (args.kv_tq_fused) tq_flags |= BN_TQ_FLAG_FUSED_ATTENTION;
+        bn_tq_set_flags(model.tq_state, tq_flags);
+        if (args.kv_tq_adaptive) {
+            for (int h = 0; h < model.config.n_kv_heads; h++)
+                bn_tq_set_head_strategy(model.tq_state, h, BN_TQ_STRATEGY_CALIBRATED);
+        }
+    }
 
     // Set expert I/O for MoE: prefer mmap, fallback to pread
     if (model.config.n_experts > 0) {
@@ -544,6 +565,16 @@ int main(int argc, char **argv) {
         }
         draft_model.file = draft_mf;
         draft_model.config.flash_attn = args.flash_attn;
+        if (draft_model.tq_state) {
+            uint32_t tq_flags = 0;
+            if (args.kv_tq_adaptive) tq_flags |= BN_TQ_FLAG_ADAPTIVE;
+            if (args.kv_tq_fused) tq_flags |= BN_TQ_FLAG_FUSED_ATTENTION;
+            bn_tq_set_flags(draft_model.tq_state, tq_flags);
+            if (args.kv_tq_adaptive) {
+                for (int h = 0; h < draft_model.config.n_kv_heads; h++)
+                    bn_tq_set_head_strategy(draft_model.tq_state, h, BN_TQ_STRATEGY_CALIBRATED);
+            }
+        }
         // Share thread pool (never run concurrently)
         draft_model.pool = model.pool;
 
