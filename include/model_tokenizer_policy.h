@@ -11,6 +11,7 @@ typedef enum {
 BnTokenizerPre bn_model_tokenizer_pretokenizer(const char *tokenizer_pre);
 
 int bn_model_tokenizer_uses_metaspace(const char *tokenizer_model);
+int bn_model_tokenizer_uses_spm_dummy_prefix(const char *tokenizer_model);
 int bn_model_tokenizer_default_add_bos(const char *tokenizer_pre,
                                        int has_bos_token);
 

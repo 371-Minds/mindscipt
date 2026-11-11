@@ -696,7 +696,18 @@ int bn_model_arch_config_uses_full_rope_text_dims(const BnConfig *c) {
 }
 
 int bn_model_arch_tokenizer_uses_metaspace(const char *tokenizer_model) {
-    return bn_model_arch_is_gemma4(tokenizer_model);
+    /* SentencePiece vocabularies encode spaces as U+2581. The byte-level BPE
+     * path mis-encodes them: it falls back to <0x20> tokens for every space. */
+    if (!tokenizer_model) return 0;
+    return strcmp(tokenizer_model, "llama") == 0 ||
+           strcmp(tokenizer_model, "gemma4") == 0;
+}
+
+int bn_model_arch_tokenizer_uses_spm_dummy_prefix(const char *tokenizer_model) {
+    /* SentencePiece's add_dummy_prefix: the text starts with a space that
+     * becomes U+2581 and merges into the first word ("The" -> "▁The").
+     * The Gemma4 metaspace path carries its own normalization contract. */
+    return tokenizer_model && strcmp(tokenizer_model, "llama") == 0;
 }
 
 BnTokenizerPre bn_model_tokenizer_pretokenizer(const char *tokenizer_pre) {
@@ -711,6 +722,10 @@ BnTokenizerPre bn_model_tokenizer_pretokenizer(const char *tokenizer_pre) {
 
 int bn_model_tokenizer_uses_metaspace(const char *tokenizer_model) {
     return bn_model_arch_tokenizer_uses_metaspace(tokenizer_model);
+}
+
+int bn_model_tokenizer_uses_spm_dummy_prefix(const char *tokenizer_model) {
+    return bn_model_arch_tokenizer_uses_spm_dummy_prefix(tokenizer_model);
 }
 
 int bn_model_tokenizer_default_add_bos(const char *tokenizer_pre,

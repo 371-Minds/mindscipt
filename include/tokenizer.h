@@ -19,6 +19,7 @@ typedef struct {
     int     add_bos;                // whether to prepend BOS (from GGUF metadata)
     int     chatml;                 // 1 if model uses ChatML template
     int     metaspace;              // 1 for tokenizers that encode spaces as U+2581
+    int     spm_dummy_prefix;       // 1 if the text starts with a dummy space (U+2581)
     int     max_token_length;
     BnTokenizerPre pretokenizer;
     int     ranked_bpe;

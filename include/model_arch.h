@@ -240,6 +240,7 @@ int bn_model_arch_loads_extra_ffn_post_norms(const BnConfig *c);
 int bn_model_arch_loads_moe_aux_weights(const BnConfig *c);
 int bn_model_arch_config_uses_full_rope_text_dims(const BnConfig *c);
 int bn_model_arch_tokenizer_uses_metaspace(const char *tokenizer_model);
+int bn_model_arch_tokenizer_uses_spm_dummy_prefix(const char *tokenizer_model);
 int bn_model_arch_uses_small_dense_shape(const BnConfig *c);
 int bn_model_arch_dense_batch_prefill_shape_allowed(
     const BnConfig *c,

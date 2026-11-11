@@ -277,6 +277,7 @@ int bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f) {
 
     const char *model_name = bn_gguf_get_str(f, "tokenizer.ggml.model");
     t->metaspace = bn_model_tokenizer_uses_metaspace(model_name);
+    t->spm_dummy_prefix = bn_model_tokenizer_uses_spm_dummy_prefix(model_name);
 
     // Special token IDs
     int idx;
@@ -416,6 +417,34 @@ static int tokenizer_init_metaspace_work(const BnTokenizer *t, const char *text,
             }
         }
         i = next;
+    }
+    /* SentencePiece prefixes the text with a dummy space, which becomes
+     * U+2581 and merges into the first word ("The" -> "▁The"). */
+    if (t->spm_dummy_prefix && n_work > 0 && n_work + 3 <= max_work) {
+        int prefix[3], n_prefix = 0;
+        int tok = vocab_lookup(t, BN_TOKENIZER_METASPACE);
+        if (tok >= 0) {
+            prefix[n_prefix++] = tok;
+        } else {
+            /* An unknown metaspace falls back to its three UTF-8 bytes. */
+            for (int j = 0; j < 3; j++) {
+                char byte_token[8];
+                snprintf(byte_token, sizeof(byte_token), "<0x%02X>",
+                         (unsigned char)BN_TOKENIZER_METASPACE[j]);
+                tok = vocab_lookup(t, byte_token);
+                if (tok >= 0) prefix[n_prefix++] = tok;
+            }
+        }
+        if (n_prefix > 0) {
+            memmove(work + n_prefix, work, (size_t)n_work * sizeof(int));
+            memmove(groups + n_prefix, groups, (size_t)n_work * sizeof(int));
+            /* The prefix shares the first piece so that it can merge into it. */
+            for (int j = 0; j < n_prefix; j++) {
+                work[j] = prefix[j];
+                groups[j] = groups[n_prefix];
+            }
+            n_work += n_prefix;
+        }
     }
     return n_work;
 }

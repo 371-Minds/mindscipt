@@ -6762,7 +6762,11 @@ static void test_model_arch_registry(void) {
     c.policy_flags = 0;
     assert(!bn_model_arch_config_uses_full_rope_text_dims(&c));
     assert(bn_model_arch_tokenizer_uses_metaspace("gemma4"));
-    assert(!bn_model_arch_tokenizer_uses_metaspace("llama"));
+    assert(bn_model_arch_tokenizer_uses_metaspace("llama"));
+    assert(!bn_model_arch_tokenizer_uses_metaspace("gpt2"));
+    assert(bn_model_arch_tokenizer_uses_spm_dummy_prefix("llama"));
+    assert(!bn_model_arch_tokenizer_uses_spm_dummy_prefix("gemma4"));
+    assert(!bn_model_arch_tokenizer_uses_spm_dummy_prefix("gpt2"));
 
     memset(&c, 0, sizeof(c));
     c.policy_flags = BN_MODEL_ARCH_POLICY_REQUIRES_FLOAT_KQUANT_FALLBACK |

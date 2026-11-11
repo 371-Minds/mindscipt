@@ -131,6 +131,65 @@ static size_t build_gemma4_tokenizer_gguf(uint8_t *buf, size_t buf_size) {
     return wb.pos;
 }
 
+/* A SentencePiece vocabulary: spaces are U+2581 and the pieces that carry a
+ * leading metaspace exist as single tokens, as in the LLaMA vocabulary. */
+static size_t build_llama_spm_tokenizer_gguf(uint8_t *buf, size_t buf_size) {
+    typedef struct { uint8_t *data; size_t pos; size_t cap; } WB;
+    WB wb = { buf, 0, buf_size };
+
+    #define WB_WRITE(wb, d, sz) do { memcpy((wb).data + (wb).pos, (d), (sz)); (wb).pos += (sz); } while(0)
+    #define WB_U32(wb, v) do { uint32_t _v = (v); WB_WRITE(wb, &_v, 4); } while(0)
+    #define WB_U64(wb, v) do { uint64_t _v = (v); WB_WRITE(wb, &_v, 8); } while(0)
+    #define WB_F32(wb, v) do { float _v = (v); WB_WRITE(wb, &_v, 4); } while(0)
+    #define WB_STR(wb, s) do { uint64_t _l = strlen(s); WB_U64(wb, _l); WB_WRITE(wb, s, _l); } while(0)
+
+    const char *tokens[] = {
+        "<s>", "</s>", "T", "h", "e", "Th", "The", "▁",
+        "▁T", "▁Th", "▁The", "i", "s", "▁i", "▁is"
+    };
+    float scores[] = {
+        -1000, -1000, 0, 0, 0, 1, 2, 0, 3, 4, 5, 0, 0, 6, 7
+    };
+    uint64_t n_vocab = sizeof(tokens) / sizeof(tokens[0]);
+
+    WB_U32(wb, 0x46554747);
+    WB_U32(wb, 3);
+    WB_U64(wb, 0);
+    WB_U64(wb, 5);
+
+    WB_STR(wb, "tokenizer.ggml.model");
+    WB_U32(wb, BN_GGUF_TYPE_STRING);
+    WB_STR(wb, "llama");
+
+    WB_STR(wb, "tokenizer.ggml.tokens");
+    WB_U32(wb, BN_GGUF_TYPE_ARRAY);
+    WB_U32(wb, BN_GGUF_TYPE_STRING);
+    WB_U64(wb, n_vocab);
+    for (uint64_t i = 0; i < n_vocab; i++) WB_STR(wb, tokens[i]);
+
+    WB_STR(wb, "tokenizer.ggml.scores");
+    WB_U32(wb, BN_GGUF_TYPE_ARRAY);
+    WB_U32(wb, BN_GGUF_TYPE_FLOAT32);
+    WB_U64(wb, n_vocab);
+    WB_WRITE(wb, scores, sizeof(scores));
+
+    WB_STR(wb, "tokenizer.ggml.bos_token_id");
+    WB_U32(wb, BN_GGUF_TYPE_UINT32);
+    WB_U32(wb, 0);
+
+    WB_STR(wb, "tokenizer.ggml.eos_token_id");
+    WB_U32(wb, BN_GGUF_TYPE_UINT32);
+    WB_U32(wb, 1);
+
+    #undef WB_WRITE
+    #undef WB_U32
+    #undef WB_U64
+    #undef WB_F32
+    #undef WB_STR
+
+    return wb.pos;
+}
+
 static void test_tokenizer_init(void) {
     printf("test_tokenizer_init... ");
 
@@ -366,6 +425,38 @@ static void assert_encoding(BnTokenizer *t, const char *text,
     }
 }
 
+static void test_tokenizer_llama_spm(void) {
+    printf("test_tokenizer_llama_spm... ");
+
+    uint8_t buf[8192];
+    size_t size = build_llama_spm_tokenizer_gguf(buf, sizeof(buf));
+    BnGGUFFile *gf = bn_gguf_open(buf, size);
+    assert(gf != NULL);
+
+    BnTokenizer t;
+    int rc = bn_tokenizer_init(&t, gf);
+    assert(rc == 0);
+    assert(t.metaspace == 1);
+    assert(t.spm_dummy_prefix == 1);
+
+    /* The dummy prefix merges into the first word: "The" -> "▁The". */
+    const int the_is[] = {10, 14};
+    assert_encoding(&t, "The is", the_is, 2);
+    const int the[] = {10};
+    assert_encoding(&t, "The", the, 1);
+
+    int tokens[8];
+    int n = bn_tokenizer_encode(&t, "The is", 1, tokens, 8);
+    assert(n == 3);
+    assert(tokens[0] == 0);
+    assert(tokens[1] == 10);
+    assert(tokens[2] == 14);
+
+    bn_tokenizer_free(&t);
+    bn_gguf_free(gf);
+    printf("PASSED\n");
+}
+
 static void test_tokenizer_ranked_bpe(void) {
     printf("test_tokenizer_ranked_bpe... ");
     const char *vocab[] = {"a", "b", "c", "ab", "bc", "abc", "aa"};
@@ -478,6 +569,7 @@ int main(void) {
     test_tokenizer_decode_oob();
     test_tokenizer_scores_wrong_type();
     test_tokenizer_gemma4_metaspace();
+    test_tokenizer_llama_spm();
     printf("All tokenizer tests passed!\n");
     return 0;
 }
